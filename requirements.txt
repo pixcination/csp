@@ -33,7 +33,7 @@ pandas_market_calendars>=4.4
 requests>=2.31              # TastyTrade REST; was missing
 websockets>=12.0            # DXLink streaming; was missing
 yfinance>=0.2.40            # daily bars, earnings dates, dividends; was missing
-massive-api>=1.0            # historical 1-minute archive (free tier: 5 req/min)
+massive>=2.0                # historical 1-minute archive (free tier: 5 req/min); PyPI name is "massive"
 
 # --- Application -------------------------------------------------------------
 streamlit>=1.49            # width="stretch" replaces the deprecated use_container_width

@@ -286,7 +286,7 @@ def candidates_for_lot(ticker: str, shares: int, basis: float,
                         limit: int = 5) -> list[CallCandidate]:
     """Rank covered calls against one assigned share lot."""
     from data_sources import chains
-    from data_sources.yfinance_sync import load_daily_total_return
+    from data_sources.yfinance_sync import load_daily
 
     cfg = load_config().get("management", {}).get("covered_call", {})
     chain, under = chains.load_chain(ticker)
@@ -307,7 +307,7 @@ def candidates_for_lot(ticker: str, shares: int, basis: float,
     if frame.empty:
         return []
 
-    daily = load_daily_total_return(ticker)
+    daily = load_daily(ticker, basis="price")
     out = []
     for _, row in frame.iterrows():
         candidate = evaluate_call(ticker, row, spot, basis, shares, daily,

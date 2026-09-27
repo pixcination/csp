@@ -410,7 +410,7 @@ def build_decision_sheet(tickers: list[str] | None = None,
     """Rank every candidate strike across the universe by annualised EV."""
     from core.paths import load_universe
     from data_sources import chains
-    from data_sources.yfinance_sync import earnings_guard, load_daily_total_return
+    from data_sources.yfinance_sync import earnings_guard, load_daily
 
     cfg = load_config()
     tickers = tickers or load_universe()
@@ -442,7 +442,7 @@ def build_decision_sheet(tickers: list[str] | None = None,
                     reporter.advance(1, note=f"{ticker} no strikes in band")
                     continue
 
-                daily = load_daily_total_return(ticker)
+                daily = load_daily(ticker, basis="price")
                 adv = _adv_dollars(daily)
 
                 # Per-ticker signals, computed once rather than per strike.

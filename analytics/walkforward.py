@@ -238,7 +238,7 @@ def across_universe(tickers: list[str] | None = None, years: int = 20,
     """
     from core.paths import load_universe
     from core.progress import NullReporter
-    from data_sources.yfinance_sync import load_daily_total_return
+    from data_sources.yfinance_sync import load_daily
 
     tickers = tickers or load_universe()
     reporter = reporter or NullReporter()
@@ -247,7 +247,7 @@ def across_universe(tickers: list[str] | None = None, years: int = 20,
     with reporter.stage("walkforward", "Walk-forward validation", total=len(tickers)):
         for ticker in tickers:
             try:
-                daily = load_daily_total_return(ticker)
+                daily = load_daily(ticker, basis="total")
                 if daily.empty:
                     reporter.advance(1, note=f"{ticker} no history")
                     continue

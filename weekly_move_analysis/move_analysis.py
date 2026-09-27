@@ -45,10 +45,10 @@ def data_dir() -> Path:
 
 
 def load_bars(ticker: str) -> pd.DataFrame:
-    """Prefer the pipeline's total-return bars; fall back to a local CSV."""
+    """Prefer the pipeline's price-basis (traded, split-adjusted) bars; fall back to a local CSV."""
     try:
-        from data_sources.yfinance_sync import load_daily_total_return
-        frame = load_daily_total_return(ticker)
+        from data_sources.yfinance_sync import load_daily
+        frame = load_daily(ticker, basis="price")
         if not frame.empty:
             return frame.set_index("date")
     except Exception:

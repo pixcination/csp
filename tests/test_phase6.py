@@ -34,8 +34,8 @@ def synthetic(monkeypatch):
 
     import data_sources.yfinance_sync as yfs
     monkeypatch.setattr(
-        yfs, "load_daily_total_return",
-        lambda t, start=None, end=None, allow_fallback=True:
+        yfs, "load_daily",
+        lambda t, start=None, end=None, basis="price", allow_fallback=True:
             frames.get(t, pd.DataFrame()))
     return frames
 
@@ -68,10 +68,10 @@ def test_thin_history_is_not_correlated(synthetic, monkeypatch):
         "high": np.arange(40.0) + 101, "low": np.arange(40.0) + 99,
         "volume": np.full(40, 1e6)})
     import data_sources.yfinance_sync as yfs
-    original = yfs.load_daily_total_return
+    original = yfs.load_daily
     monkeypatch.setattr(
-        yfs, "load_daily_total_return",
-        lambda t, start=None, end=None, allow_fallback=True:
+        yfs, "load_daily",
+        lambda t, start=None, end=None, basis="price", allow_fallback=True:
             short if t == "SHORT" else original(t))
     matrix = portfolio.correlation_matrix(["TECH1", "TECH2", "SHORT"])
     assert "SHORT" not in matrix.columns

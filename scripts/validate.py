@@ -46,10 +46,10 @@ def check_data_ready() -> bool:
     from data_sources.yfinance_sync import daily_data_status
 
     status = daily_data_status()
-    if status["source"] == "daily_bars_tr":
-        print(f"  Daily bars: {status['total_return_rows']:,} rows across "
-              f"{status['total_return_tickers']} tickers "
-              f"({status['adjusted']}-adjusted)")
+    if status["source"] == "daily_bars_raw":
+        print(f"  Daily bars: {status['raw_rows']:,} rows across "
+              f"{status['raw_tickers']} tickers, through {status['last_date']} "
+              f"(raw; price and total bases derived on read)")
         if status.get("mixed_basis"):
             print(f"\n  WARNING -- {status['action']}\n")
             print("  Proceeding, but tickers scored on different price bases are not"
@@ -64,14 +64,14 @@ def check_data_ready() -> bool:
         print(f"  Daily bars: {status['legacy_rows']:,} rows across "
               f"{status['legacy_tickers']} tickers, SPLIT-ADJUSTED ONLY")
         print(f"  {status['action']}")
-        print("  Proceeding on the legacy table -- results are directionally valid "
-              "but\n  understate returns on dividend payers.")
+        print("  Proceeding on the legacy table -- a valid price basis, but wheel "
+              "and\n  buy-and-hold returns will omit dividends.")
         return True
 
     print(f"\n  NO DAILY PRICE DATA.\n")
     print(f"    database : {status['database']}")
     print(f"    exists   : {status['exists']}")
-    print(f"    tr rows  : {status['total_return_rows']:,}")
+    print(f"    raw rows : {status['raw_rows']:,}")
     print(f"    legacy   : {status['legacy_rows']:,}")
     print(f"\n  {status['action']}\n")
     print("  Every ticker will report 'no history' until this is populated -- that "

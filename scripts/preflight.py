@@ -9,7 +9,7 @@ Checks, in the order that things actually break:
   2. Dependencies
   3. Credentials, and whether a second .env is lurking (finding F-01)
   4. Market calendar backend (finding F-12)
-  5. Data freshness: 1-minute archive, chain snapshots, reference data
+  5. Data freshness: 1-minute archive, daily bars, caches, events, chains
   6. Account capacity against the configured universe
 
 Exits 0 if everything required is present, 1 otherwise, so it can gate a
@@ -173,34 +173,42 @@ def check_data_freshness() -> None:
     try:
         from data_sources.yfinance_sync import daily_data_status
         status = daily_data_status()
-        if status["source"] == "daily_bars_tr":
-            check(OK, "Daily bars (total return)",
-                  f"{status['total_return_rows']:,} rows / "
-                  f"{status['total_return_tickers']} tickers")
+        if status["source"] == "daily_bars_raw":
+            level = WARN if status["mixed_basis"] else OK
+            check(level, "Daily bars (raw; price + total bases)",
+                  f"{status['raw_rows']:,} rows / {status['raw_tickers']} tickers"
+                  + (f" -- {status['action']}" if status["mixed_basis"] else ""))
+            if status["legacy_tr_present"]:
+                check(WARN, "Pre-Phase-8 daily_bars_tr still present",
+                      "mixed adjustment vintages; run scripts/migrate_phase8.py")
         elif status["source"] == "daily_bars":
             check(WARN, "Daily bars: legacy table only",
                   f"{status['legacy_rows']:,} rows, split-adjusted. "
-                  f"Run pipeline/run.py to build total-return bars.")
+                  f"Run pipeline/run.py to build daily_bars_raw.")
         else:
             check(FAIL, "No daily price data", status["action"] or "")
     except Exception as exc:
         check(WARN, "Could not inspect daily bars", str(exc)[:100])
 
+    # Ages, not just existence: a cache can exist and be months old.
+    try:
+        from core import freshness
+        for item in freshness.report():
+            level = {"ok": OK, "warn": WARN, "missing": WARN}[item.status]
+            text = f"{item.label}: {item.age}" if item.last else f"{item.label}: missing"
+            detail = f"last {item.last}" if item.last else ""
+            if item.detail:
+                detail = f"{detail}  {item.detail}".strip()
+            check(level, text, detail)
+    except Exception as exc:
+        check(WARN, "Could not measure data freshness", str(exc)[:100])
+
     for label, path in [
-        ("1-minute cache", data_dir() / "raw_1m_cache.duckdb"),
         ("IV history", data_dir() / "iv_history.duckdb"),
-        ("Wheel ledger", data_dir() / "trade_log.duckdb"),
+        ("Paper book", data_dir() / "trade_log.duckdb"),
     ]:
         check(OK if path.exists() else WARN, label,
               f"{path.stat().st_size / 1e6:.0f} MB" if path.exists() else "not built yet")
-
-    for label, name in [("Treasury rates", "treasury_rates.parquet"),
-                         ("Volatility indices", "vol_indices.parquet"),
-                         ("Earnings calendar", "earnings.parquet"),
-                         ("Dividends", "dividends.parquet")]:
-        path = reference_dir() / name
-        check(OK if path.exists() else WARN, label,
-              "" if path.exists() else "run the reference refresh")
 
 
 def check_portability() -> None:

@@ -45,11 +45,11 @@ DEFAULT_CLUSTER_THRESHOLD = 0.65
 
 def return_matrix(tickers: list[str], years: int = 3) -> pd.DataFrame:
     """Aligned daily log returns, one column per ticker."""
-    from data_sources.yfinance_sync import load_daily_total_return
+    from data_sources.yfinance_sync import load_daily
 
     series = {}
     for ticker in tickers:
-        frame = load_daily_total_return(ticker)
+        frame = load_daily(ticker, basis="price")
         if frame.empty or len(frame) < MIN_OVERLAP:
             continue
         cutoff = frame["date"].max() - pd.DateOffset(years=years)
@@ -381,7 +381,7 @@ def simultaneous_assignment(book: list[dict], horizon: int = 7,
 
     `book` entries need `ticker`, `strike`, `spot` and `collateral`.
     """
-    from data_sources.yfinance_sync import load_daily_total_return
+    from data_sources.yfinance_sync import load_daily
 
     if not book:
         return None
@@ -394,7 +394,7 @@ def simultaneous_assignment(book: list[dict], horizon: int = 7,
         spot, strike = float(entry.get("spot", 0)), float(entry.get("strike", 0))
         if spot <= 0 or strike <= 0:
             continue
-        frame = load_daily_total_return(ticker)
+        frame = load_daily(ticker, basis="price")
         if frame.empty or len(frame) < horizon + MIN_OVERLAP:
             continue
         cutoff = frame["date"].max() - pd.DateOffset(years=years)

@@ -308,3 +308,14 @@ paper_trading:
   starting_cash: 50000
   fill_at: realistic                  # 'mid' | 'realistic' | 'worst'
   auto_expire: true
+
+# --- Data freshness (Phase 8) -------------------------------------------------
+# Age thresholds for the preflight / status warnings (core/freshness.py).
+# Exceeding one warns; it never blocks a run.
+freshness:
+  daily_bars_trading_days: 1   # stalest ticker's last bar vs last completed session
+  cache_1m_days: 30            # raw_1m_cache.duckdb last bar (gaps, intraday RV)
+  earnings_days: 7             # data/reference/earnings.parquet
+  dividends_days: 35           # data/reference/dividends.parquet
+  reference_days: 3            # treasury rates, volatility indices
+  chains_days: 7               # newest data/chains/<block>

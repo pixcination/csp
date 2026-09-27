@@ -151,7 +151,7 @@ def main() -> int:
                      help="drop ticker/cell combinations with fewer cycles")
     args = ap.parse_args()
 
-    from data_sources.yfinance_sync import load_daily_total_return
+    from data_sources.yfinance_sync import load_daily
 
     tickers = ([t.strip().upper() for t in args.tickers.split(",") if t.strip()]
                if args.tickers else load_universe())
@@ -168,7 +168,7 @@ def main() -> int:
 
     with reporter.stage("sweep", "Cross-sectional sweep", total=len(tickers) * cells):
         for ticker in tickers:
-            daily = load_daily_total_return(ticker)
+            daily = load_daily(ticker, basis="total")
             if daily.empty:
                 skipped.append(ticker)
                 reporter.advance(cells, note=f"{ticker} no daily history")

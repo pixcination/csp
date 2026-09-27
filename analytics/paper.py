@@ -96,6 +96,45 @@ def ensure_schema() -> None:
     con.close()
 
 
+def migrate_legacy_trade_log() -> int:
+    """Copy rows from the retired Trade Log's `positions` table into the book.
+
+    Phase 8 retired the legacy stack (`legacy/analytics/trade_log.py`), which
+    kept a separate hand-entered ledger in the same database. Idempotent: each
+    migrated row carries `legacy trade_log id N` in its notes and is skipped
+    on a re-run. The legacy table is left in place, untouched. Returns the
+    number of rows copied.
+    """
+    con = _connect()
+    try:
+        tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
+        if "positions" not in tables:
+            return 0
+        legacy = con.execute("SELECT * FROM positions ORDER BY id").fetchdf()
+        copied = 0
+        for _, row in legacy.iterrows():
+            tag = f"legacy trade_log id {int(row['id'])}"
+            if con.execute("SELECT count(*) FROM paper_positions WHERE notes LIKE ?",
+                           [f"%{tag}%"]).fetchone()[0]:
+                continue
+            premium = float(row["premium_collected"])
+            contracts = int(row["contracts"])
+            con.execute(
+                "INSERT INTO paper_positions (ticker, strategy, strike, expiration, "
+                "contracts, actual_fill, entry_date, entry_fees, status, exit_date, "
+                "exit_price, collateral, entered_by, notes) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'migrated', ?)",
+                [str(row["ticker"]).upper(), row["strategy"], float(row["strike"]),
+                 row["expiration"], contracts, premium, row["entry_date"],
+                 float(row["commission"] or 0.0), row["status"], row["exit_date"],
+                 row["exit_price"], float(row["strike"]) * 100 * contracts,
+                 "; ".join(x for x in (tag, row["notes"]) if isinstance(x, str) and x)])
+            copied += 1
+        return copied
+    finally:
+        con.close()
+
+
 # --- Accepting a recommendation -------------------------------------------
 
 @dataclass

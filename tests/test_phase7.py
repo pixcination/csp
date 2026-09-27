@@ -430,7 +430,7 @@ def test_split_artifact_is_excluded(monkeypatch):
     frame = _sessions_with_split()
     monkeypatch.setattr(gaps, "session_frame", lambda t, years=20: frame)
     import data_sources.yfinance_sync as ys
-    monkeypatch.setattr(ys, "load_daily_total_return",
+    monkeypatch.setattr(ys, "load_daily",
                         lambda t, **k: _adjusted_from(frame))
 
     raw = gaps.gap_series("T", exclude_corporate_actions=False)
@@ -445,7 +445,7 @@ def test_split_artifact_does_not_inflate_overnight_volatility(monkeypatch):
     frame = _sessions_with_split()
     monkeypatch.setattr(gaps, "session_frame", lambda t, years=20: frame)
     import data_sources.yfinance_sync as ys
-    monkeypatch.setattr(ys, "load_daily_total_return",
+    monkeypatch.setattr(ys, "load_daily",
                         lambda t, **k: _adjusted_from(frame))
     result = gaps.profile("T")
     assert result.excluded_days >= 1
@@ -457,7 +457,7 @@ def test_ordinary_days_survive_the_filter(monkeypatch):
     frame = _sessions(seed=7, gap_vol=0.006, intraday_vol=0.006, n=1200)
     monkeypatch.setattr(gaps, "session_frame", lambda t, years=20: frame)
     import data_sources.yfinance_sync as ys
-    monkeypatch.setattr(ys, "load_daily_total_return",
+    monkeypatch.setattr(ys, "load_daily",
                         lambda t, **k: _adjusted_from(frame))
     cleaned = gaps.gap_series("T")
     assert cleaned.attrs["excluded_days"] == 0
@@ -469,7 +469,7 @@ def test_filter_falls_back_when_no_ground_truth_exists(monkeypatch):
     frame = _sessions_with_split()
     monkeypatch.setattr(gaps, "session_frame", lambda t, years=20: frame)
     import data_sources.yfinance_sync as ys
-    monkeypatch.setattr(ys, "load_daily_total_return",
+    monkeypatch.setattr(ys, "load_daily",
                         lambda t, **k: pd.DataFrame())
     cleaned = gaps.gap_series("T")
     assert cleaned.attrs["excluded_days"] == 1

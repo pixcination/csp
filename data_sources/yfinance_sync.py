@@ -3,17 +3,34 @@ Daily bars, earnings dates and dividends from yfinance.
 
 THREE JOBS
 ----------
-**Total-return daily history.** Finding F-10: `universe_daily.duckdb` is built
-from Massive 1-minute bars pulled with `adjusted=True`, which is *split*
-adjusted only. yfinance `history()` is split *and dividend* adjusted. The same
-ticker produces different long-run returns depending on which you read, and
-the empirical move engine is about to depend on one of them.
+**Daily history on two explicit price bases.** Finding F-10 established that
+the same ticker produces different long-run returns depending on whether its
+bars are dividend-adjusted. Phase 8 settled which basis each question needs:
 
-The rule this module establishes: **total-return bars for probability work,
-raw prices for strike selection.** You receive dividends while holding
-assigned shares, so a wheel backtest that ignores them understates returns;
-but a strike is a strike, and adjusting it retroactively would be nonsense.
-Both are stored, explicitly labelled, in `data/universe_daily.duckdb`.
+    price  -- split-adjusted only: the price that actually traded.
+              Strikes, levels, technicals, breach/touch probabilities, gaps,
+              realized vol. Options settle on this price, and it DROPS by the
+              dividend on the ex-date. A dividend-adjusted series erases those
+              drops, which understated P(breach) for high-yield names (MO, T,
+              KO, PBR...) whenever a window spanned an ex-date.
+    total  -- split and dividend adjusted: what a holder earned.
+              Long-run wheel / buy-and-hold performance comparisons only.
+
+Only raw bars are stored (`daily_bars_raw`: yfinance with
+`auto_adjust=False`, whose Close is split-adjusted, plus Yahoo's `adj_close`,
+dividends and splits). The total-return basis is DERIVED locally from the
+stored dividends by `load_daily(..., basis="total")`, and `adjustment_check`
+cross-checks it against Yahoo's `adj_close`.
+
+WHY NOT STORE YAHOO'S ADJUSTED SERIES (the bug this replaced)
+------------------------------------------------------------
+Phases 2-7 stored `auto_adjust=True` bars and re-pulled only the last ~5 days
+on each run. Every new dividend makes Yahoo re-adjust the *entire* history,
+but only the tail was re-stated, so the stored series became a mix of
+adjustment vintages with an artificial step at each seam -- corrupting
+returns, moving averages and every probability computed across the seam.
+Now: any new dividend or split in the incremental window, or any disagreement
+with stored history on the overlap, triggers a full re-pull of that ticker.
 
 **Earnings calendar.** The single largest driver of assignment risk on a
 5-14 DTE put, and the only one known in advance. Free yfinance data is
@@ -31,6 +48,7 @@ import datetime as dt
 from dataclasses import dataclass
 
 import duckdb
+import numpy as np
 import pandas as pd
 
 from core.market_calendar import ET, previous_trading_day
@@ -40,14 +58,23 @@ from core.progress import BaseReporter, NullReporter
 EARNINGS_FILE = "earnings.parquet"
 DIVIDENDS_FILE = "dividends.parquet"
 
-DAILY_SCHEMA = """
-CREATE TABLE IF NOT EXISTS daily_bars_tr (
+RAW_TABLE = "daily_bars_raw"
+RAW_SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS {RAW_TABLE} (
     ticker VARCHAR, date DATE,
-    open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, volume DOUBLE,
-    dividends DOUBLE, splits DOUBLE,
+    open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, adj_close DOUBLE,
+    volume DOUBLE, dividends DOUBLE, splits DOUBLE,
     PRIMARY KEY (ticker, date)
 )
 """
+RAW_COLUMNS = ["ticker", "date", "open", "high", "low", "close", "adj_close",
+               "volume", "dividends", "splits"]
+BAR_COLUMNS = ["date", "open", "high", "low", "close", "volume"]
+BASES = ("price", "total")
+
+# Overlap closes that move by more than this mean Yahoo restated history
+# (a late-posted split, a data correction) and the ticker must be re-pulled.
+RESTATEMENT_TOLERANCE = 1e-3
 
 
 def _yf():
@@ -60,7 +87,7 @@ def _yf():
     return yf
 
 
-# --- Daily bars ------------------------------------------------------------
+# --- Daily bars: sync ------------------------------------------------------
 
 @dataclass
 class DailySyncResult:
@@ -69,18 +96,89 @@ class DailySyncResult:
     first_date: str | None = None
     last_date: str | None = None
     up_to_date: bool = False
+    full_repull: str | None = None      # why the whole history was re-pulled
     error: str | None = None
 
 
 def _last_stored(con, ticker: str) -> dt.date | None:
-    row = con.execute("SELECT max(date) FROM daily_bars_tr WHERE ticker = ?",
-                       [ticker]).fetchone()
+    row = con.execute(f"SELECT max(date) FROM {RAW_TABLE} WHERE ticker = ?",
+                      [ticker]).fetchone()
     return row[0] if row and row[0] else None
 
 
+def _normalise(frame: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """yfinance `history(auto_adjust=False)` -> RAW_COLUMNS."""
+    frame = frame.reset_index()
+    frame.columns = [str(c).strip().lower().replace(" ", "_") for c in frame.columns]
+    frame["date"] = pd.to_datetime(frame["date"]).dt.tz_localize(None).dt.date
+    frame["ticker"] = ticker
+    frame = frame.rename(columns={"stock_splits": "splits"})
+    for column in ("dividends", "splits"):
+        if column not in frame.columns:
+            frame[column] = 0.0
+    if "adj_close" not in frame.columns:
+        frame["adj_close"] = frame["close"]
+    frame[["dividends", "splits"]] = frame[["dividends", "splits"]].fillna(0.0)
+    return frame[RAW_COLUMNS].dropna(subset=["close"]).reset_index(drop=True)
+
+
+def _fetch(yf, ticker: str, start: str | None = None) -> pd.DataFrame:
+    kwargs = {"start": start} if start else {"period": "max"}
+    frame = yf.Ticker(ticker).history(actions=True, auto_adjust=False, **kwargs)
+    if frame is None or frame.empty:
+        return pd.DataFrame(columns=RAW_COLUMNS)
+    return _normalise(frame, ticker)
+
+
+def repull_reason(stored: pd.DataFrame, incoming: pd.DataFrame) -> str | None:
+    """Does this incremental pull invalidate the stored history?
+
+    `stored` and `incoming` are RAW_COLUMNS frames for one ticker. Returns a
+    reason string when the ticker must be re-pulled in full, else None.
+
+    * A new dividend changes Yahoo's `adj_close` for every earlier row.
+    * A new split changes the split-adjusted Close for every earlier row.
+    * An overlap row whose close or corporate actions differ from what is
+      stored means Yahoo restated something -- trust neither side, re-pull.
+    """
+    if incoming.empty:
+        return None
+    last = stored["date"].max() if not stored.empty else None
+    new = incoming[incoming["date"] > last] if last is not None else incoming
+    if (new["splits"].fillna(0) > 0).any():
+        return "new split"
+    if (new["dividends"].fillna(0) > 0).any():
+        return "new dividend"
+    if stored.empty:
+        return None
+    overlap = incoming.merge(stored, on="date", suffixes=("", "_stored"))
+    if overlap.empty:
+        return None
+    moved = (overlap["close"] / overlap["close_stored"] - 1.0).abs()
+    if (moved > RESTATEMENT_TOLERANCE).any():
+        return "history restated"
+    for column in ("dividends", "splits"):
+        if (overlap[column].fillna(0) - overlap[f"{column}_stored"].fillna(0)).abs().max() > 1e-9:
+            return f"late-posted {column[:-1]}"
+    return None
+
+
+def _replace(con, ticker: str, frame: pd.DataFrame, whole_ticker: bool) -> None:
+    con.register("incoming", frame)
+    try:
+        if whole_ticker:
+            con.execute(f"DELETE FROM {RAW_TABLE} WHERE ticker = ?", [ticker])
+        else:
+            con.execute(f"DELETE FROM {RAW_TABLE} WHERE ticker = ? AND date IN "
+                        f"(SELECT date FROM incoming)", [ticker])
+        con.execute(f"INSERT INTO {RAW_TABLE} SELECT {', '.join(RAW_COLUMNS)} FROM incoming")
+    finally:
+        con.unregister("incoming")
+
+
 def sync_daily(tickers: list[str], reporter: BaseReporter | None = None,
-                force_full: bool = False) -> list[DailySyncResult]:
-    """Incremental total-return daily bars for the universe.
+               force_full: bool = False) -> list[DailySyncResult]:
+    """Incremental raw daily bars for the universe.
 
     yfinance has no per-minute cap worth pacing around at this scale, so this
     stage runs inline in the pipeline -- unlike the Massive archive sync.
@@ -91,9 +189,9 @@ def sync_daily(tickers: list[str], reporter: BaseReporter | None = None,
     watermark = previous_trading_day(dt.datetime.now(ET).date() + dt.timedelta(days=1))
 
     con = duckdb.connect(str(db_universe_daily()))
-    con.execute(DAILY_SCHEMA)
+    con.execute(RAW_SCHEMA)
     try:
-        with reporter.stage("daily", "Daily bars (total return)", total=len(tickers)):
+        with reporter.stage("daily", "Daily bars", total=len(tickers)):
             for ticker in tickers:
                 res = DailySyncResult(ticker=ticker)
                 try:
@@ -104,53 +202,39 @@ def sync_daily(tickers: list[str], reporter: BaseReporter | None = None,
                         results.append(res)
                         continue
 
+                    before = con.execute(f"SELECT count(*) FROM {RAW_TABLE} "
+                                         f"WHERE ticker = ?", [ticker]).fetchone()[0]
                     if last:
-                        start = (last - dt.timedelta(days=5)).isoformat()
-                        frame = yf.Ticker(ticker).history(start=start, actions=True,
-                                                           auto_adjust=True)
+                        start = (last - dt.timedelta(days=7)).isoformat()
+                        frame = _fetch(yf, ticker, start)
+                        stored = con.execute(
+                            f"SELECT date, close, dividends, splits FROM {RAW_TABLE} "
+                            f"WHERE ticker = ? AND date >= ?", [ticker, start]).fetchdf()
+                        stored["date"] = pd.to_datetime(stored["date"]).dt.date
+                        reason = repull_reason(stored, frame)
+                        if reason:
+                            res.full_repull = reason
+                            frame = _fetch(yf, ticker)
                     else:
-                        frame = yf.Ticker(ticker).history(period="max", actions=True,
-                                                           auto_adjust=True)
+                        res.full_repull = "initial" if not force_full else "forced"
+                        frame = _fetch(yf, ticker)
 
-                    if frame is None or frame.empty:
+                    if frame.empty:
                         res.error = "no data returned"
                         reporter.advance(1, note=f"{ticker} empty")
                         results.append(res)
                         continue
 
-                    frame = frame.reset_index()
-                    frame.columns = [str(c).strip().lower().replace(" ", "_")
-                                      for c in frame.columns]
-                    frame["date"] = pd.to_datetime(frame["date"]).dt.tz_localize(None).dt.date
-                    frame["ticker"] = ticker
-                    for column in ("dividends", "stock_splits"):
-                        if column not in frame.columns:
-                            frame[column] = 0.0
-                    frame = frame.rename(columns={"stock_splits": "splits"})
-                    keep = ["ticker", "date", "open", "high", "low", "close",
-                            "volume", "dividends", "splits"]
-                    frame = frame[[c for c in keep if c in frame.columns]].dropna(
-                        subset=["close"])
-
-                    con.register("incoming", frame)
-                    before = con.execute(
-                        "SELECT count(*) FROM daily_bars_tr WHERE ticker = ?",
-                        [ticker]).fetchone()[0]
-                    # Upsert: the 5-day overlap re-states recent bars in case a
-                    # split or dividend retroactively adjusted them.
-                    con.execute(
-                        "DELETE FROM daily_bars_tr WHERE ticker = ? AND date IN "
-                        "(SELECT date FROM incoming)", [ticker])
-                    con.execute("INSERT INTO daily_bars_tr SELECT * FROM incoming")
-                    con.unregister("incoming")
-                    after = con.execute(
-                        "SELECT count(*) FROM daily_bars_tr WHERE ticker = ?",
-                        [ticker]).fetchone()[0]
-
+                    _replace(con, ticker, frame, whole_ticker=bool(res.full_repull))
+                    after = con.execute(f"SELECT count(*) FROM {RAW_TABLE} "
+                                        f"WHERE ticker = ?", [ticker]).fetchone()[0]
                     res.rows_added = max(after - before, 0)
                     res.first_date = str(frame["date"].min())
                     res.last_date = str(frame["date"].max())
-                    reporter.advance(1, note=f"{ticker} +{res.rows_added}")
+                    note = f"{ticker} +{res.rows_added}"
+                    if res.full_repull and res.full_repull != "initial":
+                        note += f" (full re-pull: {res.full_repull})"
+                    reporter.advance(1, note=note)
                 except Exception as exc:
                     res.error = f"{type(exc).__name__}: {str(exc)[:120]}"
                     reporter.advance(1, note=f"{ticker} error")
@@ -160,106 +244,44 @@ def sync_daily(tickers: list[str], reporter: BaseReporter | None = None,
     return results
 
 
-def daily_data_status() -> dict:
-    """What daily price data actually exists, and which table it is in.
+# --- Daily bars: read ------------------------------------------------------
 
-    Added after a validation run reported "no history" for all 61 tickers and
-    gave no clue why. The cause was that `daily_bars_tr` had never been built --
-    but every caller swallowed the missing-table error and returned an empty
-    frame, so the diagnosis looked like 61 separate data problems instead of
-    one missing pipeline stage. Silent degradation is worse than a crash: it
-    turns a two-minute fix into an afternoon.
+def total_return_factor(frame: pd.DataFrame) -> pd.Series:
+    """Backward dividend-adjustment factor for a date-sorted raw frame.
+
+    For an ex-date d paying D, every bar before d is scaled by
+    (1 - D / close[d-1]) -- the CRSP / Yahoo convention. The factor for a row
+    is the product over all ex-dates AFTER it, so the latest row is 1.0 and
+    the series is anchored at the last returned date.
     """
-    import duckdb
-    path = db_universe_daily()
-    status = {
-        "database": str(path), "exists": path.exists(),
-        "total_return_rows": 0, "total_return_tickers": 0,
-        "legacy_rows": 0, "legacy_tickers": 0,
-        "source": "none", "adjusted": None, "action": None,
-    }
-    if not path.exists():
-        status["action"] = ("No daily database at all. Run:  python pipeline/run.py")
-        return status
-
-    con = duckdb.connect(str(path), read_only=True)
-    try:
-        tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
-        if "daily_bars_tr" in tables:
-            row = con.execute("SELECT count(*), count(DISTINCT ticker) "
-                               "FROM daily_bars_tr").fetchone()
-            status["total_return_rows"], status["total_return_tickers"] = int(row[0]), int(row[1])
-        if "daily_bars" in tables:
-            row = con.execute("SELECT count(*), count(DISTINCT ticker) "
-                               "FROM daily_bars").fetchone()
-            status["legacy_rows"], status["legacy_tickers"] = int(row[0]), int(row[1])
-    except Exception as exc:
-        status["action"] = f"Could not read the database: {exc}"
-        return status
-    finally:
-        con.close()
-
-    # Coverage against the universe matters more than the row count. A table
-    # holding two tickers reports 25,124 rows and looks healthy, while 59 names
-    # silently fall through to the legacy split-adjusted table -- producing a
-    # run where some tickers are scored on total return and others are not.
-    try:
-        from core.paths import load_universe
-        universe = set(load_universe())
-    except Exception:
-        universe = set()
-
-    if universe and status["total_return_tickers"]:
-        con = duckdb.connect(str(path), read_only=True)
-        try:
-            covered = {r[0] for r in con.execute(
-                "SELECT DISTINCT ticker FROM daily_bars_tr").fetchall()}
-        finally:
-            con.close()
-        status["universe_covered"] = len(covered & universe)
-        status["universe_size"] = len(universe)
-        status["coverage"] = len(covered & universe) / len(universe)
-        status["mixed_basis"] = 0 < status["coverage"] < 1.0
-    else:
-        status["universe_covered"] = status["total_return_tickers"]
-        status["universe_size"] = len(universe)
-        status["coverage"] = 0.0
-        status["mixed_basis"] = False
-
-    if status["total_return_rows"]:
-        status["source"] = "daily_bars_tr"
-        status["adjusted"] = "split and dividend"
-        if status["mixed_basis"]:
-            status["action"] = (
-                f"MIXED PRICE BASIS: only {status['universe_covered']} of "
-                f"{status['universe_size']} universe tickers are in the "
-                f"total-return table. The rest fall back to the legacy "
-                f"split-adjusted table, so results are not comparable across "
-                f"tickers. Run  python pipeline/run.py  to complete the sync.")
-    elif status["legacy_rows"]:
-        status["source"] = "daily_bars"
-        status["adjusted"] = "split only"
-        status["action"] = (
-            "Falling back to the legacy split-adjusted table built by scripts/01. "
-            "Usable, but probability and backtest work should run on total-return "
-            "bars -- run  python pipeline/run.py  to build them.")
-    else:
-        status["action"] = ("Daily database exists but holds no bars. Run:  "
-                             "python pipeline/run.py")
-    return status
+    close = frame["close"].astype(float).reset_index(drop=True)
+    dividends = frame["dividends"].fillna(0.0).astype(float).reset_index(drop=True)
+    prev_close = close.shift(1)
+    step = pd.Series(1.0, index=close.index)
+    mask = (dividends > 0) & (prev_close > 0)
+    step[mask] = 1.0 - dividends[mask] / prev_close[mask]
+    factor = step[::-1].cumprod()[::-1].shift(-1, fill_value=1.0)
+    factor.index = frame.index
+    return factor
 
 
-def load_daily_total_return(ticker: str, start=None, end=None,
-                             allow_fallback: bool = True) -> pd.DataFrame:
-    """Dividend-adjusted daily bars -- the basis for all probability work.
+def load_daily(ticker: str, start=None, end=None, basis: str = "price",
+               allow_fallback: bool = True) -> pd.DataFrame:
+    """Daily bars on an explicit price basis -- see the module docstring.
 
-    Falls back to the legacy split-adjusted `daily_bars` table when the
-    total-return table has not been built, because 25 MB of perfectly usable
-    daily history should not sit unread while every downstream module reports
-    "no history". The fallback is flagged on the returned frame via
-    `frame.attrs["price_basis"]` so callers can say which basis they used.
+    `basis="price"` (default): split-adjusted traded prices. Use for anything
+    a strike, level or probability is computed from.
+    `basis="total"`: dividend-adjusted, derived locally from stored dividends.
+    Use only for long-run holder-return comparisons.
+
+    Falls back to the legacy tables when `daily_bars_raw` has no rows for the
+    ticker, because 25 MB of usable history should not sit unread while every
+    downstream module reports "no history". The basis actually delivered is
+    always on `frame.attrs["price_basis"]`: "price", "total", or
+    "split_adjusted_legacy" / "total_return_legacy" for a fallback.
     """
-    import duckdb
+    if basis not in BASES:
+        raise ValueError(f"basis must be one of {BASES}, not {basis!r}")
     path = db_universe_daily()
     if not path.exists():
         return _empty_daily("missing")
@@ -267,25 +289,45 @@ def load_daily_total_return(ticker: str, start=None, end=None,
     con = duckdb.connect(str(path), read_only=True)
     try:
         tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
-        for table, basis in (("daily_bars_tr", "total_return"),
-                              ("daily_bars", "split_adjusted")):
-            if table not in tables:
-                continue
-            if table == "daily_bars" and not allow_fallback:
-                continue
-            query = (f"SELECT date, open, high, low, close, volume FROM {table} "
-                     f"WHERE ticker = ?")
-            params: list = [ticker]
-            if start:
-                query += " AND date >= ?"
-                params.append(start)
-            if end:
-                query += " AND date <= ?"
-                params.append(end)
-            frame = con.execute(query + " ORDER BY date", params).fetchdf()
+        where, params = " WHERE ticker = ?", [ticker]
+        if start:
+            where += " AND date >= ?"
+            params.append(pd.Timestamp(start).date())
+        if end:
+            where += " AND date <= ?"
+            params.append(pd.Timestamp(end).date())
+
+        if RAW_TABLE in tables:
+            frame = con.execute(
+                f"SELECT date, open, high, low, close, volume, dividends FROM {RAW_TABLE}"
+                f"{where} ORDER BY date", params).fetchdf()
             if not frame.empty:
                 frame["date"] = pd.to_datetime(frame["date"])
+                if basis == "total":
+                    factor = total_return_factor(frame)
+                    for column in ("open", "high", "low", "close"):
+                        frame[column] = frame[column] * factor
+                frame = frame[BAR_COLUMNS]
                 frame.attrs["price_basis"] = basis
+                return frame
+
+        if not allow_fallback:
+            return _empty_daily("empty")
+        # daily_bars (built from the split-adjusted 1-minute archive) is a
+        # price basis; daily_bars_tr (pre-Phase-8) is a mixed-vintage total one.
+        order = (("daily_bars", "split_adjusted_legacy"),
+                 ("daily_bars_tr", "total_return_legacy"))
+        if basis == "total":
+            order = order[::-1]
+        for table, label in order:
+            if table not in tables:
+                continue
+            frame = con.execute(f"SELECT date, open, high, low, close, volume "
+                                f"FROM {table}{where} ORDER BY date", params).fetchdf()
+            if not frame.empty:
+                frame["date"] = pd.to_datetime(frame["date"])
+                frame["volume"] = frame["volume"].astype(float)
+                frame.attrs["price_basis"] = label
                 return frame
     except Exception:
         pass
@@ -294,10 +336,133 @@ def load_daily_total_return(ticker: str, start=None, end=None,
     return _empty_daily("empty")
 
 
+def load_daily_total_return(ticker: str, start=None, end=None,
+                            allow_fallback: bool = True) -> pd.DataFrame:
+    """Dividend-adjusted daily bars. Thin wrapper over `load_daily`, kept for
+    the long-run performance callers and for compatibility."""
+    return load_daily(ticker, start=start, end=end, basis="total",
+                      allow_fallback=allow_fallback)
+
+
 def _empty_daily(reason: str) -> pd.DataFrame:
-    frame = pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+    frame = pd.DataFrame(columns=BAR_COLUMNS)
     frame.attrs["price_basis"] = reason
     return frame
+
+
+def adjustment_check(ticker: str) -> dict | None:
+    """Locally derived total-return factor vs Yahoo's own `adj_close`.
+
+    The ratio (close x factor) / adj_close should be constant through history.
+    Drift means a dividend is missing or misdated in the stored actions, or
+    Yahoo's adjustment disagrees with ours -- either way the total basis for
+    this ticker should not be trusted until it is re-pulled.
+    """
+    path = db_universe_daily()
+    if not path.exists():
+        return None
+    con = duckdb.connect(str(path), read_only=True)
+    try:
+        frame = con.execute(f"SELECT date, close, adj_close, dividends FROM {RAW_TABLE} "
+                            f"WHERE ticker = ? ORDER BY date", [ticker]).fetchdf()
+    except Exception:
+        return None
+    finally:
+        con.close()
+    frame = frame[(frame["adj_close"] > 0) & (frame["close"] > 0)]
+    if frame.empty:
+        return None
+    ratio = frame["close"] * total_return_factor(frame) / frame["adj_close"]
+    ratio = ratio / ratio.iloc[-1]
+    deviation = (ratio - 1.0).abs()
+    worst = int(np.argmax(deviation.to_numpy()))
+    return {"ticker": ticker, "rows": len(frame),
+            "max_deviation": float(deviation.iloc[worst]),
+            "worst_date": str(pd.Timestamp(frame["date"].iloc[worst]).date())}
+
+
+def daily_data_status() -> dict:
+    """What daily price data actually exists, and which table it is in.
+
+    Added after a validation run reported "no history" for all 61 tickers and
+    gave no clue why. The cause was that the bars table had never been built
+    -- but every caller swallowed the missing-table error and returned an
+    empty frame, so the diagnosis looked like 61 separate data problems
+    instead of one missing pipeline stage. Silent degradation is worse than a
+    crash: it turns a two-minute fix into an afternoon.
+    """
+    path = db_universe_daily()
+    status = {
+        "database": str(path), "exists": path.exists(),
+        "raw_rows": 0, "raw_tickers": 0,
+        "legacy_rows": 0, "legacy_tickers": 0,
+        "legacy_tr_present": False,
+        "last_date": None, "stalest_ticker": None, "stalest_date": None,
+        "source": "none", "action": None,
+        "universe_covered": 0, "universe_size": 0, "coverage": 0.0,
+        "mixed_basis": False,
+    }
+    if not path.exists():
+        status["action"] = "No daily database at all. Run:  python pipeline/run.py"
+        return status
+
+    con = duckdb.connect(str(path), read_only=True)
+    try:
+        tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
+        status["legacy_tr_present"] = "daily_bars_tr" in tables
+        covered: set[str] = set()
+        if RAW_TABLE in tables:
+            row = con.execute(f"SELECT count(*), count(DISTINCT ticker), max(date) "
+                              f"FROM {RAW_TABLE}").fetchone()
+            status["raw_rows"], status["raw_tickers"] = int(row[0]), int(row[1])
+            status["last_date"] = row[2]
+            per_ticker = con.execute(f"SELECT ticker, max(date) AS last FROM {RAW_TABLE} "
+                                     f"GROUP BY ticker ORDER BY last LIMIT 1").fetchone()
+            if per_ticker:
+                status["stalest_ticker"], status["stalest_date"] = per_ticker
+            covered = {r[0] for r in con.execute(
+                f"SELECT DISTINCT ticker FROM {RAW_TABLE}").fetchall()}
+        if "daily_bars" in tables:
+            row = con.execute("SELECT count(*), count(DISTINCT ticker) "
+                              "FROM daily_bars").fetchone()
+            status["legacy_rows"], status["legacy_tickers"] = int(row[0]), int(row[1])
+    except Exception as exc:
+        status["action"] = f"Could not read the database: {exc}"
+        return status
+    finally:
+        con.close()
+
+    # Coverage against the universe matters more than the row count. A table
+    # holding two tickers looks healthy by row count, while 59 names silently
+    # fall through to a legacy table on a different basis.
+    try:
+        from core.paths import load_universe
+        universe = set(load_universe())
+    except Exception:
+        universe = set()
+    if universe:
+        status["universe_covered"] = len(covered & universe)
+        status["universe_size"] = len(universe)
+        status["coverage"] = len(covered & universe) / len(universe)
+        status["mixed_basis"] = 0 < status["coverage"] < 1.0
+
+    if status["raw_rows"]:
+        status["source"] = RAW_TABLE
+        if status["mixed_basis"]:
+            missing = sorted(universe - covered)
+            status["action"] = (
+                f"MIXED PRICE BASIS: {len(missing)} of {status['universe_size']} "
+                f"universe tickers are not in {RAW_TABLE} ({', '.join(missing[:8])}) "
+                f"and fall back to a legacy table. Run  python pipeline/run.py  "
+                f"to complete the sync.")
+    elif status["legacy_rows"]:
+        status["source"] = "daily_bars"
+        status["action"] = ("Falling back to the legacy split-adjusted table built by "
+                            "scripts/01. Run  python pipeline/run.py  to build "
+                            f"{RAW_TABLE}.")
+    else:
+        status["action"] = "Daily database exists but holds no bars. Run:  python pipeline/run.py"
+    return status
 
 
 # --- Earnings --------------------------------------------------------------

@@ -46,7 +46,7 @@ from core.progress import BaseReporter, ConsoleReporter  # noqa: E402
 STAGES = [
     ("preflight", "Preflight and session"),
     ("reference", "Reference data"),
-    ("daily", "Daily bars (total return)"),
+    ("daily", "Daily bars"),
     ("earnings", "Earnings calendar"),
     ("chains", "Option chains"),
     ("analyse", "Analysis"),
@@ -408,7 +408,7 @@ def _evaluate_open_positions(reporter: BaseReporter) -> list[dict]:
     from analytics.exit_rules import OpenPut, evaluate_short_put
     from core.market_calendar import trading_days_between
     from data_sources import chains
-    from data_sources.yfinance_sync import load_daily_total_return
+    from data_sources.yfinance_sync import load_daily
 
     out = []
     today = dt.date.today()
@@ -426,7 +426,7 @@ def _evaluate_open_positions(reporter: BaseReporter) -> list[dict]:
             entry_credit=float(row["premium_collected"]),
             spot=spot, current_mark=mark if mark is not None else 0.0,
             trading_days_left=max(left, 0))
-        daily = load_daily_total_return(ticker)
+        daily = load_daily(ticker, basis="price")
         decision = evaluate_short_put(position, daily)
         out.append({"position_id": int(row["id"]), **decision.to_dict()})
         if decision.urgency != "routine":

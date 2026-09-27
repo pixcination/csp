@@ -161,15 +161,19 @@ def _corporate_action_mask(frame: pd.DataFrame, ticker: str,
     AAPL's overnight volatility to 78% against a true figure near 30%, and put
     it second in a table ranking undefendable risk.
 
-    `daily_bars_tr` is fully split and dividend adjusted, so it is the ground
-    truth. Any day where the archive's close-to-close return differs from the
+    The yfinance price basis (`load_daily(basis="price")`, split-adjusted
+    consistently across its whole history) is the ground truth. It is
+    deliberately NOT dividend adjusted: the archive is not either, so an
+    ex-dividend drop appears in both and agrees, instead of being misread as
+    a seam and excluded (Phase 8 -- the pre-Phase-8 total-return reference
+    flagged ex-dates on high-yield names as disagreements). Any day where the archive's close-to-close return differs from the
     adjusted one by more than `tolerance` is a corporate action or a data seam,
     not a market move, and is excluded. Excluding is right rather than
     rescaling: at a seam we do not know which side is correct.
     """
-    from data_sources.yfinance_sync import load_daily_total_return
+    from data_sources.yfinance_sync import load_daily
 
-    adjusted = load_daily_total_return(ticker)
+    adjusted = load_daily(ticker, basis="price")
     if adjusted.empty:
         # No ground truth available. Fall back to an absolute sanity bound --
         # a genuine overnight move beyond 50% is vanishingly rare and a split

@@ -109,7 +109,7 @@ def rank_rolls(ticker: str, current_strike: float, current_expiration: dt.date,
                 allow_debit: bool = False) -> list[RollCandidate]:
     """Every roll available for one open short put, ranked."""
     from data_sources import chains
-    from data_sources.yfinance_sync import load_daily_total_return
+    from data_sources.yfinance_sync import load_daily
 
     cfg = load_config().get("management", {}).get("defense", {})
     chain, under = chains.load_chain(ticker)
@@ -162,7 +162,7 @@ def rank_rolls(ticker: str, current_strike: float, current_expiration: dt.date,
     if targets.empty:
         return []
 
-    daily = load_daily_total_return(ticker)
+    daily = load_daily(ticker, basis="price")
     old_dte_trd = max(trading_days_between(today, current_expiration), 1)
     old_probs = moves.breach_probabilities(daily, ticker, spot, current_strike,
                                             old_dte_trd, lookback_years=10,

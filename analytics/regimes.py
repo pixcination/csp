@@ -209,7 +209,7 @@ def build(tickers: list[str] | None = None, params: WheelParams | None = None,
     """Full scorecard across the universe. Returns (detail, consistency)."""
     from core.paths import load_universe
     from core.progress import NullReporter
-    from data_sources.yfinance_sync import load_daily_total_return
+    from data_sources.yfinance_sync import load_daily
 
     tickers = tickers or load_universe()
     reporter = reporter or NullReporter()
@@ -218,7 +218,7 @@ def build(tickers: list[str] | None = None, params: WheelParams | None = None,
     with reporter.stage("regimes", "Regime scorecard", total=len(tickers)):
         for ticker in tickers:
             try:
-                daily = load_daily_total_return(ticker)
+                daily = load_daily(ticker, basis="total")
                 if daily.empty:
                     reporter.advance(1, note=f"{ticker} no history")
                     continue

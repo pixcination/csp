@@ -164,11 +164,11 @@ run_one = run_cols[0].button("Run backtest", type="primary")
 run_sweep = run_cols[1].button("Parameter sweep")
 
 if run_one or run_sweep:
-    from data_sources.yfinance_sync import load_daily_total_return
+    from data_sources.yfinance_sync import load_daily
     from analytics.wheel_backtest import (WheelParams, compare_to_buy_and_hold,
                                             run_wheel, sweep)
 
-    daily = load_daily_total_return(ticker)
+    daily = load_daily(ticker, basis="total")
     if daily.empty:
         st.error(f"No daily history for {ticker}. Run the pipeline first.")
     else:
