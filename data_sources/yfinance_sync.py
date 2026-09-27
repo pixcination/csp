@@ -122,12 +122,66 @@ def _normalise(frame: pd.DataFrame, ticker: str) -> pd.DataFrame:
     return frame[RAW_COLUMNS].dropna(subset=["close"]).reset_index(drop=True)
 
 
-def _fetch(yf, ticker: str, start: str | None = None) -> pd.DataFrame:
+def _vendor_map(tickers: list[str]) -> dict[str, tuple[str, float]]:
+    """{symbol: (yf_symbol, price_scale)} from the registry (Phase 9)."""
+    try:
+        from data_sources import universe
+        return universe.vendor_map(tickers)
+    except Exception:
+        return {t: (t.replace(".", "-"), 1.0) for t in tickers}
+
+
+def _scale(frame: pd.DataFrame, factor: float) -> pd.DataFrame:
+    """Apply a registry price_scale (XSP = ^SPX x 0.1) to prices and dividends."""
+    if factor == 1.0 or frame.empty:
+        return frame
+    frame = frame.copy()
+    for column in ("open", "high", "low", "close", "adj_close", "dividends"):
+        frame[column] = frame[column] * factor
+    return frame
+
+
+def _download(yf, yf_symbols: list[str], start: str | None = None,
+              retries: int = 3, backoff: float = 2.0) -> dict[str, pd.DataFrame]:
+    """Batch `yf.download`, split per symbol. Retries the whole call with
+    exponential backoff, then each still-missing symbol once on its own.
+    Returns {yf_symbol: yahoo-shaped frame}; a missing key means no data."""
+    import time
     kwargs = {"start": start} if start else {"period": "max"}
-    frame = yf.Ticker(ticker).history(actions=True, auto_adjust=False, **kwargs)
-    if frame is None or frame.empty:
-        return pd.DataFrame(columns=RAW_COLUMNS)
-    return _normalise(frame, ticker)
+    out: dict[str, pd.DataFrame] = {}
+    pending = list(dict.fromkeys(yf_symbols))
+
+    def split(data, wanted):
+        if data is None or data.empty:
+            return
+        for symbol in wanted:
+            try:
+                part = data[symbol] if isinstance(data.columns, pd.MultiIndex) else data
+            except KeyError:
+                continue
+            part = part.dropna(how="all")
+            if not part.empty and "Close" in part and part["Close"].notna().any():
+                out[symbol] = part
+
+    for attempt in range(retries):
+        if not pending:
+            break
+        try:
+            split(yf.download(pending, auto_adjust=False, actions=True, group_by="ticker",
+                              threads=True, progress=False, **kwargs), pending)
+        except Exception:
+            pass
+        pending = [s for s in pending if s not in out]
+        if pending and attempt < retries - 1:
+            time.sleep(backoff * (2 ** attempt))
+    # A batch can drop a symbol that loads fine alone (Yahoo rate limiting).
+    for symbol in pending:
+        try:
+            split(yf.download([symbol], auto_adjust=False, actions=True, group_by="ticker",
+                              progress=False, **kwargs), [symbol])
+        except Exception:
+            pass
+    return out
 
 
 def repull_reason(stored: pd.DataFrame, incoming: pd.DataFrame) -> str | None:
@@ -177,71 +231,103 @@ def _replace(con, ticker: str, frame: pd.DataFrame, whole_ticker: bool) -> None:
 
 
 def sync_daily(tickers: list[str], reporter: BaseReporter | None = None,
-               force_full: bool = False) -> list[DailySyncResult]:
-    """Incremental raw daily bars for the universe.
+               force_full: bool = False, batch_size: int = 40) -> list[DailySyncResult]:
+    """Incremental raw daily bars for `tickers` (canonical symbols).
 
-    yfinance has no per-minute cap worth pacing around at this scale, so this
-    stage runs inline in the pipeline -- unlike the Massive archive sync.
+    Phase 9: batched `yf.download` (threads, retry with backoff) using the
+    registry's vendor mapping, so indices (^SPX...) and class shares (BRK-B)
+    load, and one Yahoo series can serve two symbols (SPX and XSP).
+
+    Per ticker: current -> skipped; otherwise pulled from the last stored
+    date minus 7 days, compared on the overlap (`repull_reason`), and re-pulled
+    in full when anything invalidates the stored history.
     """
     yf = _yf()
     reporter = reporter or NullReporter()
-    results: list[DailySyncResult] = []
+    results = {t: DailySyncResult(ticker=t) for t in tickers}
+    mapping = _vendor_map(tickers)
     watermark = previous_trading_day(dt.datetime.now(ET).date() + dt.timedelta(days=1))
 
     con = duckdb.connect(str(db_universe_daily()))
     con.execute(RAW_SCHEMA)
     try:
         with reporter.stage("daily", "Daily bars", total=len(tickers)):
+            last = {} if force_full else {t: _last_stored(con, t) for t in tickers}
+            full, incremental = [], []
             for ticker in tickers:
-                res = DailySyncResult(ticker=ticker)
-                try:
-                    last = None if force_full else _last_stored(con, ticker)
-                    if last and last >= watermark:
-                        res.up_to_date = True
-                        reporter.advance(1, note=f"{ticker} current")
-                        results.append(res)
+                stored = last.get(ticker)
+                if stored and stored >= watermark:
+                    results[ticker].up_to_date = True
+                    reporter.advance(1, note=f"{ticker} current")
+                elif stored:
+                    incremental.append(ticker)
+                else:
+                    results[ticker].full_repull = "forced" if force_full else "initial"
+                    full.append(ticker)
+
+            # Incremental: one download from the earliest start, sliced per ticker.
+            for chunk in _chunks(incremental, batch_size):
+                start = (min(last[t] for t in chunk) - dt.timedelta(days=7)).isoformat()
+                pulled = _download(yf, [mapping[t][0] for t in chunk], start)
+                for ticker in chunk:
+                    yf_symbol, scale = mapping[ticker]
+                    if yf_symbol not in pulled:
+                        results[ticker].error = "no data returned"
+                        reporter.advance(1, note=f"{ticker} empty")
                         continue
+                    own_start = last[ticker] - dt.timedelta(days=7)
+                    frame = _scale(_normalise(pulled[yf_symbol], ticker), scale)
+                    frame = frame[frame["date"] >= own_start]
+                    stored = con.execute(
+                        f"SELECT date, close, dividends, splits FROM {RAW_TABLE} "
+                        f"WHERE ticker = ? AND date >= ?", [ticker, own_start]).fetchdf()
+                    stored["date"] = pd.to_datetime(stored["date"]).dt.date
+                    reason = repull_reason(stored, frame)
+                    if reason:
+                        results[ticker].full_repull = reason
+                        full.append(ticker)
+                        continue
+                    _store(con, ticker, frame, results[ticker], whole_ticker=False)
+                    reporter.advance(1, note=f"{ticker} +{results[ticker].rows_added}")
 
-                    before = con.execute(f"SELECT count(*) FROM {RAW_TABLE} "
-                                         f"WHERE ticker = ?", [ticker]).fetchone()[0]
-                    if last:
-                        start = (last - dt.timedelta(days=7)).isoformat()
-                        frame = _fetch(yf, ticker, start)
-                        stored = con.execute(
-                            f"SELECT date, close, dividends, splits FROM {RAW_TABLE} "
-                            f"WHERE ticker = ? AND date >= ?", [ticker, start]).fetchdf()
-                        stored["date"] = pd.to_datetime(stored["date"]).dt.date
-                        reason = repull_reason(stored, frame)
-                        if reason:
-                            res.full_repull = reason
-                            frame = _fetch(yf, ticker)
-                    else:
-                        res.full_repull = "initial" if not force_full else "forced"
-                        frame = _fetch(yf, ticker)
-
-                    if frame.empty:
+            for chunk in _chunks(full, batch_size):
+                pulled = _download(yf, [mapping[t][0] for t in chunk])
+                for ticker in chunk:
+                    yf_symbol, scale = mapping[ticker]
+                    res = results[ticker]
+                    if yf_symbol not in pulled:
                         res.error = "no data returned"
                         reporter.advance(1, note=f"{ticker} empty")
-                        results.append(res)
                         continue
-
-                    _replace(con, ticker, frame, whole_ticker=bool(res.full_repull))
-                    after = con.execute(f"SELECT count(*) FROM {RAW_TABLE} "
-                                        f"WHERE ticker = ?", [ticker]).fetchone()[0]
-                    res.rows_added = max(after - before, 0)
-                    res.first_date = str(frame["date"].min())
-                    res.last_date = str(frame["date"].max())
+                    frame = _scale(_normalise(pulled[yf_symbol], ticker), scale)
+                    _store(con, ticker, frame, res, whole_ticker=True)
                     note = f"{ticker} +{res.rows_added}"
-                    if res.full_repull and res.full_repull != "initial":
+                    if res.full_repull not in ("initial", "forced"):
                         note += f" (full re-pull: {res.full_repull})"
                     reporter.advance(1, note=note)
-                except Exception as exc:
-                    res.error = f"{type(exc).__name__}: {str(exc)[:120]}"
-                    reporter.advance(1, note=f"{ticker} error")
-                results.append(res)
     finally:
         con.close()
-    return results
+    return [results[t] for t in tickers]
+
+
+def _chunks(items: list, size: int):
+    for i in range(0, len(items), max(size, 1)):
+        yield items[i:i + size]
+
+
+def _store(con, ticker: str, frame: pd.DataFrame, res: DailySyncResult,
+           whole_ticker: bool) -> None:
+    try:
+        before = con.execute(f"SELECT count(*) FROM {RAW_TABLE} WHERE ticker = ?",
+                             [ticker]).fetchone()[0]
+        _replace(con, ticker, frame, whole_ticker=whole_ticker)
+        after = con.execute(f"SELECT count(*) FROM {RAW_TABLE} WHERE ticker = ?",
+                            [ticker]).fetchone()[0]
+        res.rows_added = max(after - before, 0)
+        res.first_date = str(frame["date"].min())
+        res.last_date = str(frame["date"].max())
+    except Exception as exc:
+        res.error = f"{type(exc).__name__}: {str(exc)[:120]}"
 
 
 # --- Daily bars: read ------------------------------------------------------
@@ -484,16 +570,18 @@ def sync_earnings(tickers: list[str],
     the pipeline needs the whole universe at once.
     """
     yf = _yf()
+    mapping = _vendor_map(tickers)
     reporter = reporter or NullReporter()
     rows = []
     with reporter.stage("earnings", "Earnings calendar", total=len(tickers)):
         for ticker in tickers:
             try:
-                frame = yf.Ticker(ticker).get_earnings_dates(limit=8)
+                frame = yf.Ticker(mapping[ticker][0]).get_earnings_dates(limit=8)
                 if frame is not None and not frame.empty:
                     for stamp, row in frame.iterrows():
                         rows.append({
                             "ticker": ticker,
+                            "time_of_day": earnings_time_of_day(stamp),
                             "earnings_date": pd.Timestamp(stamp).tz_localize(None).date()
                             if pd.Timestamp(stamp).tzinfo else pd.Timestamp(stamp).date(),
                             "eps_estimate": row.get("EPS Estimate"),
@@ -509,8 +597,46 @@ def sync_earnings(tickers: list[str],
     frame = pd.DataFrame(rows)
     if not frame.empty:
         frame = frame.drop_duplicates(subset=["ticker", "earnings_date"])
-        frame.to_parquet(reference_dir() / EARNINGS_FILE, index=False)
+        _merge_into(reference_dir() / EARNINGS_FILE, frame, "ticker", tickers)
     return frame
+
+
+def earnings_time_of_day(stamp) -> str:
+    """bmo / amc / during / unknown from a yfinance earnings timestamp (ET).
+
+    yfinance reports midnight when the time is not known, so 00:00 is
+    "unknown" rather than "before the open"."""
+    try:
+        stamp = pd.Timestamp(stamp)
+        if stamp.tzinfo is not None:
+            stamp = stamp.tz_convert("America/New_York")
+    except Exception:
+        return "unknown"
+    minutes = stamp.hour * 60 + stamp.minute
+    if minutes == 0:
+        return "unknown"
+    if minutes < 9 * 60 + 30:
+        return "bmo"
+    if minutes >= 16 * 60:
+        return "amc"
+    return "during"
+
+
+def _merge_into(path, fresh: pd.DataFrame, key: str, requested: list[str]) -> None:
+    """Replace the rows for the requested symbols; keep everyone else's.
+
+    Until Phase 9 both reference files were overwritten with only the
+    symbols just pulled, so a `--tickers` subset run (or a one-symbol refresh)
+    silently deleted every other stock's earnings dates -- and the fail-safe
+    earnings rule then blocked all of them as "unknown"."""
+    if path.exists():
+        try:
+            existing = pd.read_parquet(path)
+            existing = existing[~existing[key].isin(requested)]
+            fresh = pd.concat([existing, fresh], ignore_index=True)
+        except Exception:
+            pass
+    fresh.to_parquet(path, index=False)
 
 
 def load_earnings() -> pd.DataFrame:
@@ -624,12 +750,13 @@ def sync_dividends(tickers: list[str],
                     reporter: BaseReporter | None = None) -> pd.DataFrame:
     """Ex-dividend dates and amounts, for the early-assignment warning."""
     yf = _yf()
+    mapping = _vendor_map(tickers)
     reporter = reporter or NullReporter()
     rows = []
     with reporter.stage("dividends", "Dividend ex-dates", total=len(tickers)):
         for ticker in tickers:
             try:
-                series = yf.Ticker(ticker).dividends
+                series = yf.Ticker(mapping[ticker][0]).dividends
                 if series is not None and len(series):
                     recent = series.tail(12)
                     for stamp, amount in recent.items():
@@ -646,7 +773,7 @@ def sync_dividends(tickers: list[str],
     frame = pd.DataFrame(rows)
     if not frame.empty:
         frame = frame.drop_duplicates(subset=["symbol", "ex_date"])
-        frame.to_parquet(reference_dir() / DIVIDENDS_FILE, index=False)
+        _merge_into(reference_dir() / DIVIDENDS_FILE, frame, "symbol", tickers)
     return frame
 
 

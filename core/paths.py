@@ -92,10 +92,20 @@ def raw_1m_dir() -> Path:
     return _ensure(data_dir() / "raw_1m")
 
 
+def config_dir() -> Path:
+    """Versioned, hand-maintained inputs: macro calendar, registry snapshot."""
+    return _ensure(project_root() / "config")
+
+
 # --- Databases -------------------------------------------------------------
 
 def db_universe_daily() -> Path:
     return data_dir() / "universe_daily.duckdb"
+
+
+def db_universe() -> Path:
+    """Universe registry, market metrics and the events table (Phase 9)."""
+    return data_dir() / "universe.duckdb"
 
 
 def db_1m_cache() -> Path:
@@ -201,8 +211,31 @@ def final_universe_file() -> Path:
     return output_dir() / "final_universe.txt"
 
 
-def load_universe() -> list[str]:
-    """The confirmed tradable ticker list, one per line, '#' comments ignored."""
+def load_universe(scope: str = "csp") -> list[str]:
+    """Active symbols from the universe registry (Phase 9).
+
+    scope="csp" (default): what the cash-secured-put engine can trade --
+      active and physically settled (no cash-settled indices). Every
+      pre-Phase-9 caller meant this, so the default preserves them.
+    scope="all": every active symbol, indices included -- for the data
+      stages (daily bars, market metrics, events).
+
+    Falls back to `output/final_universe.txt` when the registry has not been
+    built, so a fresh clone still runs.
+    """
+    try:
+        from data_sources import universe as registry
+        symbols = registry.symbols(scope=scope)
+        if symbols:
+            return symbols
+    except Exception:
+        pass
+    return load_universe_file()
+
+
+def load_universe_file() -> list[str]:
+    """`output/final_universe.txt`: one ticker per line, '#' comments ignored.
+    Now an import format for the registry rather than the source of truth."""
     path = final_universe_file()
     if not path.exists():
         return []

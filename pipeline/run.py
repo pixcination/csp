@@ -5,6 +5,7 @@ The activation button.
     python pipeline/run.py --quick         # skip refresh, analyse what is on disk
     python pipeline/run.py --tickers SPY,F # a subset
     python pipeline/run.py --force-chains  # ignore the staleness window
+    python pipeline/run.py --data-only     # nightly: bars, metrics, events; no chains
 
 One orchestrator owns the whole run. Each stage decides for itself whether it
 has anything to do, so the cost of pressing the button scales with how stale
@@ -45,9 +46,13 @@ from core.progress import BaseReporter, ConsoleReporter  # noqa: E402
 
 STAGES = [
     ("preflight", "Preflight and session"),
+    ("universe", "Universe registry"),
     ("reference", "Reference data"),
     ("daily", "Daily bars"),
     ("earnings", "Earnings calendar"),
+    ("metrics", "Market metrics"),
+    ("events", "Events calendar"),
+    ("stage1", "Stage 1 screen"),
     ("chains", "Option chains"),
     ("analyse", "Analysis"),
     ("candidates", "Ranking candidates"),
@@ -223,24 +228,90 @@ def _stage_daily(reporter: BaseReporter, manifest: RunManifest,
             "dividend_rows": dividends}
 
 
+def _stage_universe(reporter: BaseReporter, manifest: RunManifest) -> dict:
+    from data_sources import universe
+    with reporter.stage("universe", "Universe registry", total=1):
+        rows = universe.ensure()
+        frame = universe.load(active_only=True)
+        counts = frame["asset_class"].value_counts().to_dict()
+        reporter.advance(1, note=f"{len(frame)} active of {rows}: " +
+                         ", ".join(f"{v} {k}" for k, v in sorted(counts.items())))
+    return {"rows": rows, "active": len(frame), "by_class": counts}
+
+
+def _stocks(tickers: list[str]) -> list[str]:
+    """Only stocks report earnings; asking yfinance for SPY's is noise."""
+    try:
+        from data_sources import universe
+        frame = universe.load()
+        stocks = set(frame.loc[frame["asset_class"] == "stock", "symbol"])
+        return [t for t in tickers if t in stocks or t not in set(frame["symbol"])]
+    except Exception:
+        return tickers
+
+
 def _stage_earnings(reporter: BaseReporter, manifest: RunManifest,
                      tickers: list[str], max_age_hours: int = 20) -> dict:
     from core.paths import reference_dir
     from data_sources import yfinance_sync
+    tickers = _stocks(tickers)
     path = reference_dir() / yfinance_sync.EARNINGS_FILE
     if path.exists():
         age = dt.datetime.now() - dt.datetime.fromtimestamp(path.stat().st_mtime)
-        if age < dt.timedelta(hours=max_age_hours):
+        known = set(yfinance_sync.load_earnings().get("ticker", pd.Series(dtype=str)))
+        # Fresh AND complete: a symbol added since the last pull must not wait a day.
+        if age < dt.timedelta(hours=max_age_hours) and set(tickers) <= known:
             with reporter.stage("earnings", "Earnings calendar"):
                 reporter.skip(f"{age.total_seconds() / 3600:.0f}h old")
             return {"skipped": True}
     frame = yfinance_sync.sync_earnings(tickers, reporter=reporter)
     covered = frame["ticker"].nunique() if not frame.empty else 0
     if covered < len(tickers):
+        missing = sorted(set(tickers) - set(frame["ticker"])) if not frame.empty else tickers
         manifest.warnings.append(
-            f"earnings dates found for only {covered}/{len(tickers)} tickers -- "
-            f"the rest are treated as blocked until confirmed")
+            f"yfinance earnings dates missing for {len(missing)}/{len(tickers)} stock(s) "
+            f"({', '.join(missing[:6])}); TastyTrade dates still apply -- the events "
+            f"stage reports what remains unknown")
     return {"tickers_covered": covered, "rows": len(frame)}
+
+
+def _stage_metrics(reporter: BaseReporter, manifest: RunManifest,
+                   tickers: list[str]) -> dict:
+    from data_sources import tasty_metrics
+    result = tasty_metrics.sync(tickers, reporter=reporter)
+    if result["errors"]:
+        manifest.warnings.append(f"market metrics: {result['errors'][0]}")
+    if result["missing"]:
+        manifest.warnings.append(
+            f"market metrics missing for: {', '.join(result['missing'][:8])}")
+    return result
+
+
+def _stage_events(reporter: BaseReporter, manifest: RunManifest,
+                  tickers: list[str]) -> dict:
+    from data_sources import events
+    counts = events.build(reporter=reporter)
+    health = events.earnings_health()
+    if not health["healthy"]:
+        manifest.warnings.append(f"earnings calendar: {health['note']}")
+    disagree = events.load()
+    disagree = disagree[(disagree["type"] == "earnings") & disagree["sources_disagree"]
+                        & (disagree["date"] >= dt.date.today())]
+    for row in disagree.itertuples():
+        reporter.log(f"  earnings date disagreement {row.symbol}: {row.note}")
+    return {"counts": counts, "earnings_coverage": health["coverage"],
+            "earnings_missing": health["missing"],
+            "disagreements": disagree["symbol"].tolist()}
+
+
+def _stage_stage1(reporter: BaseReporter, manifest: RunManifest,
+                  tickers: list[str]) -> dict:
+    from analytics import universe_screen
+    with reporter.stage("stage1", "Stage 1 screen", total=1):
+        frame = universe_screen.screen(tickers)
+        counts = frame["tier"].value_counts().to_dict()
+        reporter.advance(1, note=", ".join(f"{v} {k}" for k, v in counts.items()))
+    return {"tiers": counts}
 
 
 def _stage_chains(reporter: BaseReporter, manifest: RunManifest,
@@ -513,20 +584,29 @@ import pandas as pd  # noqa: E402  (used by helpers above)
 # --- Entry point -----------------------------------------------------------
 
 def run(tickers: list[str] | None = None, quick: bool = False,
-        force_chains: bool = False,
+        force_chains: bool = False, data_only: bool = False,
         reporter: BaseReporter | None = None) -> RunManifest:
-    universe = tickers or load_universe()
-    if not universe:
+    """`data_only`: refresh data (bars, earnings, metrics, events, Stage 1)
+    and stop -- the nightly job, so the interactive run only pulls chains."""
+    # Data stages cover every active registry symbol, indices included;
+    # chains and the CSP analysis cover what a cash-secured put can trade.
+    data_universe = tickers or load_universe(scope="all")
+    tradable = set(load_universe(scope="csp"))
+    registered = set(load_universe(scope="all"))
+    # --tickers may name symbols not yet in the registry; those are treated
+    # as tradable (the registry default is a physically settled stock).
+    universe = [t for t in data_universe if t in tradable or t not in registered]
+    if not data_universe:
         raise RuntimeError(
-            "No universe. output/final_universe.txt is missing or empty -- "
-            "run the Stage 3 screen, or pass --tickers.")
+            "No universe. The registry and output/final_universe.txt are both "
+            "empty -- add symbols on the Universe page, or pass --tickers.")
 
     info = classify()
     manifest = RunManifest(
         run_id=dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4],
         started_at=dt.datetime.now().isoformat(timespec="seconds"),
         session_block=session_block(), session_state=info.state.value,
-        tickers=len(universe))
+        tickers=len(data_universe))
 
     reporter = reporter or ConsoleReporter(STAGES)
     started = dt.datetime.now()
@@ -541,12 +621,19 @@ def run(tickers: list[str] | None = None, quick: bool = False,
 
     with RunLock():
         guarded("preflight", _stage_preflight, reporter, manifest)
+        guarded("universe", _stage_universe, reporter, manifest)
         if not quick:
             guarded("reference", _stage_reference, reporter, manifest)
-            guarded("daily", _stage_daily, reporter, manifest, universe)
-            guarded("earnings", _stage_earnings, reporter, manifest, universe)
-            guarded("chains", _stage_chains, reporter, manifest, universe, force_chains)
-        guarded("analyse", _stage_analyse, reporter, manifest, universe)
+            guarded("daily", _stage_daily, reporter, manifest, data_universe)
+            guarded("earnings", _stage_earnings, reporter, manifest, data_universe)
+            guarded("metrics", _stage_metrics, reporter, manifest, data_universe)
+            guarded("events", _stage_events, reporter, manifest, data_universe)
+            guarded("stage1", _stage_stage1, reporter, manifest, data_universe)
+            if not data_only:
+                guarded("chains", _stage_chains, reporter, manifest, universe,
+                        force_chains)
+        if not data_only:
+            guarded("analyse", _stage_analyse, reporter, manifest, universe)
 
     manifest.finished_at = dt.datetime.now().isoformat(timespec="seconds")
     manifest.elapsed_seconds = (dt.datetime.now() - started).total_seconds()
@@ -562,14 +649,16 @@ def main() -> int:
                      help="skip all refresh stages; analyse what is on disk")
     ap.add_argument("--force-chains", action="store_true",
                      help="re-pull chains regardless of the staleness window")
+    ap.add_argument("--data-only", action="store_true",
+                    help="refresh data only (nightly job): no chains, no analysis")
     args = ap.parse_args()
 
     tickers = ([t.strip().upper() for t in args.tickers.split(",") if t.strip()]
                if args.tickers else None)
     reporter = ConsoleReporter(STAGES)
     try:
-        manifest = run(tickers, quick=args.quick,
-                        force_chains=args.force_chains, reporter=reporter)
+        manifest = run(tickers, quick=args.quick, force_chains=args.force_chains,
+                       data_only=args.data_only, reporter=reporter)
     except RunLocked as exc:
         print(f"\n{exc}")
         return 2

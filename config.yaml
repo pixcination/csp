@@ -44,6 +44,7 @@ stage1_thresholds:
   min_rv: 0.12
   max_rv: 0.75
   max_drawdown_floor: -0.65
+  drawdown_lookback_years: 10     # Phase 9 yfinance screen: drawdown window (null = all history)
 
 # === Stage 3: chain scan rate limiting ===
 # TastyTrade/dxFeed enforces 25,000 subscriptions/session and 10,000
@@ -321,3 +322,34 @@ freshness:
   dividends_days: 35           # data/reference/dividends.parquet
   reference_days: 3            # treasury rates, volatility indices
   chains_days: 7               # newest data/chains/<block>
+  market_metrics_days: 3       # data/universe.duckdb market_metrics (Phase 9)
+  events_days: 3               # data/universe.duckdb events (Phase 9)
+
+# --- Events and caution policy (Phase 9) --------------------------------------
+# What an event inside a trade's life does to it. data_sources/events.py.
+#   action:      block (reject) | warn (flag, keep) | ignore
+#   days_before / days_after: widen the window around the trade
+#               [entry - days_before, expiration + days_after]
+#   applies_to:  strategies the rule covers (csp, pcs, covered_call)
+#   asset_classes: omit for all
+# Earnings with no known forward date still fail safe (block) for STOCKS
+# while the calendar as a whole is healthy -- never for ETFs or indices,
+# which do not report earnings (that rule blocked every ETF before Phase 9).
+event_policy:
+  earnings:       {action: block, days_before: 0, days_after: 0, applies_to: [csp, pcs, covered_call], asset_classes: [stock]}
+  fomc:           {action: warn,   days_before: 0, days_after: 0, applies_to: [csp, pcs, covered_call]}
+  cpi:            {action: warn,   days_before: 0, days_after: 0, applies_to: [csp, pcs, covered_call]}
+  nfp:            {action: ignore, days_before: 0, days_after: 0, applies_to: [csp, pcs, covered_call]}
+  ex_dividend:    {action: warn,   days_before: 0, days_after: 0, applies_to: [covered_call]}
+  split:          {action: warn,   days_before: 0, days_after: 0, applies_to: [csp, pcs, covered_call]}
+  opex:           {action: ignore, days_before: 0, days_after: 0, applies_to: [csp, pcs, covered_call]}
+  quad_witching:  {action: ignore, days_before: 0, days_after: 0, applies_to: [csp, pcs, covered_call]}
+
+events:
+  opex_years_back: 2
+  opex_years_forward: 2
+  earnings_disagree_days: 1        # |yfinance - tasty| beyond this = sources_disagree
+  earnings_health_min_coverage: 0.5
+
+market_metrics:
+  batch_size: 50

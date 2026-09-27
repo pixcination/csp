@@ -21,8 +21,8 @@ from pathlib import Path
 
 from core.market_calendar import (ET, is_trading_day, previous_trading_day,
                                   trading_days_between)
-from core.paths import (chains_dir, db_1m_cache, db_universe_daily, load_config,
-                        reference_dir)
+from core.paths import (chains_dir, db_1m_cache, db_universe, db_universe_daily,
+                        load_config, reference_dir)
 
 OK, WARN, MISSING = "ok", "warn", "missing"
 
@@ -33,6 +33,8 @@ DEFAULTS = {
     "dividends_days": 35,
     "reference_days": 3,
     "chains_days": 7,
+    "market_metrics_days": 3,
+    "events_days": 3,
 }
 
 
@@ -128,6 +130,37 @@ def _file(key: str, label: str, path: Path, limit_days: float, hint: str) -> Fre
                      "" if status == OK else hint)
 
 
+def _universe_table(key: str, label: str, query: str, limit_days: float,
+                    hint: str) -> Freshness:
+    """Age of a Phase 9 table in data/universe.duckdb, from its own stamp."""
+    import duckdb
+    path = db_universe()
+    if not path.exists():
+        return Freshness(key, label, MISSING, None, "--", hint)
+    try:
+        con = duckdb.connect(str(path), read_only=True)
+        try:
+            last = con.execute(query).fetchone()[0]
+        finally:
+            con.close()
+    except Exception:
+        last = None
+    if last is None:
+        return Freshness(key, label, MISSING, None, "--", hint)
+    last = pd_timestamp(last)
+    days = (dt.datetime.now() - last).total_seconds() / 86400
+    status = WARN if days > limit_days else OK
+    age = f"{days * 24:.0f}h old" if days < 2 else f"{days:.0f}d old"
+    return Freshness(key, label, status, last.strftime("%Y-%m-%d %H:%M"), age,
+                     "" if status == OK else hint)
+
+
+def pd_timestamp(value) -> dt.datetime:
+    if isinstance(value, dt.datetime):
+        return value
+    return dt.datetime.combine(value, dt.time())
+
+
 def _chains(limits: dict) -> Freshness:
     root = chains_dir()
     blocks = sorted(p for p in root.iterdir() if p.is_dir()) if root.exists() else []
@@ -155,6 +188,11 @@ def report() -> list[Freshness]:
               limits["reference_days"], "reference refresh"),
         _file("vol_indices", "Volatility indices", ref / "vol_indices.parquet",
               limits["reference_days"], "reference refresh"),
+        _universe_table("metrics", "Market metrics (TastyTrade)",
+                        "SELECT max(fetched_at) FROM market_metrics",
+                        limits["market_metrics_days"], "IV rank / percentile; re-run the pipeline"),
+        _universe_table("events", "Events table", "SELECT max(built_at) FROM events",
+                        limits["events_days"], "earnings / macro / OPEX gates; re-run the pipeline"),
         _chains(limits),
         _cache_1m(limits),
     ]

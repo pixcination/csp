@@ -169,21 +169,24 @@ def _yahoo(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 class _FakeYF:
+    """Stands in for yfinance.download (Phase 9 batches the sync)."""
+
     def __init__(self, frame):
         self.frame = frame
         self.calls = []
 
-    def Ticker(self, ticker):                   # noqa: N802 (yfinance API)
-        fake = self
+    def download(self, symbols, start=None, period=None, **_):
+        self.calls.append("full" if period == "max" else f"since {start}")
+        f = self.frame
+        if start:
+            f = f[pd.to_datetime(f["date"]) >= pd.Timestamp(start)]
+        yahoo = _yahoo(f)
+        return pd.concat({s: yahoo for s in symbols}, axis=1)
 
-        class _T:
-            def history(self, start=None, period=None, **_):
-                fake.calls.append("full" if period == "max" else f"since {start}")
-                f = fake.frame
-                if start:
-                    f = f[pd.to_datetime(f["date"]) >= pd.Timestamp(start)]
-                return _yahoo(f)
-        return _T()
+
+@pytest.fixture(autouse=True)
+def _identity_vendor_map(monkeypatch):
+    monkeypatch.setattr(ys, "_vendor_map", lambda tickers: {t: (t, 1.0) for t in tickers})
 
 
 def test_repull_reason_detects_every_invalidating_change():
@@ -411,6 +414,7 @@ def test_freshness_report_never_raises(monkeypatch, tmp_path):
     from core import freshness
     monkeypatch.setattr(freshness, "db_universe_daily", lambda: tmp_path / "none.duckdb")
     monkeypatch.setattr(freshness, "db_1m_cache", lambda: tmp_path / "none2.duckdb")
+    monkeypatch.setattr(freshness, "db_universe", lambda: tmp_path / "none3.duckdb")
     monkeypatch.setattr(freshness, "reference_dir", lambda: tmp_path)
     monkeypatch.setattr(freshness, "chains_dir", lambda: tmp_path / "chains")
     items = freshness.report()

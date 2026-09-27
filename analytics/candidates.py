@@ -110,6 +110,13 @@ class Recommendation:
     term_structure_ratio: float | None = None
     event_suspected: bool = False
 
+    # Phase 9: TastyTrade market metrics and the events check
+    ivr: float | None = None                 # tasty IV index rank (tos source), 0-1
+    ivp: float | None = None                 # tasty IV percentile, 0-1
+    iv_index: float | None = None
+    liquidity_rating: int | None = None
+    events: tuple = ()                       # every event hit, as text
+
     def to_dict(self) -> dict:
         out = asdict(self)
         out["expiration"] = str(self.expiration)
@@ -225,7 +232,11 @@ def evaluate_strike(ticker: str, row: pd.Series, spot: float, daily: pd.DataFram
                      regime_reading, ticker_committed: float = 0.0,
                      earnings_blocks: bool = False,
                      earnings_note: str = "",
-                     context: dict | None = None) -> Recommendation | None:
+                     context: dict | None = None,
+                     event_rejections: tuple = (),
+                     event_warnings: tuple = (),
+                     event_hits: tuple = (),
+                     metrics: dict | None = None) -> Recommendation | None:
     strike = float(row["strike_price"])
     expiration = pd.Timestamp(row["expiration"]).date()
     today = dt.datetime.now(ET).date()
@@ -296,6 +307,9 @@ def evaluate_strike(ticker: str, row: pd.Series, spot: float, daily: pd.DataFram
     if earnings_blocks and earnings_note:
         rejections = [r if "earnings" not in r else f"earnings: {earnings_note}"
                       for r in rejections]
+    # Non-earnings events the policy blocks or warns on (FOMC, CPI...).
+    rejections.extend(event_rejections)
+    warnings.extend(event_warnings)
     if size.rejected:
         rejections.extend(size.reasons or ("no tradable size",))
     if ev == ev and ev <= 0:
@@ -371,6 +385,10 @@ def evaluate_strike(ticker: str, row: pd.Series, spot: float, daily: pd.DataFram
         rationale=_rationale(ticker, strike, expiration, fill, contracts, net,
                               prob_otm, ev_ann, ratio, basis_note, size, sample),
         open_interest=oi, option_volume=volume,
+        ivr=(metrics or {}).get("ivr"), ivp=(metrics or {}).get("ivp"),
+        iv_index=(metrics or {}).get("iv_index"),
+        liquidity_rating=(metrics or {}).get("liquidity_rating"),
+        events=tuple(event_hits),
     )
 
 
@@ -424,7 +442,8 @@ def evaluate_universe(tickers: list[str] | None = None,
     """
     from core.paths import load_universe
     from data_sources import chains
-    from data_sources.yfinance_sync import earnings_guard, load_daily
+    from data_sources import events, tasty_metrics
+    from data_sources.yfinance_sync import load_daily
 
     cfg = load_config()
     tickers = tickers or load_universe()
@@ -435,11 +454,15 @@ def evaluate_universe(tickers: list[str] | None = None,
 
     # Checked once, not per ticker: an empty calendar would otherwise block
     # every candidate in the universe, each rejection looking individually
-    # reasonable while the run silently produced nothing.
-    from data_sources.yfinance_sync import earnings_calendar_health
-    calendar = earnings_calendar_health(tickers)
+    # reasonable while the run silently produced nothing. Phase 9: measured
+    # over STOCKS only, from the merged yfinance + TastyTrade events table.
+    if events.load().empty:
+        events.build()
+    calendar = events.earnings_health(tickers)
     if not calendar["healthy"]:
         reporter.log(f"EARNINGS GATE DEGRADED: {calendar['note']}")
+    metrics_by_symbol = {r["symbol"]: r for r in
+                         tasty_metrics.latest(tickers, max_age_days=5).to_dict("records")}
 
     rows: list[Recommendation] = []
     with reporter.stage("candidates", "Ranking candidates", total=len(tickers)):
@@ -461,19 +484,29 @@ def evaluate_universe(tickers: list[str] | None = None,
 
                 # Per-ticker signals, computed once rather than per strike.
                 context = _ticker_context(ticker, chain, spot)
-                guard_hits = {}
+                checks = {}
                 for expiration in strikes["expiration"].dt.date.unique():
-                    guard = earnings_guard(ticker, expiration, today,
-                                            calendar_healthy=calendar["healthy"])
-                    guard_hits[expiration] = (guard.blocks_expiry, guard.note)
+                    checks[expiration] = events.check(
+                        ticker, today, expiration, "csp",
+                        calendar_healthy=calendar["healthy"])
 
                 for _, row in strikes.iterrows():
                     expiration = pd.Timestamp(row["expiration"]).date()
-                    blocks, note = guard_hits.get(expiration, (False, ""))
+                    check = checks[expiration]
+                    earnings_hit = check.earnings_block
+                    others_block = tuple(h.text() for h in check.hits
+                                         if h.action == "block" and h.type != "earnings")
+                    warn = tuple(h.text() for h in check.hits if h.action == "warn")
                     rec = evaluate_strike(ticker, row, spot, daily, adv, account,
                                            cfg, regime_reading,
-                                           earnings_blocks=blocks, earnings_note=note,
-                                           context=context)
+                                           earnings_blocks=earnings_hit is not None,
+                                           earnings_note=(earnings_hit.note
+                                                          if earnings_hit else ""),
+                                           context=context,
+                                           event_rejections=others_block,
+                                           event_warnings=warn,
+                                           event_hits=tuple(h.text() for h in check.hits),
+                                           metrics=metrics_by_symbol.get(ticker))
                     if rec is not None:
                         rows.append(rec)
                 accepted = sum(1 for r in rows if r.ticker == ticker and r.accepted)

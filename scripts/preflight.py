@@ -155,18 +155,23 @@ def check_data_freshness() -> None:
                   f"no data under {archive_root()} for any of {len(rows)} tickers "
                   f"-- run scripts/03_copy_selected_tickers.py with the external "
                   f"archive connected, or sync from Massive")
-        elif absent:
-            check(FAIL, f"1-minute archive missing for {len(absent)} ticker(s)",
-                  ", ".join(sorted(r["ticker"] for r in absent)[:10]))
-        elif not behind:
-            check(OK, "1-minute archive current")
-        elif worst and worst > 30:
-            check(FAIL, f"1-minute archive {worst} days behind",
-                  f"{len(behind)}/{len(rows)} tickers stale. "
-                  f"Run: python scripts/sync_archive.py")
         else:
-            check(WARN, f"1-minute archive {worst} days behind",
-                  f"{len(behind)}/{len(rows)} tickers stale")
+            if absent:
+                # Phase 9: registry symbols can be added that the archive never
+                # held. The archive is optional (gaps and intraday RV fall
+                # back), so a partial gap warns; only a missing archive fails.
+                check(WARN, f"1-minute archive missing for {len(absent)} ticker(s)",
+                      ", ".join(sorted(r["ticker"] for r in absent)[:10])
+                      + " -- gap analysis falls back to daily data for these")
+            if not behind:
+                check(OK, "1-minute archive current")
+            elif worst and worst > 30:
+                check(FAIL, f"1-minute archive {worst} days behind",
+                      f"{len(behind)}/{len(rows)} tickers stale. "
+                      f"Run: python scripts/sync_archive.py")
+            else:
+                check(WARN, f"1-minute archive {worst} days behind",
+                      f"{len(behind)}/{len(rows)} tickers stale")
     except Exception as exc:
         check(WARN, "Could not read 1-minute archive", str(exc)[:120])
 

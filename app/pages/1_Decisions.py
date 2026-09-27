@@ -86,6 +86,11 @@ else:
             st.caption(rec.get("rationale", ""))
 
             chips = []
+            if rec.get("ivr") is not None and rec.get("ivr") == rec.get("ivr"):
+                chips.append(f"IV rank {rec['ivr']:.0%} · IV percentile "
+                             f"{rec.get('ivp') or 0:.0%} (TastyTrade)")
+            for event in rec.get("events") or ():
+                chips.append(f"event: {event}")
             if not rec.get("scales", True):
                 chips.append(f"⚠ size capped by {rec.get('binding_constraint','')} — "
                               f"this trade does not scale with more capital")
@@ -151,7 +156,7 @@ if not sheet.empty and run_results.has_full_sheet:
                 lambda r: "; ".join(r) if r is not None and len(r) else "")
         columns = [c for c in ["ticker", "expiration", "strike", "dte_calendar",
                                "modelled_fill", "delta", "prob_otm_empirical",
-                               "ev_annualised", "iv_rv_ratio", "open_interest",
+                               "ev_annualised", "iv_rv_ratio", "ivr", "ivp", "open_interest",
                                "accepted", "selected", "proposed", "why_not"]
                    if c in view.columns]
         st.dataframe(

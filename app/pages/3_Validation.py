@@ -221,15 +221,33 @@ try:
     if coverage.empty:
         st.caption("No universe loaded.")
     else:
+        from data_sources import tasty_metrics
+        tasty = tasty_metrics.latest()
+        tasty_n = int(tasty["ivr"].notna().sum()) if not tasty.empty else 0
         active = int(coverage["active"].sum())
-        cols = st.columns(3)
-        cols[0].metric("Active", f"{active}/{len(coverage)}")
+        cols = st.columns(4)
+        cols[0].metric("Own IV rank active", f"{active}/{len(coverage)}")
         cols[1].metric("Median captures", f"{int(coverage['observations'].median())}")
         cols[2].metric("Median shortfall", f"{int(coverage['needed'].median())}")
-        if active < len(coverage):
-            st.caption(
-                f"At one weekday run during market hours, the median ticker is about "
-                f"{int(coverage['needed'].median())} trading days from switching on.")
-        st.dataframe(coverage, hide_index=True, width="stretch")
+        cols[3].metric("TastyTrade IVR available", f"{tasty_n}/{len(coverage)}")
+        st.caption(
+            "Since Phase 9 the engine carries TastyTrade's IV rank and percentile "
+            "(`/market-metrics`, rank source 'tos', stored daily) on every candidate. "
+            "Our own rank from captures stays as a cross-check and switches on per "
+            "ticker once it has enough regular-session captures.")
+        if not tasty.empty:
+            coverage = coverage.merge(
+                tasty[["symbol", "ivr", "ivr_tw", "ivp", "iv_index", "snapshot_date"]]
+                .rename(columns={"symbol": "ticker", "ivr": "tasty_ivr",
+                                 "ivr_tw": "tasty_ivr_tw", "ivp": "tasty_ivp",
+                                 "snapshot_date": "tasty_as_of"}),
+                on="ticker", how="left")
+        st.dataframe(coverage, hide_index=True, width="stretch", column_config={
+            "tasty_ivr": st.column_config.ProgressColumn(
+                "Tasty IVR", min_value=0.0, max_value=1.0, format="%.2f"),
+            "tasty_ivp": st.column_config.ProgressColumn(
+                "Tasty IVP", min_value=0.0, max_value=1.0, format="%.2f"),
+            "tasty_ivr_tw": st.column_config.NumberColumn("Tasty IVR (tw)", format="%.2f"),
+        })
 except Exception as exc:
     st.caption(f"Could not read IV history: {exc}")

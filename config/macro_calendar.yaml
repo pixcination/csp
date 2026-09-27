@@ -1,0 +1,67 @@
+# Macro event calendar -- maintained by hand (Phase 9).
+#
+# Read by data_sources/events.py into the `events` table (symbol "*").
+# What each event does to a trade is set in config.yaml -> event_policy.
+#
+# Sources, verified 2026-09-27:
+#   FOMC  https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+#         ("Each meeting date is tentative until confirmed at the meeting
+#          immediately preceding it.")  date = the decision (second) day,
+#         statement 14:00 ET.  sep: true = Summary of Economic Projections.
+#   CPI   https://www.bls.gov/schedule/news_release/cpi.htm       08:30 ET
+#   NFP   https://www.bls.gov/schedule/news_release/empsit.htm    08:30 ET
+#         BLS had not published 2027 dates yet -- ADD THEM when it does.
+#
+# Add a row: {date: YYYY-MM-DD, note: "..."}; optional time: "HH:MM".
+
+fomc:
+  time: "14:00"
+  dates:
+    - {date: 2026-01-28, note: "Jan 27-28"}
+    - {date: 2026-03-18, note: "Mar 17-18", sep: true}
+    - {date: 2026-04-29, note: "Apr 28-29"}
+    - {date: 2026-06-17, note: "Jun 16-17", sep: true}
+    - {date: 2026-07-29, note: "Jul 28-29"}
+    - {date: 2026-09-16, note: "Sep 15-16", sep: true}
+    - {date: 2026-10-28, note: "Oct 27-28"}
+    - {date: 2026-12-09, note: "Dec 8-9", sep: true}
+    - {date: 2027-01-27, note: "Jan 26-27"}
+    - {date: 2027-03-17, note: "Mar 16-17", sep: true}
+    - {date: 2027-04-28, note: "Apr 27-28"}
+    - {date: 2027-06-09, note: "Jun 8-9", sep: true}
+    - {date: 2027-07-28, note: "Jul 27-28"}
+    - {date: 2027-09-15, note: "Sep 14-15", sep: true}
+    - {date: 2027-10-27, note: "Oct 26-27"}
+    - {date: 2027-12-08, note: "Dec 7-8", sep: true}
+
+cpi:
+  time: "08:30"
+  dates:
+    - {date: 2026-01-13, note: "Dec 2025 CPI"}
+    - {date: 2026-02-13, note: "Jan 2026 CPI"}
+    - {date: 2026-03-11, note: "Feb 2026 CPI"}
+    - {date: 2026-04-10, note: "Mar 2026 CPI"}
+    - {date: 2026-05-12, note: "Apr 2026 CPI"}
+    - {date: 2026-06-10, note: "May 2026 CPI"}
+    - {date: 2026-07-14, note: "Jun 2026 CPI"}
+    - {date: 2026-08-12, note: "Jul 2026 CPI"}
+    - {date: 2026-09-11, note: "Aug 2026 CPI"}
+    - {date: 2026-10-14, note: "Sep 2026 CPI"}
+    - {date: 2026-11-10, note: "Oct 2026 CPI"}
+    - {date: 2026-12-10, note: "Nov 2026 CPI"}
+
+nfp:
+  time: "08:30"
+  dates:
+    - {date: 2026-01-09, note: "Dec 2025 payrolls"}
+    - {date: 2026-02-11, note: "Jan 2026 payrolls"}
+    - {date: 2026-03-06, note: "Feb 2026 payrolls"}
+    - {date: 2026-04-03, note: "Mar 2026 payrolls"}
+    - {date: 2026-05-08, note: "Apr 2026 payrolls"}
+    - {date: 2026-06-05, note: "May 2026 payrolls"}
+    - {date: 2026-07-02, note: "Jun 2026 payrolls"}
+    - {date: 2026-08-07, note: "Jul 2026 payrolls"}
+    - {date: 2026-09-04, note: "Aug 2026 payrolls"}
+    - {date: 2026-10-02, note: "Sep 2026 payrolls"}
+    - {date: 2026-11-06, note: "Oct 2026 payrolls"}
+    - {date: 2026-12-04, note: "Nov 2026 payrolls"}

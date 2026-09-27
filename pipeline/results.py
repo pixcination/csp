@@ -166,14 +166,18 @@ def load_run(run_id: str) -> RunResults | None:
     return result
 
 
-def latest_run(finished_only: bool = True) -> RunResults | None:
+def latest_run(finished_only: bool = True, with_analysis: bool = True) -> RunResults | None:
     """The newest run on disk, skipping ones that never finished (a crash or
-    a run still in progress) unless `finished_only` is False."""
+    a run still in progress) unless `finished_only` is False, and -- since
+    Phase 9's `--data-only` nightly job -- runs that analysed nothing, which
+    would otherwise blank every results page the morning after."""
     for run_id in list_runs():
         result = load_run(run_id)
         if result is None:
             continue
         if finished_only and not result.finished_at:
+            continue
+        if with_analysis and "analyse" not in (result.manifest.stages or {}):
             continue
         return result
     return None

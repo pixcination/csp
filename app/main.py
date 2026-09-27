@@ -40,6 +40,8 @@ pages = [
             icon=":material/donut_large:"),
     st.Page(str(PAGES_DIR / "5_Signals.py"), title="Signals",
             icon=":material/insights:"),
+    st.Page(str(PAGES_DIR / "6_Universe.py"), title="Universe",
+            icon=":material/list_alt:"),
 ]
 # The Phase-2 Scanner / Ticker Detail / Trade Log pages were retired to
 # legacy/ in Phase 8; the Screener and Trade Detail pages replace them.
