@@ -415,6 +415,7 @@ def test_freshness_report_never_raises(monkeypatch, tmp_path):
     monkeypatch.setattr(freshness, "db_universe_daily", lambda: tmp_path / "none.duckdb")
     monkeypatch.setattr(freshness, "db_1m_cache", lambda: tmp_path / "none2.duckdb")
     monkeypatch.setattr(freshness, "db_universe", lambda: tmp_path / "none3.duckdb")
+    monkeypatch.setattr(freshness, "db_technicals", lambda: tmp_path / "none4.duckdb")
     monkeypatch.setattr(freshness, "reference_dir", lambda: tmp_path)
     monkeypatch.setattr(freshness, "chains_dir", lambda: tmp_path / "chains")
     items = freshness.report()

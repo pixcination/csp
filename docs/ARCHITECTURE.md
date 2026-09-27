@@ -1,6 +1,6 @@
 # Architecture
 
-How the CSP / wheel screener is built **as of Phase 9** (2026-09-27). This
+How the CSP / wheel screener is built **as of Phase 10** (2026-09-27). This
 file describes the code as it is. Where the system is going is in
 [SCREENER_ROADMAP.md](SCREENER_ROADMAP.md); what each phase changed is in
 `docs/PHASE{N}_SUMMARY.md` (Phase 1: [PHASE1_NOTES.md](PHASE1_NOTES.md)). The
@@ -41,7 +41,7 @@ and is not repeated here. Read the docstring before changing a module.
           │
  pipeline/run.py  (one orchestrator, staleness-aware, run lock)
    preflight → universe → reference → daily → earnings → metrics → events
-             → stage1 → chains → analyse          (--data-only stops before chains)
+             → stage1 → technicals → chains → analyse   (--data-only stops before chains)
                                                    │
           ┌────────────────────────────────────────┘
           ▼
@@ -98,7 +98,7 @@ D:\csp\
 │   ├── components/        charts.py, formatting.py, run_state.py
 │   └── pages/             0_Command_Center … 5_Signals, 6_Universe
 ├── scripts/               CLI entry points (section 8)
-├── tests/                 test_foundation, test_phase3 … test_phase9
+├── tests/                 test_foundation, test_phase3 … test_phase10
 ├── vendor/tastytrade/     vendored client (tastytrade_common, snapshot_loop)
 ├── legacy/                the retired Phase-2 stack; not imported (Phase 8)
 ├── weekly_move_analysis/  the original move study, kept as a script
@@ -120,6 +120,7 @@ D:\csp\
 | same → `events` | `data_sources/events.py` | Derived each run: earnings (merged sources), ex-dividend (history + projection), splits, FOMC/CPI/NFP, OPEX, quad witching. |
 | `data/universe_daily.duckdb` → `daily_bars_raw` | `yfinance_sync.sync_daily` | Raw daily OHLCV from yfinance `auto_adjust=False` (Close is split-adjusted, not dividend-adjusted), Yahoo `adj_close`, dividends, splits. One row per ticker/date, under the canonical symbol (XSP is stored as ^SPX × 0.1). |
 | same → `daily_bars`, `ticker_meta` | `scripts/01` | Legacy daily bars resampled from the 1-minute archive (split-adjusted). Fallback only. |
+| `data/technicals.duckdb` → `indicator_latest`, `level_stats`, `oscillator_stats` | `analytics/technical_study.py` (pipeline `technicals` stage) | Derived nightly: the last row of every daily and weekly indicator plus trend state (long format); the level-respect event study per symbol × level × horizon × slope regime; RSI-extreme forward returns. Safe to delete. |
 | `data/raw_1m_cache.duckdb` → `bars_1m` | `scripts/06` | Normalised 1-minute bars for the universe; used by `gaps.py` and intraday RV. |
 | `data/chains/<session_block>/` | `data_sources/chains.py` | Chain snapshots: `<T>_chain.parquet` + `<T>_underlying.parquet`, keyed by session block (`2026-09-25_rth_14`, `_pre`, `_post`, `_closed`; a whole weekend shares one `_closed` block). |
 | `data/stage3_chains/<date>/` | `scripts/04` | Legacy chain snapshots; still read by `iv_history.py`. |
@@ -204,6 +205,7 @@ degrades to warn if under half the stocks have a forward date.
 | metrics | TastyTrade `/market-metrics`, 50 per request; updates registry sector/weeklies | today's snapshot stored |
 | events | rebuild the events table; report earnings coverage and date disagreements | — |
 | stage1 | Stage 1 thresholds on yfinance bars → registry (advisory) | — |
+| technicals | indicators, trend state, level-respect and RSI studies → `data/technicals.duckdb` (~2.4 s per symbol) | symbol already studied through its latest bar |
 | chains | TastyTrade capture (≤21 DTE; ≤60 for tickers with open paper positions), CSP-tradable symbols only | snapshot current for this session block |
 | analyse | regime, capacity, open-position management, `evaluate_universe` (events check, IVR/IVP on every row) → `select_sheet` → `portfolio.select`, stress, wheel (covered calls, rolls) | — |
 
@@ -238,7 +240,8 @@ Pure Python, config-driven, no Streamlit imports. Grouped by job:
 | Probability of outcome | `moves.py` (empirical P(breach)/P(touch), vol-conditioned, effective n), `options_math.py` (Black-Scholes, Greeks, IV solve), `volatility.py` (close-to-close, Parkinson, Garman-Klass, intraday RV) |
 | Market pricing | `vrp.py` (IV/RV), `skew.py` (put skew, term structure), `surface.py` (per-snapshot vol surface, forward), `iv_history.py` (own IV rank, needs 10+ captures) |
 | Risk context | `regime.py` (VIX term-structure gate), `gaps.py` (overnight gap risk, corporate-action seam filter), `technicals.py` (SMA/RSI/52-week), `earnings_history.py` (past report reactions: gap, close-to-close, two-session, ATR multiple; implied move once snapshots exist) |
-| Universe | `universe_screen.py` (Stage 1 on yfinance; drawdown over `drawdown_lookback_years`), `bars.py` (weekly resample, no-lookahead alignment) |
+| Universe | `universe_screen.py` (Stage 1 on yfinance; drawdown over `drawdown_lookback_years`), `bars.py` (weekly resample, no-lookahead alignment via `weekly_positions`) |
+| Technicals (Phase 10) | `indicators.py` (SMA/EMA 9–200, RSI, ATR, Bollinger, MACD, ADX, 52-week, volume ratio; daily and weekly as `w_*`), `trend_state.py` (uptrend/range/downtrend per day), `level_respect.py` (MA test events → held/bounced/broke, pierce depth, Wilson CIs, **block-bootstrap placebo**, slope split, `support_map`), `oscillator_study.py` (RSI-extreme episodes vs baseline), `technical_study.py` (cache and pipeline stage) |
 | Trade construction | `candidates.py` (EV-ranked CSP sheet with hard gates, `evaluate_universe` / `select_sheet`), `costs.py` (tastytrade fees + fill model), `sizing.py` (capital and liquidity caps) |
 | Book | `portfolio.py` (correlation clusters, marginal risk, simultaneous-assignment stress), `paper.py` (paper book, slippage, calibration inputs) |
 | Management | `exit_rules.py` (hold/close/roll/accept, net of fees), `roll_engine.py`, `covered_call.py` |
@@ -261,7 +264,7 @@ sample size.
 | Wheel | defensive rolls, covered calls against assigned lots, wheel backtest (total basis) | `active_run()` |
 | Validation | calibration, slippage, IV coverage, walk-forward | disk |
 | Portfolio | exposure, clusters, stress, correlation | `active_run()` |
-| Signals | gap risk, skew, term structure | disk |
+| Signals | **Levels** (universe chance check, support map with %/ATR/EM distances, every level ranked by edge CI, chart of tests, RSI extremes), gap risk, skew, term structure | technicals cache, disk |
 | Universe | registry editor (add / deactivate / tag), IVR/IVP, next earnings and disagreements, Stage 1 verdicts, per-symbol weekly bars and earnings reactions, 45-day market-event calendar with policy | registry, metrics, events |
 
 `app/components/run_state.py`: `active_run()` prefers the run made in this
@@ -296,7 +299,11 @@ Headless check: `python scripts/check_pages.py` runs every page through
 | `regime` | VIX term-structure thresholds and size multiplier | `regime.py` |
 | `move_analysis` | horizons, lookbacks, min observations | `moves.py`, `weekly_move_analysis` |
 | `paper_trading` | paper book defaults | `paper.py` |
-| `freshness` | cache-age warning thresholds, incl. market metrics and events | `core/freshness.py` |
+| `freshness` | cache-age warning thresholds, incl. market metrics, events and technicals | `core/freshness.py` |
+| `indicators` | MA lengths, RSI/ATR/ADX windows, Bollinger, MACD, volume window | `analytics/indicators.py` |
+| `levels` | studied MA lengths, lookback, band / tolerance / bounce / re-arm (ATR multiples), horizons, min n, placebo replicates and block length, slope lookback, recency half-life, "strong" floor, EM days | `analytics/level_respect.py` |
+| `trend_state` | ADX floor, EMA50 slope window | `analytics/trend_state.py` |
+| `oscillator_study` | RSI thresholds, horizons, lookback | `analytics/oscillator_study.py` |
 | `event_policy` | per event type: action, days before/after, strategies, asset classes | `data_sources/events.py` |
 | `events` | OPEX horizon, earnings disagreement tolerance, calendar-health minimum | `data_sources/events.py` |
 | `market_metrics` | request batch size | `data_sources/tasty_metrics.py` |
@@ -382,6 +389,10 @@ re-pulls `daily_bars_raw`, runs the adjustment check, drops
 - **IV rank from own captures** needs 10+ capture dates per ticker. The
   TastyTrade IVR/IVP is informational on every candidate and is not yet part
   of any gate or score; ranking weights come in Phase 11.
+- **Moving-average "support" is mostly chance in this universe** (Phase 10:
+  median edge over the bootstrap placebo +0.4 pts; 32 strong levels vs ~26
+  expected by chance). Treat a strong level as a hypothesis; the Levels tab
+  says so. Trend state and level stats are informational until Phases 11–13.
 - **Indices are data-only.** Index chains are not captured until Phase 11
   verifies index underlyings in the chain client. CSP does not apply to them.
 - **Implied-move history** for earnings reactions starts accumulating with the

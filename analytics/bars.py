@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import datetime as dt
 
+import numpy as np
 import pandas as pd
 
 WEEK_RULE = "W-FRI"
@@ -102,8 +103,23 @@ def week_last_session(friday: dt.date) -> dt.date:
     return friday
 
 
+def weekly_positions(daily: pd.DataFrame, weekly_frame: pd.DataFrame) -> np.ndarray:
+    """For each daily row, the positional index into `weekly_frame` of the
+    last week whose scheduled last session is <= that day (-1 = none yet).
+
+    The alignment is computed once and reused for every weekly column --
+    `indicators.with_weekly` attaches ~40 of them."""
+    available = pd.to_datetime(weekly_frame["scheduled_last_session"]).to_numpy(
+        dtype="datetime64[ns]")
+    days = pd.to_datetime(daily["date"]).to_numpy(dtype="datetime64[ns]")
+    order = np.argsort(available, kind="stable")
+    found = np.searchsorted(available[order], days, side="right") - 1
+    return np.where(found >= 0, order[np.clip(found, 0, None)], -1)
+
+
 def weekly_on_daily(daily: pd.DataFrame, weekly_values: pd.Series | None = None,
-                    weekly_frame: pd.DataFrame | None = None) -> pd.Series:
+                    weekly_frame: pd.DataFrame | None = None,
+                    positions: np.ndarray | None = None) -> pd.Series:
     """Align a weekly series onto daily dates with no lookahead.
 
     `weekly_values` is indexed like `weekly(daily)` rows (positional) or by
@@ -112,18 +128,14 @@ def weekly_on_daily(daily: pd.DataFrame, weekly_values: pd.Series | None = None,
     """
     wk = weekly_frame if weekly_frame is not None else weekly(daily)
     if weekly_values is None:
-        values = wk["close"].to_numpy()
+        values = wk["close"].to_numpy(dtype=float)
     elif isinstance(weekly_values.index, pd.DatetimeIndex):
-        values = weekly_values.reindex(pd.to_datetime(wk["week_end"])).to_numpy()
+        values = weekly_values.reindex(pd.to_datetime(wk["week_end"])).to_numpy(dtype=float)
     else:
-        values = weekly_values.to_numpy()
-    available = pd.DataFrame({
-        "available_from": pd.to_datetime(wk["scheduled_last_session"]),
-        "value": values}).sort_values("available_from")
-    days = pd.DataFrame({"date": pd.to_datetime(daily["date"])}).sort_values("date")
-    merged = pd.merge_asof(days, available, left_on="date", right_on="available_from",
-                           direction="backward")
-    return pd.Series(merged["value"].to_numpy(), index=merged["date"], name="weekly")
+        values = weekly_values.to_numpy(dtype=float)
+    pos = positions if positions is not None else weekly_positions(daily, wk)
+    out = np.where(pos >= 0, values[np.clip(pos, 0, None)], np.nan)
+    return pd.Series(out, index=pd.to_datetime(daily["date"]).to_numpy(), name="weekly")
 
 
 def last_completed_week(daily: pd.DataFrame, as_of: dt.date) -> pd.Series | None:

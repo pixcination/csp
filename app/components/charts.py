@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-from app.theme import CATEGORICAL, STATUS, PLOTLY_TEMPLATE, MUTED_INK
+from app.theme import CATEGORICAL, CHART_SURFACE, STATUS, PLOTLY_TEMPLATE, MUTED_INK
 from analytics.options_math import bs_price_greeks, expected_move
 
 
@@ -207,3 +207,64 @@ def chain_volume_oi_chart(chain: pd.DataFrame, expiration) -> go.Figure:
                           name="Call OI", marker_color=CATEGORICAL[0], opacity=0.85))
     fig.update_layout(barmode="group", xaxis_title="Strike", yaxis_title="Open interest")
     return _apply_layout(fig, "Open interest by strike", height=320)
+
+
+def levels_chart(frame: pd.DataFrame, levels: list[tuple[str, str]],
+                 tests: pd.DataFrame | None = None, test_label: str = "",
+                 years: float = 2.0) -> go.Figure:
+    """Price with moving-average levels and the tests of one level (Phase 10).
+
+    One y-axis. Price is categorical 1; up to three levels take categorical
+    2, 3 and 5 in fixed order and are direct-labelled at the right edge. Test markers use the
+    reserved status colours with distinct symbols (held = circle, broke = x)
+    and a legend, so the outcome is never colour alone.
+    """
+    cutoff = pd.to_datetime(frame["date"]).max() - pd.DateOffset(years=years)
+    view = frame[pd.to_datetime(frame["date"]) >= cutoff]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=view["date"], y=view["close"], name="Close",
+                             line=dict(color=CATEGORICAL[0], width=2),
+                             hovertemplate="%{y:,.2f}"))
+    # Level hues skip categorical green (4) and red (6): the test markers use
+    # the reserved status good/critical colours, and a green level line next
+    # to green "held" markers would make identity ambiguous.
+    level_hues = [CATEGORICAL[1], CATEGORICAL[2], CATEGORICAL[4]]
+    labels = []
+    for i, (label, column) in enumerate(levels[:3]):
+        if column not in view:
+            continue
+        color = level_hues[i]
+        fig.add_trace(go.Scatter(x=view["date"], y=view[column], name=label,
+                                 line=dict(color=color, width=2),
+                                 hovertemplate="%{y:,.2f}"))
+        last = view[column].dropna()
+        if not last.empty:
+            labels.append([float(last.iloc[-1]), label])
+    # Right-edge direct labels, pushed apart where the levels converge.
+    if labels:
+        values = pd.concat([view["close"]] + [view[c] for _, c in levels[:3] if c in view])
+        gap = 0.045 * float(values.max() - values.min() or 1.0)
+        labels.sort()
+        for j in range(1, len(labels)):
+            labels[j][0] = max(labels[j][0], labels[j - 1][0] + gap)
+        for y, label in labels:
+            fig.add_annotation(x=view["date"].iloc[-1], y=y, text=label, showarrow=False,
+                               xanchor="left", xshift=6, font=dict(color=MUTED_INK, size=11))
+    if tests is not None and not tests.empty:
+        shown = tests[pd.to_datetime(tests["date"]) >= cutoff]
+        for held, name, color, symbol in ((True, "held", STATUS["good"], "circle"),
+                                          (False, "broke", STATUS["critical"], "x")):
+            part = shown[shown["held"] == held]
+            if part.empty:
+                continue
+            fig.add_trace(go.Scatter(
+                x=part["date"], y=part["level"], mode="markers",
+                name=f"{test_label} test: {name}",
+                marker=dict(color=color, size=10, symbol=symbol,
+                            line=dict(color=CHART_SURFACE, width=2)),
+                hovertemplate=f"{name}, pierce %{{customdata:.2f}} ATR<extra></extra>",
+                customdata=part["pierce_atr"]))
+    fig = _apply_layout(fig, height=460)
+    fig.update_layout(legend=dict(orientation="h", y=1.08, x=0),
+                      margin=dict(l=50, r=90, t=40, b=40))
+    return fig

@@ -324,6 +324,7 @@ freshness:
   chains_days: 7               # newest data/chains/<block>
   market_metrics_days: 3       # data/universe.duckdb market_metrics (Phase 9)
   events_days: 3               # data/universe.duckdb events (Phase 9)
+  technicals_sessions: 1       # data/technicals.duckdb indicator_latest (Phase 10)
 
 # --- Events and caution policy (Phase 9) --------------------------------------
 # What an event inside a trade's life does to it. data_sources/events.py.
@@ -353,3 +354,43 @@ events:
 
 market_metrics:
   batch_size: 50
+
+# --- Technicals and level-respect study (Phase 10) ---------------------------
+# analytics/indicators.py, level_respect.py, oscillator_study.py, trend_state.py
+indicators:
+  ma_lengths: [9, 21, 50, 100, 200]   # SMA and EMA, daily and weekly
+  rsi: 14
+  atr: 14
+  adx: 14
+  bollinger: [20, 2.0]
+  macd: [12, 26, 9]
+  volume_ratio_window: 50
+
+levels:
+  lengths: [21, 50, 100, 200]         # MAs studied as levels (9 is noise, not support)
+  lookback_years: 20                  # history used for the event study
+  band_atr: 0.5                       # a test: low within band_atr x ATR of the level
+  tolerance_atr: 1.0                  # broke: a close below level - tolerance_atr x ATR
+  bounce_atr: 1.5                     # bounced: high reached level + bounce_atr x ATR first
+  rearm_atr: 1.0                      # debounce: price must clear level + rearm_atr x ATR ...
+  rearm_days: 3                       # ... for this many consecutive days before a new test
+  horizons: [5, 10, 20]
+  headline_horizon: 10
+  min_n: 8                            # fewer tests = "insufficient", no rate shown
+  placebo_replicates: 20
+  placebo_block_days: 20             # block bootstrap of the stock's own daily moves (see level_respect.py)
+  placebo_seed: 7
+  slope_lookback_days: 10             # rising vs falling level
+  recency_half_life_years: 3.0
+  strong_min_edge_ci_lo: 0.0          # "strong" = lower CI bound of edge over placebo above this
+  em_dte_days: 30                     # expected-move units in support_map (tasty IV index)
+
+trend_state:
+  adx_min: 20                         # below this the stack is not trending, whatever its order
+  slope_days: 10
+
+oscillator_study:
+  rsi_low: 30
+  rsi_high: 70
+  horizons: [5, 10, 20]
+  lookback_years: 20

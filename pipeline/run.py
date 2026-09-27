@@ -5,7 +5,7 @@ The activation button.
     python pipeline/run.py --quick         # skip refresh, analyse what is on disk
     python pipeline/run.py --tickers SPY,F # a subset
     python pipeline/run.py --force-chains  # ignore the staleness window
-    python pipeline/run.py --data-only     # nightly: bars, metrics, events; no chains
+    python pipeline/run.py --data-only     # nightly: bars, metrics, events, technicals; no chains
 
 One orchestrator owns the whole run. Each stage decides for itself whether it
 has anything to do, so the cost of pressing the button scales with how stale
@@ -53,6 +53,7 @@ STAGES = [
     ("metrics", "Market metrics"),
     ("events", "Events calendar"),
     ("stage1", "Stage 1 screen"),
+    ("technicals", "Technicals and level study"),
     ("chains", "Option chains"),
     ("analyse", "Analysis"),
     ("candidates", "Ranking candidates"),
@@ -312,6 +313,17 @@ def _stage_stage1(reporter: BaseReporter, manifest: RunManifest,
         counts = frame["tier"].value_counts().to_dict()
         reporter.advance(1, note=", ".join(f"{v} {k}" for k, v in counts.items()))
     return {"tiers": counts}
+
+
+def _stage_technicals(reporter: BaseReporter, manifest: RunManifest,
+                      tickers: list[str]) -> dict:
+    """Indicators, trend state, level-respect and RSI studies (Phase 10).
+    Skips symbols already studied through their latest bar."""
+    from analytics import technical_study
+    result = technical_study.run(tickers, reporter=reporter)
+    for error in result["errors"][:5]:
+        manifest.warnings.append(f"technicals: {error}")
+    return result
 
 
 def _stage_chains(reporter: BaseReporter, manifest: RunManifest,
@@ -629,6 +641,7 @@ def run(tickers: list[str] | None = None, quick: bool = False,
             guarded("metrics", _stage_metrics, reporter, manifest, data_universe)
             guarded("events", _stage_events, reporter, manifest, data_universe)
             guarded("stage1", _stage_stage1, reporter, manifest, data_universe)
+            guarded("technicals", _stage_technicals, reporter, manifest, data_universe)
             if not data_only:
                 guarded("chains", _stage_chains, reporter, manifest, universe,
                         force_chains)

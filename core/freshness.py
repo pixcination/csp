@@ -21,8 +21,8 @@ from pathlib import Path
 
 from core.market_calendar import (ET, is_trading_day, previous_trading_day,
                                   trading_days_between)
-from core.paths import (chains_dir, db_1m_cache, db_universe, db_universe_daily,
-                        load_config, reference_dir)
+from core.paths import (chains_dir, db_1m_cache, db_technicals, db_universe,
+                        db_universe_daily, load_config, reference_dir)
 
 OK, WARN, MISSING = "ok", "warn", "missing"
 
@@ -35,6 +35,7 @@ DEFAULTS = {
     "chains_days": 7,
     "market_metrics_days": 3,
     "events_days": 3,
+    "technicals_sessions": 1,
 }
 
 
@@ -161,6 +162,33 @@ def pd_timestamp(value) -> dt.datetime:
     return dt.datetime.combine(value, dt.time())
 
 
+def _technicals(limits: dict) -> Freshness:
+    """Level study / indicator cache: stalest symbol's as_of vs the last
+    completed session (Phase 10)."""
+    import duckdb
+    path = db_technicals()
+    label = "Technicals / level study"
+    hint = "run: python pipeline/run.py --data-only"
+    if not path.exists():
+        return Freshness("technicals", label, MISSING, None, "--", hint)
+    try:
+        con = duckdb.connect(str(path), read_only=True)
+        try:
+            row = con.execute("SELECT min(as_of) FROM (SELECT symbol, max(as_of) AS as_of "
+                              "FROM indicator_latest GROUP BY symbol)").fetchone()
+        finally:
+            con.close()
+    except Exception:
+        row = None
+    if not row or row[0] is None:
+        return Freshness("technicals", label, MISSING, None, "--", hint)
+    last = row[0]
+    behind = trading_days_between(last, last_completed_session())
+    status = WARN if behind > limits["technicals_sessions"] else OK
+    return Freshness("technicals", label, status, str(last), f"{behind} session(s) behind",
+                     "" if status == OK else hint)
+
+
 def _chains(limits: dict) -> Freshness:
     root = chains_dir()
     blocks = sorted(p for p in root.iterdir() if p.is_dir()) if root.exists() else []
@@ -193,6 +221,7 @@ def report() -> list[Freshness]:
                         limits["market_metrics_days"], "IV rank / percentile; re-run the pipeline"),
         _universe_table("events", "Events table", "SELECT max(built_at) FROM events",
                         limits["events_days"], "earnings / macro / OPEX gates; re-run the pipeline"),
+        _technicals(limits),
         _chains(limits),
         _cache_1m(limits),
     ]

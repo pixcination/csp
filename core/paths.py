@@ -108,6 +108,12 @@ def db_universe() -> Path:
     return data_dir() / "universe.duckdb"
 
 
+def db_technicals() -> Path:
+    """Cached indicators, level-respect and oscillator statistics (Phase 10).
+    Derived -- safe to delete; the pipeline rebuilds it."""
+    return data_dir() / "technicals.duckdb"
+
+
 def db_1m_cache() -> Path:
     return data_dir() / "raw_1m_cache.duckdb"
 
