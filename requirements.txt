@@ -1,0 +1,46 @@
+# =============================================================================
+# Wheel engine dependencies -- complete and pinned.
+#
+# The previous requirements.txt was missing python-dotenv, requests,
+# websockets, pyarrow, yfinance and openpyxl, so following the from-scratch
+# build in docs/ARCHITECTURE.md produced an environment where the TastyTrade
+# chain scan failed on import (finding F-11). Two scripts also pip-installed
+# at runtime; that has been removed.
+#
+#   python -m venv .venv
+#   .venv\Scripts\activate
+#   pip install -r requirements.txt
+# =============================================================================
+
+# --- Core data / analysis ----------------------------------------------------
+pandas>=2.2,<3.0
+numpy>=1.26,<3.0
+duckdb>=1.0
+pyarrow>=15.0
+scipy>=1.13                 # Black-Scholes: norm.cdf / norm.pdf
+PyYAML>=6.0
+python-dateutil>=2.9
+
+# --- Configuration / credentials --------------------------------------------
+python-dotenv>=1.0          # was missing; core/env.py depends on it
+
+# --- Market calendar ---------------------------------------------------------
+# Replaces the hardcoded US_MARKET_HOLIDAYS_2026 literals, which would have
+# silently started treating 2027 holidays as trading days (finding F-12).
+pandas_market_calendars>=4.4
+
+# --- External data sources ---------------------------------------------------
+requests>=2.31              # TastyTrade REST; was missing
+websockets>=12.0            # DXLink streaming; was missing
+yfinance>=0.2.40            # daily bars, earnings dates, dividends; was missing
+massive-api>=1.0            # historical 1-minute archive (free tier: 5 req/min)
+
+# --- Application -------------------------------------------------------------
+streamlit>=1.49            # width="stretch" replaces the deprecated use_container_width
+plotly>=5.22
+
+# --- Reporting ---------------------------------------------------------------
+openpyxl>=3.1               # Excel export from the move analysis; was missing
+
+# --- Development -------------------------------------------------------------
+pytest>=8.0

@@ -1,0 +1,310 @@
+# === Paths ===
+pricing_data_root: "D:/pricing_data/stocks_etfs/1m"
+
+# The full ~1,050-ticker screening pool. NOT required for normal
+# operation -- everything reads data/raw_1m/ instead. Needed only to
+# re-run Stage 1 against the whole pool. Set to false once you have
+# disconnected the drive; preflight will stop warning about it.
+pricing_data_required: false
+
+# project_root is deliberately NOT configured here. It is derived from where
+# core/paths.py actually sits on disk, so the folder can be moved or copied to
+# another machine and still find itself. Set the WHEEL_PROJECT_ROOT environment
+# variable if you ever need to point at a different tree.
+
+# Folder containing your tastytrade_common.py and snapshot_loop.py (the
+# patched version from this delivery -- see docs/README.md "Stage 3 setup").
+# Stage 3 imports directly from here rather than duplicating chain-pull
+# logic.
+# Vendored into vendor/tastytrade by scripts/consolidate.py. This key
+# is retained only so the legacy scripts/04 still resolves; nothing
+# in the new pipeline reads it.
+tastytrade_pipeline_dir: "vendor/tastytrade"
+
+# === Regular session window used for daily bar aggregation (ET, local wall-clock) ===
+session_start: "09:30"
+session_end: "16:00"
+
+# === Duplicate ticker-folder handling ===
+alias_overrides: {}
+  # "BRK.B": "canonical"
+  # "BRK-B": "skip"
+
+# === Stage 0 ingestion parallelism / memory ===
+ingest_workers: 4
+worker_memory_limit_gb: 2.0
+
+# === Stage 1 quantitative filter thresholds ===
+stage1_thresholds:
+  min_history_years: 3
+  max_staleness_days: 10
+  min_adv_dollars: 50000000
+  min_price: 15
+  max_price: 1000
+  min_rv: 0.12
+  max_rv: 0.75
+  max_drawdown_floor: -0.65
+
+# === Stage 3: chain scan rate limiting ===
+# TastyTrade/dxFeed enforces 25,000 subscriptions/session and 10,000
+# subscription changes/minute (rolling window). This budget stays well
+# under that for the aggregate multi-symbol scan; 8000 leaves ~20% margin.
+# Lower this if you see rate-limit warnings from TastyTrade; the scan just
+# takes longer, it won't fail.
+stage3_subs_per_minute_budget: 8000
+
+# === Stage 3: chain liquidity thresholds ===
+stage3_thresholds:
+  dte_min: 5                       # matches your 5-14 DTE wheel target window
+  dte_max: 14
+  target_delta: -0.25              # typical CSP entry delta -- adjust to your style
+  delta_band: [-0.40, -0.10]       # range checked for strike density
+  min_oi_near_target: 100          # open interest floor at the nearest-to-target strike
+  min_strikes_in_band: 3           # need real strike choices, not just one thin option
+  max_spread_pct_at_target: 10     # (ask-bid)/mid, in percent
+  max_spread_dollars_at_target: 0.10  # hybrid rule: also pass if the raw
+                                       # dollar spread is this tight, even if
+                                       # the percentage looks wide -- cheap
+                                       # short-DTE OTM puts often show large
+                                       # percentage spreads on a perfectly
+                                       # normal penny-wide market. A symbol
+                                       # only fails if BOTH the percentage
+                                       # AND the dollar spread look bad.
+
+# === Analytics engine (app / analytics module) ===
+analytics:
+  risk_free_rate: 0.045            # static annualized rate for Black-Scholes;
+                                    # not a live feed -- revisit only if this
+                                    # tool needs rate-sensitivity precision
+                                    # beyond a wheel-strategy research scope.
+  rv_windows_days: [10, 20, 30, 60]
+  rsi_window_days: 14
+  sma_windows_days: [20, 50, 200]
+  # Trailing-window mismatch between the underlying's downtrend flag and
+  # its RV window is intentional -- SMA/RSI answer "is this in a downtrend
+  # right now," a separate question from the RV windows' "how volatile has
+  # it recently been."
+  technical_health:
+    downtrend_price_below_sma: 200
+    downtrend_rsi_below: 30
+
+# === Composite score weights (must sum to 1.0) ===
+# A starting point, not a claimed-optimal methodology -- retune freely.
+# yield: annualized premium yield: iv_rank: IV rank/percentile;
+# liquidity: Stage 3 OI + spread quality; technical: the health flag above;
+# prob_otm: probability-OTM, theoretical Black-Scholes until a backtest
+# has run for that ticker, then blended toward the backtest-calibrated value.
+scoring:
+  weights:
+    yield: 0.30
+    iv_rank: 0.20
+    liquidity: 0.20
+    technical: 0.15
+    prob_otm: 0.15
+
+# === Backtest harness ===
+# Real historical option chains aren't available (TastyTrade has no
+# historical chain API -- see docs/PROJECT_SPEC.md), so the backtest simulates
+# historical option pricing from the underlying's real price history rather
+# than replaying real historical quotes: Black-Scholes off a realized-vol
+# proxy for IV, scaled by vol_risk_premium_multiplier (short-dated equity
+# puts have historically priced richer than trailing RV -- 1.15 is a
+# reasonable starting estimate, not a fitted one). Revisit this multiplier
+# once enough real accumulated IV history (data/stage3_chains/) exists to
+# calibrate it per-ticker instead of assuming one global value.
+backtest:
+  vol_risk_premium_multiplier: 1.15
+  rv_window_days: 20               # trailing RV window used as the IV proxy
+  entry_cadence: weekly            # roll a new position every Friday
+  entry_weekday: 4                 # Python weekday() -- 0=Mon .. 4=Fri
+  target_dte: 10                   # single DTE targeted at entry (midpoint of the
+                                    # 5-14 DTE window above) -- the window itself
+                                    # doesn't specify one DTE per trade, so this
+                                    # picks the entry point the weekly cadence rolls at.
+  assignment_rule: close_below_strike_at_expiration
+
+# === Scanner page presets ===
+# A small fixed set, not a general query builder -- store as simple config
+# (universe + strategy), matching the narrow wheel-only scope of this tool.
+# Add more presets here later rather than building a scan-builder UI.
+scanner_presets:
+  - name: "CSP candidates, 5-14 DTE"
+    universe: all
+    strategy: csp
+  - name: "Covered call roll candidates"
+    universe: trade_log_assigned    # positions marked "assigned" in the trade log
+    strategy: covered_call
+
+# ===========================================================================
+# === PHASE 1 ADDITIONS (wheel expansion) ===================================
+# ===========================================================================
+
+# === Account ===
+# Raised to $3,000,000: this is a research and signal-generation tool feeding a
+# larger portfolio traded elsewhere. TastyTrade supplies the data and the
+# analysis; execution happens in another account and is entered here manually,
+# with the fill price overridable.
+#
+# THE CONSTRAINT FLIPS AT THIS SIZE. At $50,000 the binding limit was cash --
+# half the universe could not be collateralised at all. At $3,000,000 cash
+# stops binding and LIQUIDITY starts: a position large enough to matter to the
+# portfolio is large enough to move the option's market. Size is therefore
+# capped by open interest, option volume and underlying turnover as well as by
+# capital, and `liquidity_limits` below is what usually decides.
+account:
+  broker: tastytrade                  # where the DATA comes from
+  account_type: research              # research | roth_ira | margin
+  net_liquidating_value: 3000000
+  require_cash_secured: true          # collateral accounting stays conservative
+  cash_buffer_pct: 0.08
+  max_collateral_per_position_pct: 0.04    # $120k -- every universe name now fits
+  max_collateral_per_ticker_pct: 0.06
+  max_sector_collateral_pct: 0.25
+  max_open_positions: 25
+
+# === Liquidity limits: the real cap at portfolio scale ===
+# A fill you cannot get is not a signal. These translate "how much of this
+# option actually trades" into a contract ceiling, and at $3M they bind far
+# more often than the capital limits above.
+liquidity_limits:
+  max_pct_of_open_interest: 0.03      # never more than 3% of OI at the strike
+  max_pct_of_option_volume: 0.10      # nor 10% of the day's contract volume
+  max_pct_of_underlying_adv: 0.005    # nor 0.5% of the stock's dollar turnover
+  min_open_interest: 250              # below this, do not trade the strike at all
+  min_option_volume: 25
+  assume_volume_when_missing: 0       # off-hours volume is 0; fall back to OI
+
+# === Execution ===
+# Signals are generated here and executed elsewhere. The tool models TastyTrade
+# costs because that is the schedule we have; override `model_costs_as` when
+# the executing venue differs materially.
+execution:
+  mode: signal_only                   # signal_only | paper | live (not yet built)
+  data_source: tastytrade
+  venue: external
+  model_costs_as: tastytrade
+  allow_manual_fill_override: true    # record what you actually paid
+  require_confirmation_before_paper_entry: true
+
+# === Transaction costs: tastytrade published schedule, rev. 2026-07-30 ===
+costs:
+  option_open_commission_per_contract: 1.00
+  option_close_commission_per_contract: 0.00
+  option_commission_cap_per_leg: 10.00
+  option_clearing_fee_per_contract: 0.10
+  option_regulatory_fee_per_contract: 0.02
+  option_finra_taf_per_contract: 0.00329
+  assignment_or_exercise_fee: 5.00
+  stock_clearing_fee_per_share: 0.0008
+  stock_finra_taf_per_share: 0.000195
+  stock_finra_taf_cap: 9.79
+  sec_fee_per_million_sold: 20.60
+  slippage_fraction_of_half_spread: 0.40
+
+# === Chain capture ===
+# Wider than the 5-14 entry window on purpose: roll targets have to be
+# visible, and you cannot rank a roll you did not download.
+chain_capture:
+  dte_max_universe: 21                # every screened ticker
+  dte_max_with_position: 60           # tickers holding an open leg or shares
+  rth_refresh_minutes: 20             # re-pull during RTH if older than this
+  offhours_one_snapshot_per_block: true
+
+# === Massive.com historical archive (free tier) ===
+# Free tier = 5 requests/minute, end-of-day only. This is a background
+# archiver, never part of an interactive run. Live pricing comes from
+# TastyTrade DXLink instead.
+massive:
+  requests_per_minute: 5
+  safety_margin: 0.9                  # pace at 4.5/min to absorb clock drift
+  max_retries: 3
+  interactive: false                  # never invoked by the activation button
+
+# === Trade management ===
+# Starting rules, not fitted optima. The 45-DTE folklore (manage at 50%,
+# roll at 21 DTE) does not transfer to a 7-DTE book -- see docs for the
+# derivation. Everything here is swept by analytics/rule_sweep.py.
+management:
+  entry:
+    target_dte: 7
+    dte_min: 5
+    dte_max: 10
+    target_delta: -0.20
+    delta_band: [-0.30, -0.12]
+    min_credit_per_contract: 0.15     # below this, fees dominate
+    max_cost_drag: 0.10               # reject if fees > 10% of gross credit
+    min_iv_rv_ratio: 1.05             # only sell vol that is priced above realized
+    block_if_earnings_before_expiry: true
+    max_new_positions_per_run: 3
+  exit:
+    # Expressed in remaining extrinsic dollars, NOT percent of max profit.
+    # At a $0.20 credit, closing at "50% of max" nets $10 gross against
+    # $1.24 of exit fees -- a percentage target is actively wrong here.
+    close_when_remaining_extrinsic_below: 0.05
+    min_net_gain_to_close_early: 5.00 # dollars, after all fees
+    hold_to_expiry_if_otm_by_pct: 0.03
+  defense:
+    roll_when_delta_beyond: -0.45     # roughly at the money
+    roll_when_price_below_strike: true
+    min_dte_to_roll: 2                # under 2 DTE, take the assignment
+    require_net_credit_to_roll: true
+    max_rolls_per_cycle: 2            # then accept assignment; wheels are not traps
+    roll_out_weeks: [1, 2]
+  covered_call:
+    target_delta: 0.25
+    dte_min: 5
+    dte_max: 14
+    never_strike_below_basis: true    # hard rule; overridable per-trade only
+    min_credit_per_contract: 0.15
+    avoid_ex_dividend_within_days: 3
+
+# === Phase 7 signals ===
+# Skew and gap risk. Both read data already on disk -- the chain snapshots for
+# skew and term structure, the 1-minute archive for gaps -- and neither needs
+# accumulated history the way IV rank does.
+signals:
+  block_inverted_skew: true         # calls priced above puts = wrong tail to sell
+  flat_skew_warns: true
+  max_prob_undefendable_gap: 0.05   # warn above a 5% chance of a gap through the strike
+  gap_variance_share_warn: 0.60     # flag names where most risk is overnight
+  gap_lookback_years: 20
+  block_single_name_backwardation: false   # warns rather than blocks; often earnings
+
+# === Portfolio construction ===
+# Candidates are ranked independently; these limits are what stop the book
+# quietly filling with six versions of the same bet. Clusters are derived from
+# return correlation rather than sector labels, because 27 of 61 universe
+# names have no sector tag and correlation groups what actually moves together.
+portfolio:
+  max_positions_per_cluster: 2
+  max_cluster_collateral_pct: 0.25
+  max_sector_collateral_pct: 0.25
+  max_pairwise_correlation: 0.80
+  cluster_threshold: 0.65           # correlation above this = same cluster
+  correlation_years: 3
+  stress_horizon_days: 7            # window for the simultaneous-assignment test
+  stress_years: 20
+
+# === Regime gate: VIX term structure ===
+regime:
+  enabled: true
+  contango_ratio_max: 0.95            # VIX9D/VIX3M below this = calm, full size
+  backwardation_ratio_min: 1.05       # above this = stand down / half size
+  size_multiplier_backwardation: 0.5
+
+# === Empirical move analysis (generalised weekly_move_analysis) ===
+move_analysis:
+  horizons_days: [1, 2, 3, 5, 7, 10, 14, 21]
+  lookback_years: [1, 3, 5, 10, 0]    # 0 = all available history
+  min_observations: 60
+  percentiles: [1, 5, 10, 20, 25, 50, 75, 90, 95, 99]
+  price_basis: total_return           # dividend-adjusted for probability work
+
+# === Paper trading ===
+# Until TastyTrade position sync is switched on, every recommendation the
+# tool makes can be committed to a local paper book and scored later.
+paper_trading:
+  enabled: true
+  starting_cash: 50000
+  fill_at: realistic                  # 'mid' | 'realistic' | 'worst'
+  auto_expire: true

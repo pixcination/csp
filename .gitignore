@@ -1,0 +1,56 @@
+# =============================================================================
+# Secrets -- never commit. Both .env files in this project have historically
+# contained live TastyTrade OAuth credentials and a Massive API key.
+# =============================================================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- Generated data (rebuildable, and large) --------------------------------
+data/
+!data/.gitkeep
+output/*.csv
+# Hand-maintained inputs, not generated -- these ARE versioned.
+!output/stage2_quality_tags_master.csv
+!output/final_universe.txt
+*.duckdb
+*.duckdb.wal
+*.parquet
+
+# The wheel ledger is USER DATA, not a cache. If you ever want it versioned,
+# add an explicit exception -- but it contains your position history.
+# data/trade_log.duckdb
+
+# --- Raw price archive ------------------------------------------------------
+*_1m.txt
+weekly_move_analysis/*.csv
+weekly_move_analysis/*.xlsx
+
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Local tooling / backups ------------------------------------------------
+*.bak
+.codebase-memory/
+legacy/data/
+
+# --- Editors / OS -----------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Streamlit --------------------------------------------------------------
+.streamlit/secrets.toml
