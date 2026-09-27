@@ -53,7 +53,7 @@ def intraday_rv_series(bars_1m: pd.DataFrame, window_days: int) -> pd.Series:
     Rolling annualized realized vol from 1-minute regular-session bars: sum
     of squared consecutive log-returns within each trading day, then a
     rolling mean over `window_days` sessions, annualized. Requires
-    bars_1m to already be regular_session-filtered (analytics.data_access
+    bars_1m to already be regular_session-filtered (legacy/analytics/data_access.py
     .load_1m_bars defaults to that).
     """
     if bars_1m.empty:

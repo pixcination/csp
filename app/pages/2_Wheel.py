@@ -27,8 +27,11 @@ from core.paths import load_config, load_universe  # noqa: E402
 st.set_page_config(page_title="Wheel", layout="wide")
 st.title("Wheel")
 
-manifest = st.session_state.get("last_manifest")
-analyse = manifest.stages.get("analyse", {}) if manifest else {}
+from app.components.run_state import active_run, analyse_stage, run_caption  # noqa: E402
+
+manifest, _, source = active_run()
+analyse = analyse_stage(manifest)
+run_caption(manifest, source)
 
 # --- 1. Defence ------------------------------------------------------------
 

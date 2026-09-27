@@ -408,6 +408,20 @@ def build_decision_sheet(tickers: list[str] | None = None,
                           reporter: BaseReporter | None = None,
                           include_rejected: bool = False) -> pd.DataFrame:
     """Rank every candidate strike across the universe by annualised EV."""
+    return select_sheet(evaluate_universe(tickers, reporter=reporter),
+                        include_rejected=include_rejected)
+
+
+def evaluate_universe(tickers: list[str] | None = None,
+                      reporter: BaseReporter | None = None) -> pd.DataFrame:
+    """Every candidate strike across the universe, accepted AND rejected.
+
+    Sorted by rank key (rejected last), with the rejection census on
+    `frame.attrs["census"]`. This is what a run persists as
+    `candidates.parquet` -- the full sheet, so a later page can show why a
+    strike was turned down, not only what survived. `select_sheet` turns it
+    into the proposal list.
+    """
     from core.paths import load_universe
     from data_sources import chains
     from data_sources.yfinance_sync import earnings_guard, load_daily
@@ -482,15 +496,23 @@ def build_decision_sheet(tickers: list[str] | None = None,
 
     frame = pd.DataFrame([r.to_dict() for r in rows])
     frame["rank_key"] = [r.rank_key for r in rows]
+    frame = frame.sort_values("rank_key", ascending=False).reset_index(drop=True)
     frame.attrs["census"] = census
-    if not include_rejected:
+    return frame
+
+
+def select_sheet(frame: pd.DataFrame, include_rejected: bool = False) -> pd.DataFrame:
+    """The proposal list from `evaluate_universe`'s full sheet: accepted rows
+    (unless `include_rejected`), best strike per ticker, run cap applied."""
+    census = frame.attrs.get("census")
+    if not frame.empty and not include_rejected:
         frame = frame[frame["accepted"]]
     if frame.empty:
         empty = pd.DataFrame()
-        empty.attrs["census"] = census
+        if census:
+            empty.attrs["census"] = census
         return empty
-    frame = frame.sort_values("rank_key", ascending=False).reset_index(drop=True)
-    out = _one_per_ticker(frame, cfg)
+    out = _one_per_ticker(frame.reset_index(drop=True), load_config())
     out.attrs["census"] = census
     return out
 

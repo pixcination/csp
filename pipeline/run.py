@@ -127,12 +127,41 @@ class RunLock:
 
 
 def _pid_alive(pid: int) -> bool:
+    """Is `pid` running? Must never affect the process it asks about.
+
+    `os.kill(pid, 0)` is the POSIX idiom, but on Windows os.kill calls
+    TerminateProcess(pid, exit_code=sig) for any signal other than the two
+    console events -- so "checking" the lock holder killed it, with exit
+    code 0 so it looked like a clean finish. Found in Phase 8 when a second
+    process checking the lock silently ended a pipeline run mid-capture.
+    """
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            # Access denied means it exists; anything else means it does not.
+            return ctypes.get_last_error() == 5
+        try:
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
     except OSError:
         return False
-    except Exception:
-        return True
     return True
 
 
@@ -182,8 +211,16 @@ def _stage_daily(reporter: BaseReporter, manifest: RunManifest,
     failed = [r.ticker for r in results if r.error]
     if failed:
         manifest.warnings.append(f"daily bars failed: {', '.join(failed[:8])}")
+    try:
+        dividends = len(yfinance_sync.write_dividends_from_raw())
+    except Exception as exc:
+        dividends = 0
+        manifest.warnings.append(f"dividend ex-dates: {exc}")
     return {"synced": len(results) - len(failed), "failed": failed,
-            "rows_added": sum(r.rows_added for r in results)}
+            "rows_added": sum(r.rows_added for r in results),
+            "full_repulls": {r.ticker: r.full_repull for r in results
+                             if r.full_repull and r.full_repull != "initial"},
+            "dividend_rows": dividends}
 
 
 def _stage_earnings(reporter: BaseReporter, manifest: RunManifest,
@@ -249,8 +286,10 @@ def _stage_analyse(reporter: BaseReporter, manifest: RunManifest,
 
     # Candidate ranking is its own stage: it is the expensive part of the
     # analysis and the part you actually wait for.
-    from analytics.candidates import build_decision_sheet
-    sheet = build_decision_sheet(tickers, reporter=reporter)
+    from analytics.candidates import evaluate_universe, select_sheet
+    full_sheet = evaluate_universe(tickers, reporter=reporter)
+    sheet = select_sheet(full_sheet)
+    proposed = pd.DataFrame()
     if not sheet.empty:
         # Portfolio construction runs BEFORE the proposal list is finalised.
         # Ranking by EV and then checking concentration afterwards would
@@ -317,6 +356,17 @@ def _stage_analyse(reporter: BaseReporter, manifest: RunManifest,
         else:
             reporter.log("no candidates passed the entry gates")
 
+    # Persist the tables beside the manifest so pages survive a restart.
+    try:
+        from pipeline import results as run_results
+        written = run_results.write_tables(
+            manifest.run_id,
+            run_results.annotate_sheet(full_sheet, sheet, proposed),
+            results.get("open_positions", []))
+        results["persisted"] = written
+    except Exception as exc:
+        manifest.warnings.append(f"could not persist run tables: {exc}")
+
     results.update(_stage_wheel(reporter, manifest))
     return results
 
@@ -382,28 +432,31 @@ def _stage_wheel(reporter: BaseReporter, manifest: RunManifest) -> dict:
 
 
 def _tickers_with_positions() -> set[str]:
+    """Tickers with an open paper-book position (chains get a wider window)."""
     try:
-        from analytics.trade_log import list_positions
-        frame = list_positions()
+        from analytics import paper
+        frame = paper.list_positions(status="open")
         if frame.empty:
             return set()
-        return set(frame.loc[frame["status"] == "open", "ticker"].str.upper())
+        return set(frame["ticker"].str.upper())
     except Exception:
         return set()
 
 
 def _evaluate_open_positions(reporter: BaseReporter) -> list[dict]:
-    """Run the management engine over every open short put."""
+    """Run the management engine over every open short put in the paper book.
+
+    Read the retired Trade Log's table until Phase 8, so positions accepted
+    through the Decisions page were never evaluated here.
+    """
     try:
-        from analytics.trade_log import list_positions
-        frame = list_positions()
+        from analytics import paper
+        open_rows = paper.list_positions(status="open")
     except Exception:
         return []
-    if frame.empty:
-        return []
-    open_rows = frame[frame["status"] == "open"]
     if open_rows.empty:
         return []
+    open_rows = open_rows[open_rows["strategy"].fillna("csp").isin(["csp", "put"])]
 
     from analytics.exit_rules import OpenPut, evaluate_short_put
     from core.market_calendar import trading_days_between
@@ -423,7 +476,8 @@ def _evaluate_open_positions(reporter: BaseReporter) -> list[dict]:
         position = OpenPut(
             ticker=ticker, strike=float(row["strike"]),
             contracts=int(row["contracts"]),
-            entry_credit=float(row["premium_collected"]),
+            entry_credit=float(row["actual_fill"]
+                               if pd.notna(row["actual_fill"]) else row["modelled_fill"]),
             spot=spot, current_mark=mark if mark is not None else 0.0,
             trading_days_left=max(left, 0))
         daily = load_daily(ticker, basis="price")

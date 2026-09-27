@@ -5,7 +5,7 @@ docs/PROJECT_SPEC.md Page 2."""
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -13,12 +13,12 @@ import pandas as pd
 import streamlit as st
 
 from analytics.config import load_config
-from analytics.data_access import load_scanner_universe, load_chain_snapshot, load_daily_bars, list_snapshot_dates_for_ticker
+from legacy.analytics.data_access import load_scanner_universe, load_chain_snapshot, load_daily_bars, list_snapshot_dates_for_ticker
 from analytics.volatility import close_to_close_series
 from analytics.options_math import bs_price_greeks, probability_otm
 from analytics.iv_history import load_iv_history, iv_rank_and_percentile
 from analytics.chain_utils import nearest_target_delta_put
-from analytics.backtest import run_backtest
+from legacy.analytics.backtest import run_backtest
 from app.components.formatting import fmt_currency, fmt_pct, fmt_delta
 from app.components.charts import (
     price_vol_chart, iv_vs_rv_chart, pnl_at_expiration_chart, pnl_over_time_chart,

@@ -650,6 +650,34 @@ def sync_dividends(tickers: list[str],
     return frame
 
 
+def write_dividends_from_raw(per_ticker: int = 12) -> pd.DataFrame:
+    """Rebuild dividends.parquet from the dividends stored in daily_bars_raw.
+
+    Phase 8: nothing called `sync_dividends`, so the file (and with it the
+    covered-call ex-dividend warning) froze in June. The raw daily sync now
+    carries every dividend anyway, so this derives the file with no extra
+    network calls and runs after every daily stage. Same schema as before.
+    """
+    path = db_universe_daily()
+    if not path.exists():
+        return pd.DataFrame()
+    con = duckdb.connect(str(path), read_only=True)
+    try:
+        frame = con.execute(
+            f"SELECT ticker AS symbol, date AS ex_date, dividends AS amount FROM ("
+            f"  SELECT *, row_number() OVER (PARTITION BY ticker ORDER BY date DESC) AS k"
+            f"  FROM {RAW_TABLE} WHERE dividends > 0) WHERE k <= ? "
+            f"ORDER BY symbol, ex_date", [per_ticker]).fetchdf()
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        con.close()
+    if not frame.empty:
+        frame["ex_date"] = pd.to_datetime(frame["ex_date"]).dt.date
+        frame.to_parquet(reference_dir() / DIVIDENDS_FILE, index=False)
+    return frame
+
+
 def next_ex_dividend(ticker: str, today: dt.date | None = None) -> tuple[dt.date, float] | None:
     """Estimate the next ex-date by extrapolating the observed cadence.
 

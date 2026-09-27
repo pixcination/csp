@@ -9,7 +9,7 @@ import sys
 from datetime import date
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -17,8 +17,8 @@ import pandas as pd
 import streamlit as st
 
 from analytics.strategies import STRATEGIES
-from analytics.trade_log import add_position, update_position, delete_position, list_positions, summary_stats, STATUSES
-from analytics.backtest import run_backtest
+from legacy.analytics.trade_log import add_position, update_position, delete_position, list_positions, summary_stats, STATUSES
+from legacy.analytics.backtest import run_backtest
 from app.components.formatting import fmt_currency, fmt_pct
 
 st.title("Trade Log")

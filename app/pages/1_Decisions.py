@@ -33,11 +33,12 @@ info = classify()
 if not info.is_open:
     st.warning(f"{info.banner()[1]}", icon=":material/schedule:")
 
-manifest = st.session_state.get("last_manifest")
-candidates = (manifest.stages.get("analyse", {}).get("candidates", [])
-              if manifest else [])
-considered = (manifest.stages.get("analyse", {}).get("candidates_considered", 0)
-              if manifest else 0)
+from app.components.run_state import active_run, analyse_stage, run_caption  # noqa: E402
+
+manifest, run_results, source = active_run()
+candidates = analyse_stage(manifest).get("candidates", [])
+considered = analyse_stage(manifest).get("candidates_considered", 0)
+run_caption(manifest, source)
 
 execution = load_config().get("execution", {})
 allow_override = execution.get("allow_manual_fill_override", True)
@@ -134,6 +135,33 @@ else:
                     st.success(result.message)
                 except Exception as exc:
                     st.error(f"{type(exc).__name__}: {exc}")
+
+# --- The full sheet --------------------------------------------------------
+
+sheet = run_results.candidates if run_results is not None else pd.DataFrame()
+if not sheet.empty and run_results.has_full_sheet:
+    passed = int(sheet["accepted"].sum()) if "accepted" in sheet else 0
+    with st.expander(f"Every strike evaluated in this run ({len(sheet):,}; "
+                     f"{passed:,} passed the gates)"):
+        only_passed = st.toggle("Only strikes that passed every gate", value=False)
+        view = sheet[sheet["accepted"]] if only_passed else sheet
+        view = view.copy()
+        if "rejections" in view:
+            view["why_not"] = view["rejections"].map(
+                lambda r: "; ".join(r) if r is not None and len(r) else "")
+        columns = [c for c in ["ticker", "expiration", "strike", "dte_calendar",
+                               "modelled_fill", "delta", "prob_otm_empirical",
+                               "ev_annualised", "iv_rv_ratio", "open_interest",
+                               "accepted", "selected", "proposed", "why_not"]
+                   if c in view.columns]
+        st.dataframe(
+            view[columns], hide_index=True, width="stretch",
+            column_config={
+                "prob_otm_empirical": st.column_config.NumberColumn("P(OTM)", format="percent"),
+                "ev_annualised": st.column_config.NumberColumn("EV ann.", format="percent"),
+                "modelled_fill": st.column_config.NumberColumn("Fill", format="$%.2f"),
+                "why_not": st.column_config.TextColumn("Rejected because", width="large"),
+            })
 
 st.divider()
 

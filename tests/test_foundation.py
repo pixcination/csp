@@ -345,7 +345,15 @@ def test_manifest_is_strict_json_despite_nans():
     assert parsed["c"]["d"] is None
 
 
-def test_run_lock_blocks_a_second_run():
+@pytest.fixture
+def isolated_runs(tmp_path, monkeypatch):
+    """Never touch data/runs/run.lock: a real run may be holding it."""
+    import pipeline.run as run_module
+    monkeypatch.setattr(run_module, "runs_dir", lambda: tmp_path)
+    return tmp_path
+
+
+def test_run_lock_blocks_a_second_run(isolated_runs):
     from pipeline.run import RunLock, RunLocked
     with RunLock():
         with pytest.raises(RunLocked):
@@ -353,12 +361,11 @@ def test_run_lock_blocks_a_second_run():
                 pass
 
 
-def test_run_lock_releases_on_exit():
-    from core.paths import runs_dir
+def test_run_lock_releases_on_exit(isolated_runs):
     from pipeline.run import RunLock
     with RunLock():
         pass
-    assert not (runs_dir() / "run.lock").exists()
+    assert not (isolated_runs / "run.lock").exists()
 
 
 def test_earnings_guard_fails_safe_when_calendar_is_missing():
@@ -420,13 +427,3 @@ def test_legacy_shim_shares_one_config_cache():
 def test_project_root_lands_where_config_yaml_actually_is():
     from core.paths import project_root
     assert (project_root() / "config.yaml").is_file()
-
-
-def test_missing_daily_database_reads_empty_not_raises(tmp_path, monkeypatch):
-    """A fresh copy of the folder starts with an empty data/ directory. That is
-    a normal state the pages already handle -- it must not be a traceback."""
-    import analytics.data_access as da
-    monkeypatch.setattr(da, "_daily_db_path", lambda: tmp_path / "absent.duckdb")
-    frame = da.load_daily_bars("AAPL")
-    assert frame.empty
-    assert list(frame.columns) == da.DAILY_COLUMNS

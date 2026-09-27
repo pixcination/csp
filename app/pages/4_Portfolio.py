@@ -35,8 +35,11 @@ cfg = load_config()
 nlv = float(cfg.get("account", {}).get("net_liquidating_value", 0.0))
 limits = cfg.get("portfolio", {})
 
-manifest = st.session_state.get("last_manifest")
-analyse = manifest.stages.get("analyse", {}) if manifest else {}
+from app.components.run_state import active_run, analyse_stage, run_caption  # noqa: E402
+
+manifest, _, source = active_run()
+analyse = analyse_stage(manifest)
+run_caption(manifest, source)
 candidates = analyse.get("candidates", [])
 held_back = analyse.get("portfolio_rejected", [])
 

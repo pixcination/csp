@@ -1,5 +1,7 @@
 """
-Shared Plotly chart builders for the Ticker Detail page. Every chart pulls
+Shared Plotly chart builders. Written for the (now retired, see legacy/)
+Ticker Detail page; to be generalised to multi-leg positions for the Trade
+Detail page (Phase 14 -- inventory in legacy/README.md). Every chart pulls
 its colors from app/theme.py rather than Plotly defaults, and follows the
 dataviz skill's mark specs (thin lines, direct labels over legends where a
 chart has <=4 series, status colors reserved for pass/fail-type meaning).

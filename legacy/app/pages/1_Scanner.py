@@ -4,7 +4,7 @@ docs/PROJECT_SPEC.md Page 1."""
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -12,10 +12,10 @@ import pandas as pd
 import streamlit as st
 
 from analytics.config import load_config, project_root
-from analytics.data_access import load_scanner_universe, list_snapshot_dates
-from analytics.scoring import compute_composite_scores
+from legacy.analytics.data_access import load_scanner_universe, list_snapshot_dates
+from legacy.analytics.scoring import compute_composite_scores
 from app.components.formatting import fmt_pct, fmt_delta, fmt_currency, fmt_dollars_compact
-from app.components.jobs import start_background_script, job_status, is_running
+from legacy.app.components.jobs import start_background_script, job_status, is_running
 
 
 @st.cache_data(ttl=300, show_spinner="Scoring candidates...")

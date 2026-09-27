@@ -140,9 +140,11 @@ URGENCY_STYLE = {"act_now": ("Act now", "error"),
                   "attention": ("Watch", "warn"),
                   "routine": ("Routine", "ok")}
 
-manifest = st.session_state.get("last_manifest")
-decisions = (manifest.stages.get("analyse", {}).get("open_positions", [])
-             if manifest else [])
+from app.components.run_state import active_run, analyse_stage, run_caption  # noqa: E402
+
+manifest, _, source = active_run()
+decisions = analyse_stage(manifest).get("open_positions", [])
+run_caption(manifest, source)
 
 if not decisions:
     st.caption("No open positions. Once the paper book has entries, every one is "

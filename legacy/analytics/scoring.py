@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from analytics.config import load_config
-from analytics.data_access import load_daily_bars, load_chain_snapshot, list_snapshot_dates_for_ticker
+from legacy.analytics.data_access import load_daily_bars, load_chain_snapshot, list_snapshot_dates_for_ticker
 from analytics.technicals import technical_health_flag
 from analytics.options_math import probability_otm
 from analytics.iv_history import iv_rank_and_percentile

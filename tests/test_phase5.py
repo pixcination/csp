@@ -42,7 +42,9 @@ def test_iv_history_reads_the_current_capture_path():
 def test_iv_history_still_reads_the_legacy_path():
     import inspect
     from analytics import iv_history
-    assert "list_snapshot_dates_for_ticker" in inspect.getsource(
+    # Phase 8 moved the stage3_chains reader from the retired data_access
+    # module into iv_history itself; the legacy captures must still be read.
+    assert "_stage3_dates" in inspect.getsource(
         iv_history._available_blocks), "must not discard already-captured history"
 
 

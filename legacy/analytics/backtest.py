@@ -29,7 +29,7 @@ import pandas as pd
 from scipy.stats import norm
 
 from analytics.config import load_config
-from analytics.data_access import load_daily_bars
+from legacy.analytics.data_access import load_daily_bars
 from analytics.volatility import close_to_close_series
 from analytics.options_math import bs_price_greeks
 

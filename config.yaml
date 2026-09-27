@@ -298,7 +298,9 @@ move_analysis:
   lookback_years: [1, 3, 5, 10, 0]    # 0 = all available history
   min_observations: 60
   percentiles: [1, 5, 10, 20, 25, 50, 75, 90, 95, 99]
-  price_basis: total_return           # dividend-adjusted for probability work
+  price_basis: price                  # informational: the basis is chosen per caller in code
+                                      # (Phase 8). price = traded, split-adjusted, for every
+                                      # probability/strike/level; total = long-run returns only.
 
 # === Paper trading ===
 # Until TastyTrade position sync is switched on, every recommendation the

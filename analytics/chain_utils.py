@@ -1,4 +1,5 @@
-"""Shared chain-snapshot helper used by both iv_history.py and scoring.py --
+"""Shared chain-snapshot helper used by iv_history.py (and, before Phase 8,
+the now-retired legacy/analytics/scoring.py) --
 factored out so "find the put nearest the target delta within the DTE
 window" has one implementation instead of being copied into each caller."""
 import pandas as pd

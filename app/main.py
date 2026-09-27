@@ -40,13 +40,9 @@ pages = [
             icon=":material/donut_large:"),
     st.Page(str(PAGES_DIR / "5_Signals.py"), title="Signals",
             icon=":material/insights:"),
-    st.Page(str(PAGES_DIR / "1_Scanner.py"), title="Scanner",
-            icon=":material/search:"),
-    st.Page(str(PAGES_DIR / "2_Ticker_Detail.py"), title="Ticker Detail",
-            icon=":material/query_stats:"),
-    st.Page(str(PAGES_DIR / "3_Trade_Log.py"), title="Trade Log",
-            icon=":material/receipt_long:"),
 ]
+# The Phase-2 Scanner / Ticker Detail / Trade Log pages were retired to
+# legacy/ in Phase 8; the Screener and Trade Detail pages replace them.
 
 with st.sidebar:
     st.markdown(f"## {APP_NAME}")

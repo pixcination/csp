@@ -108,8 +108,7 @@ def _available_blocks(ticker: str) -> list[tuple[str, str, str]]:
 
     # Legacy path, so nothing already captured is lost.
     try:
-        from analytics.data_access import list_snapshot_dates_for_ticker
-        for date in list_snapshot_dates_for_ticker(ticker):
+        for date in _stage3_dates(ticker):
             out.append((str(date), str(date), "stage3"))
     except Exception:
         pass
@@ -121,8 +120,40 @@ def _load(ticker: str, block: str, source: str):
     if source == "chains":
         from data_sources.chains import load_chain
         return load_chain(ticker, block)
-    from analytics.data_access import load_chain_snapshot
-    return load_chain_snapshot(ticker, block)
+    return _load_stage3(ticker, block)
+
+
+# --- Legacy stage3_chains reader -------------------------------------------
+# Ported from the retired analytics/data_access.py (now legacy/) in Phase 8:
+# scripts/04 still writes this layout, and IV history must keep reading it.
+
+def _stage3_root():
+    from core.paths import data_dir
+    return data_dir() / "stage3_chains"
+
+
+def _stage3_file(date: str, ticker: str, kind: str):
+    matches = sorted((_stage3_root() / date).glob(f"{ticker}_{kind}_*.parquet"))
+    return matches[-1] if matches else None      # last scan of the day
+
+
+def _stage3_dates(ticker: str) -> list[str]:
+    root = _stage3_root()
+    if not root.exists():
+        return []
+    return [d.name for d in sorted(root.iterdir())
+            if d.is_dir() and _stage3_file(d.name, ticker, "full_chain")]
+
+
+def _load_stage3(ticker: str, date: str):
+    """(chain, underlying) for one legacy snapshot date, as data_access did."""
+    import pandas as pd
+    chain_file = _stage3_file(date, ticker, "full_chain")
+    if chain_file is None:
+        return pd.DataFrame(), None
+    under_file = _stage3_file(date, ticker, "underlying")
+    return (pd.read_parquet(chain_file),
+            pd.read_parquet(under_file) if under_file else None)
 
 
 def ingest_new_snapshots(tickers: list[str] | None = None) -> int:
