@@ -734,9 +734,13 @@ import pandas as pd  # noqa: E402  (used by helpers above)
 
 def run(tickers: list[str] | None = None, quick: bool = False,
         force_chains: bool = False, data_only: bool = False,
-        reporter: BaseReporter | None = None, request=None) -> RunManifest:
+        reporter: BaseReporter | None = None, request=None,
+        refresh_data: bool = True) -> RunManifest:
     """`data_only`: refresh data (bars, earnings, metrics, events, Stage 1)
     and stop -- the nightly job, so the interactive run only pulls chains.
+
+    `refresh_data=False` (Phase 19, the scheduled scans): skip those data
+    stages but still pull chains -- the nightly job refreshed the rest.
 
     `request`: an `analytics.scan_request.ScanRequest` (default: config).
     `tickers` narrows both the data stages and the request's universe."""
@@ -764,6 +768,8 @@ def run(tickers: list[str] | None = None, quick: bool = False,
         started_at=dt.datetime.now().isoformat(timespec="seconds"),
         session_block=session_block(), session_state=info.state.value,
         tickers=len(data_universe), request=request.to_dict())
+    if request.inherit_warning():
+        manifest.warnings.append(request.inherit_warning())
 
     reporter = reporter or ConsoleReporter(STAGES)
     started = dt.datetime.now()
@@ -779,7 +785,7 @@ def run(tickers: list[str] | None = None, quick: bool = False,
     with RunLock():
         guarded("preflight", _stage_preflight, reporter, manifest)
         guarded("universe", _stage_universe, reporter, manifest)
-        if not quick:
+        if not quick and refresh_data:
             guarded("reference", _stage_reference, reporter, manifest)
             guarded("daily", _stage_daily, reporter, manifest, data_universe)
             guarded("earnings", _stage_earnings, reporter, manifest, data_universe)

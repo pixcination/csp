@@ -313,6 +313,7 @@ def _evaluate(spec, ctx, request, account, cfg, today, daily, adv, events_frame,
     contracts = max(int(sized.contracts), 0)
     if sized.rejected:
         rejections.extend(sized.reasons or ("sizing: no contracts",))
+    warnings.extend(sized.warnings)
     n = max(contracts, 1)
 
     overrides = dict(request.event_policy_overrides or {}) if request else {}

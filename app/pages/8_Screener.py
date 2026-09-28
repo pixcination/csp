@@ -89,6 +89,8 @@ try:
 except RequestError as exc:
     st.error(f"{source}: {exc}")
     base = ScanRequest.default()
+if base.inherit_warning():
+    st.warning(f"{source}: {base.inherit_warning()}. Saving it again writes every field.")
 # Widget keys carry the source, so switching presets resets every field.
 k = f"scr|{source}|"
 

@@ -50,6 +50,19 @@ OUTCOMES (C.4) -- `expire_due()`
                 (`managed_pnl`, `managed_rule`); with none, the hold outcome.
     Marks are sampled (the scheduled job makes them hourly in Phase 19), so a
     rule that would have fired between marks is caught at the next one.
+
+PER CONTRACT (Phase 18 follow-up)
+    Every mark stores `pnl_per_contract` (gross, like `pnl`) and every outcome
+    `hold_pnl_per_contract` / `managed_pnl_per_contract` (fees split evenly),
+    so tracked results compare across tickers and accounts whatever the size.
+    The profile-sized count stays in `paper_positions.sized_contracts`.
+
+AUTO-LOGGING (Phase 19) -- `auto_log()`
+    The scheduler's once-a-day log of one auto preset's run: the C.3 sample,
+    minus naked and research-only rows (never auto-tracked), trimmed to the
+    preset's daily cap on NEW positions (default K + 2M = 11; rows already
+    open still get their observation). `observe_only()` is what any other
+    scan of an auto preset does: observations for open positions, nothing new.
 """
 from __future__ import annotations
 
@@ -84,6 +97,18 @@ SCHEMA = [
         attr_vega DOUBLE, attr_residual DOUBLE
     )
     """,
+]
+# Columns added after a table first shipped (run on every connect).
+MIGRATIONS = [
+    "ALTER TABLE position_marks ADD COLUMN IF NOT EXISTS pnl_per_contract DOUBLE",
+    # Backfill: fees split evenly makes per contract exactly the total / n.
+    "UPDATE position_marks SET pnl_per_contract = pnl / (SELECT greatest(p.contracts, 1) "
+    "FROM paper_positions p WHERE p.id = position_marks.position_id) "
+    "WHERE pnl_per_contract IS NULL AND pnl IS NOT NULL",
+    "UPDATE paper_positions SET hold_pnl_per_contract = hold_pnl / greatest(contracts, 1) "
+    "WHERE hold_pnl_per_contract IS NULL AND hold_pnl IS NOT NULL",
+    "UPDATE paper_positions SET managed_pnl_per_contract = managed_pnl / greatest(contracts, 1) "
+    "WHERE managed_pnl_per_contract IS NULL AND managed_pnl IS NOT NULL",
 ]
 
 CLOSE_VERDICTS = {"close", "roll"}
@@ -254,13 +279,19 @@ def _observe(con, key: str, position_id: int, row: dict, run_id, sample, preset)
 
 
 def log(rows, book: str = "tracked", sample: str = "manual", run_id: str | None = None,
-        preset: str | None = None) -> list[dict]:
+        preset: str | None = None, account_profile: str | None = None,
+        observe_only: bool = False, flags: str | None = None) -> list[dict]:
     """Log sheet rows (dicts or a frame). Each returns {key, action, position_id,
     message}: `opened` (a new position), `observed` (already open: an
-    observation appended) or `skipped` (not recordable, e.g. a stock leg)."""
+    observation appended), `not_open` (observe_only and not tracked) or
+    `skipped` (not recordable, e.g. a stock leg).
+
+    `account_profile` is the profile the rows were sized against; unset, the
+    run's request says (paper.run_profile)."""
     from analytics import paper
     if isinstance(rows, pd.DataFrame):
         rows = rows.to_dict("records")
+    profile = account_profile or paper.run_profile(run_id)
     out = []
     for row in rows:
         row = dict(row)
@@ -276,13 +307,19 @@ def log(rows, book: str = "tracked", sample: str = "manual", run_id: str | None 
                 continue
         finally:
             con.close()
+        if observe_only:
+            out.append({"key": key, "action": "not_open", "position_id": None,
+                        "message": f"{key}: not tracked; observe-only scans open nothing"})
+            continue
         try:
             source = {k: v for k, v in row.items() if not isinstance(v, (bytes,))}
             result = paper.accept(
                 row, contracts=max(int(_f(row.get("contracts")) or 0), 1),
                 run_id=run_id, book=book, sample=row_sample,
                 notes=f"logged ({row_sample})",
-                tracking={"dedupe_key": key, "preset": preset,
+                tracking={"dedupe_key": key, "preset": preset, "account_profile": profile,
+                          "sized_contracts": int(_f(row.get("contracts")) or 0),
+                          "flags": flags,
                           "rank_at_log": int(row["rank"]) if _f(row.get("rank")) else None,
                           "trade_id": row.get("trade_id"), "entry_spot": _f(row.get("spot")),
                           "entry_context": _json(entry_context(row)),
@@ -302,10 +339,83 @@ def log(rows, book: str = "tracked", sample: str = "manual", run_id: str | None 
 
 
 def log_all(sheet: pd.DataFrame, run_id: str | None = None, preset: str | None = None,
-            k: int | None = None, m: int | None = None) -> list[dict]:
+            k: int | None = None, m: int | None = None,
+            account_profile: str | None = None) -> list[dict]:
     """C.3: log the top K and the control sample of one sheet as tracked."""
     picked = sample_rows(sheet, k, m, seed=run_id or 0)
-    return log(picked, book="tracked", run_id=run_id, preset=preset)
+    return log(picked, book="tracked", run_id=run_id, preset=preset,
+               account_profile=account_profile)
+
+
+def auto_eligible(sheet: pd.DataFrame) -> pd.DataFrame:
+    """Rows an automatic log may open: never a naked spec, never a row the
+    profile marks research-only (Tom, Phase 17/19)."""
+    if sheet is None or sheet.empty:
+        return pd.DataFrame() if sheet is None else sheet
+    keep = pd.Series(True, index=sheet.index)
+    if "research_only" in sheet:
+        keep &= ~sheet["research_only"].map(lambda v: bool(v) if pd.notna(v) else False)
+    if "margin_class" in sheet:
+        keep &= sheet["margin_class"].fillna("") != "naked"
+    return sheet[keep]
+
+
+def opened_today(preset: str, day: dt.date | None = None) -> int:
+    """Tracked positions a preset opened on `day` (its daily cap counts these)."""
+    day = day or dt.date.today()
+    con = _con()
+    try:
+        row = con.execute("SELECT count(*) FROM paper_positions WHERE preset = ? "
+                          "AND coalesce(book, 'taken') = 'tracked' "
+                          "AND CAST(logged_at AS DATE) = ?", [preset, day]).fetchone()
+    finally:
+        con.close()
+    return int(row[0]) if row else 0
+
+
+def auto_log(sheet: pd.DataFrame, run_id: str, preset: str, account_profile: str,
+             k: int | None = None, m: int | None = None, daily_cap: int | None = None,
+             today: dt.date | None = None) -> dict:
+    """The scheduled log of one auto preset's run (Phase 19). Returns
+    {results, opened, observed, capped, excluded}."""
+    cfg = _cfg()
+    k = int(k if k is not None else cfg.get("top_k", 5))
+    m = int(m if m is not None else cfg.get("control_m", 3))
+    cap = int(daily_cap if daily_cap is not None else k + 2 * m)
+    eligible = auto_eligible(sheet)
+    excluded = 0 if sheet is None else len(sheet) - len(eligible)
+    picked = sample_rows(eligible, k, m, seed=run_id or 0)
+    if picked.empty:
+        return {"results": [], "opened": 0, "observed": 0, "capped": 0, "excluded": excluded}
+    room = max(cap - opened_today(preset, today), 0)
+    con = _con()
+    try:
+        is_open = [(_open_by_key(con, dedupe_key(r), "tracked") is not None)
+                   for r in picked.to_dict("records")]
+    finally:
+        con.close()
+    # Already-open rows only add observations; new ones fill the room in
+    # sample order (top first, then controls).
+    new_rank = np.cumsum([not o for o in is_open])
+    allowed = [o or n <= room for o, n in zip(is_open, new_rank)]
+    kept = picked[allowed]
+    capped = int(len(picked) - len(kept))
+    results = log(kept, book="tracked", run_id=run_id, preset=preset,
+                  account_profile=account_profile)
+    return {"results": results,
+            "opened": sum(r["action"] == "opened" for r in results),
+            "observed": sum(r["action"] == "observed" for r in results),
+            "capped": capped, "excluded": excluded}
+
+
+def observe_only(sheet: pd.DataFrame, run_id: str, preset: str) -> dict:
+    """A non-logging scan of an auto preset: observations for the rows that
+    are already tracked, nothing opened."""
+    if sheet is None or sheet.empty:
+        return {"results": [], "observed": 0}
+    results = log(_ranked(auto_eligible(sheet)), book="tracked", run_id=run_id,
+                  preset=preset, observe_only=True)
+    return {"results": results, "observed": sum(r["action"] == "observed" for r in results)}
 
 
 def promote(position_id: int, actual_fill: float | None = None, contracts: int | None = None,
@@ -330,6 +440,8 @@ def promote(position_id: int, actual_fill: float | None = None, contracts: int |
                                   "entry_spot": _f(row.get("entry_spot")),
                                   "entry_context": row.get("entry_context"),
                                   "source_row": row.get("source_row"),
+                                  "account_profile": row.get("account_profile"),
+                                  "sized_contracts": row.get("sized_contracts"),
                                   "promoted_from": int(position_id)})
 
 
@@ -608,6 +720,8 @@ def update(position_ids: list[int] | None = None, pull: bool = True, book: str |
             record = {"position_id": int(row["id"]), "marked_at": now, "session_block": block,
                       "source": source, "spot": spot, "mark": marked["mark"],
                       "natural": marked["natural"], "pnl": marked["unrealized"],
+                      "pnl_per_contract": (marked["unrealized"] / n
+                                           if marked["unrealized"] is not None else None),
                       "profit_pct": marked["profit_pct"], "dte_left": (front - today).days,
                       "legs": detail, "delta_shares": marked["delta_shares"],
                       "gamma_shares": marked["gamma_shares"], "theta_day": marked["theta_day"],
@@ -628,18 +742,24 @@ def update(position_ids: list[int] | None = None, pull: bool = True, book: str |
                 if pct is not None:
                     best = pct if best is None else max(best, pct)
                     worst = pct if worst is None else min(worst, pct)
-                con.execute(
-                    "INSERT INTO position_marks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                    "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [record["position_id"], now, block, source, spot, record["mark"],
-                     record["natural"], record["pnl"], pct, record["dte_left"], best, worst,
-                     _json(detail), record["delta_shares"], record["gamma_shares"],
-                     record["theta_day"], record["vega"], record["target_pct"],
-                     record["p_target_now"], record["p_max_loss_now"], record["pop_now"],
-                     record["verdict"], record["verdict_urgency"], record["verdict_reason"],
-                     record["iv_rank"], record["iv_pct"], record["vix_ratio"], record["trend"],
-                     record["rsi"], attr["pnl_change"], attr["attr_delta"], attr["attr_gamma"],
-                     attr["attr_theta"], attr["attr_vega"], attr["attr_residual"]])
+                values = {
+                    "position_id": record["position_id"], "marked_at": now,
+                    "session_block": block, "source": source, "spot": spot,
+                    "mark": record["mark"], "natural_mark": record["natural"],
+                    "pnl": record["pnl"], "profit_pct": pct, "dte_left": record["dte_left"],
+                    "best_pct": best, "worst_pct": worst, "legs_json": _json(detail),
+                    "delta_shares": record["delta_shares"],
+                    "gamma_shares": record["gamma_shares"], "theta_day": record["theta_day"],
+                    "vega": record["vega"], "target_pct": record["target_pct"],
+                    "p_target_now": record["p_target_now"],
+                    "p_max_loss_now": record["p_max_loss_now"], "pop_now": record["pop_now"],
+                    "verdict": record["verdict"], "verdict_urgency": record["verdict_urgency"],
+                    "verdict_reason": record["verdict_reason"], "iv_rank": record["iv_rank"],
+                    "iv_pct": record["iv_pct"], "vix_ratio": record["vix_ratio"],
+                    "trend": record["trend"], "rsi": record["rsi"],
+                    "pnl_per_contract": record["pnl_per_contract"], **attr}
+                con.execute(f"INSERT INTO position_marks ({', '.join(values)}) "
+                            f"VALUES ({', '.join('?' * len(values))})", list(values.values()))
             finally:
                 con.close()
             if record["mark"] is not None:
@@ -733,9 +853,10 @@ def managed_outcome(position: dict, marks_frame: pd.DataFrame) -> dict | None:
                                                    opening=False)).total
     fill = float(position["actual_fill"] if pd.notna(position.get("actual_fill"))
                  else position["modelled_fill"])
-    pnl = (fill - float(first["mark"])) * 100.0 * n - float(position.get("entry_fees") or 0.0) \
-        - close_fees
-    return {"managed_pnl": pnl, "managed_exit_date": pd.Timestamp(first["marked_at"]).date(),
+    fees = float(position.get("entry_fees") or 0.0) + close_fees
+    gross = (fill - float(first["mark"])) * 100.0
+    return {"managed_pnl": gross * n - fees, "managed_pnl_per_contract": gross - fees / n,
+            "managed_exit_date": pd.Timestamp(first["marked_at"]).date(),
             "managed_rule": f"{first['verdict']}: {first.get('verdict_reason') or ''}"[:200]}
 
 
@@ -784,19 +905,25 @@ def expire_due(today: dt.date | None = None, book: str | None = "tracked",
         exit_fees = float(closed.get("exit_fees") or 0.0)
         # Hold: the package's value at the close (for an assigned CSP, the
         # shares marked at the close -- the loss is real whether or not sold).
-        hold = (fill - debit) * 100.0 * n - float(row.get("entry_fees") or 0.0) - exit_fees
+        fees = float(row.get("entry_fees") or 0.0) + exit_fees
+        hold = (fill - debit) * 100.0 * n - fees
+        hold_one = (fill - debit) * 100.0 - fees / n
         managed = managed_outcome(row, marks(int(row["id"]))) or {
-            "managed_pnl": hold, "managed_exit_date": day, "managed_rule": "held: no rule fired"}
+            "managed_pnl": hold, "managed_pnl_per_contract": hold_one,
+            "managed_exit_date": day, "managed_rule": "held: no rule fired"}
         con = _con()
         try:
             con.execute("UPDATE paper_positions SET hold_status = ?, hold_pnl = ?, "
-                        "managed_pnl = ?, managed_exit_date = ?, managed_rule = ? WHERE id = ?",
-                        [status, hold, managed["managed_pnl"], managed["managed_exit_date"],
+                        "hold_pnl_per_contract = ?, managed_pnl = ?, "
+                        "managed_pnl_per_contract = ?, managed_exit_date = ?, "
+                        "managed_rule = ? WHERE id = ?",
+                        [status, hold, hold_one, managed["managed_pnl"],
+                         managed["managed_pnl_per_contract"], managed["managed_exit_date"],
                          managed["managed_rule"], int(row["id"])])
         finally:
             con.close()
         results.append({"position_id": int(row["id"]), "action": status, "close": price,
-                        "hold_pnl": hold, **managed,
+                        "hold_pnl": hold, "hold_pnl_per_contract": hold_one, **managed,
                         "message": f"#{row['id']} {ticker} {day}: {status} at ${price:,.2f}; "
                                    f"hold ${hold:,.0f}, managed ${managed['managed_pnl']:,.0f}"})
         if reporter:
@@ -805,13 +932,16 @@ def expire_due(today: dt.date | None = None, book: str | None = "tracked",
 
 
 def closed_outcomes(book: str | None = None) -> pd.DataFrame:
-    """Closed positions with both outcomes."""
+    """Closed positions with both outcomes (dollars, per contract, and whether
+    the dollars belong in a dollar report)."""
     from analytics import paper
     frame = paper.list_positions(book=book)
     if frame.empty:
         return frame
     frame = frame[frame["status"] != "open"]
-    cols = ["id", "book", "sample", "ticker", "strategy", "legs_label", "strike", "long_strike",
-            "expiration", "contracts", "status", "exit_date", "settlement_price", "hold_pnl",
-            "managed_pnl", "managed_exit_date", "managed_rule", "rec_pop"]
+    cols = ["id", "book", "sample", "account_profile", "ticker", "strategy", "legs_label",
+            "strike", "long_strike", "expiration", "contracts", "sized_contracts", "status",
+            "exit_date", "settlement_price", "hold_pnl", "hold_pnl_per_contract",
+            "managed_pnl", "managed_pnl_per_contract", "managed_exit_date", "managed_rule",
+            "rec_pop", "dollar_pnl_valid", "flags"]
     return frame[[c for c in cols if c in frame.columns]].reset_index(drop=True)

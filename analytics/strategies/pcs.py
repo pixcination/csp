@@ -395,6 +395,7 @@ def _evaluate(ticker, ctx, s_row, l_row, rules, exp_date, root, settlement_type,
         reasons.append(f"fees are {econ.cost_drag_pct:.1%} of gross credit (limit {max_drag:.0%})")
     if size.rejected:
         reasons.extend(size.reasons or ("no tradable size",))
+    warnings.extend(size.warnings)
     if np.isfinite(ev) and ev <= 0:
         reasons.append(f"expected value is ${ev:,.0f} -- the empirical loss tail outweighs "
                        f"the credit at this short strike and width")

@@ -427,8 +427,13 @@ else:
     metrics[1].metric("Closed", f"{stats.get('n_closed', 0)}")
     if stats.get("n_closed"):
         metrics[2].metric("Win rate", f"{stats['win_rate']:.0%}")
-        metrics[3].metric("Realised", f"${stats['total_realized']:,.0f}")
-        metrics[4].metric("Mean annualised", f"{stats['mean_annualised']:.1%}")
+        excluded = stats.get("n_dollar_excluded", 0)
+        note = (f"Leaves out {excluded} row(s) sized against the research default or a "
+                f"placeholder profile (their rates still count)." if excluded else None)
+        metrics[3].metric("Realised", f"${stats['total_realized']:,.0f}", help=note)
+        annualised = stats["mean_annualised"]
+        metrics[4].metric("Mean annualised",
+                          f"{annualised:.1%}" if annualised == annualised else "n/a", help=note)
 
     if stats.get("by_strategy"):
         st.caption(" · ".join(

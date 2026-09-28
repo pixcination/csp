@@ -50,6 +50,21 @@ never opening a wheel cycle or a share lot). `sample` says why a tracked row
 was logged (`top` of a ranking, a random `control`, or `manual`), which is
 what lets the accuracy log measure the model rather than the choices.
 `promoted_from` links a taken trade to the tracked row it started as.
+
+ACCOUNT PROFILE AND SIZE (Phase 18 follow-up, Tom 2026-09-28)
+    account_profile    the profile the row was sized against (with `run_id`,
+                       the run it came from); `profile_nlv` that profile's
+                       account value at log time
+    sized_contracts    the profile-sized contract count, kept apart from the
+                       per-contract figures
+    dollar_pnl_valid   False for a tracked row sized against the research
+                       `default` ($3M) or a placeholder profile: it counts in
+                       probability and %-of-max-profit reports, never in
+                       dollar P&L. A taken trade's dollars are always real.
+    flags              comma-separated data-quality tags, e.g. `pre_fix_bars`
+                       (priced before the Phase 18 partial-bar fix)
+    *_per_contract     outcomes per contract (gross per contract less the
+                       position's fees split evenly), comparable across sizes
 Tracking itself (observations, hourly marks, attribution, outcomes) lives in
 `analytics/tracking.py`.
 
@@ -164,6 +179,11 @@ POSITION_COLUMNS = {
     "source_row": "VARCHAR", "logged_at": "TIMESTAMP",
     "hold_status": "VARCHAR", "hold_pnl": "DOUBLE",
     "managed_pnl": "DOUBLE", "managed_exit_date": "DATE", "managed_rule": "VARCHAR",
+    # Phase 18 follow-up: the profile and size a row was logged at, per-contract
+    # outcomes, and data-quality flags
+    "account_profile": "VARCHAR", "profile_nlv": "DOUBLE", "dollar_pnl_valid": "BOOLEAN",
+    "sized_contracts": "INTEGER", "flags": "VARCHAR",
+    "hold_pnl_per_contract": "DOUBLE", "managed_pnl_per_contract": "DOUBLE",
 }
 
 
@@ -173,6 +193,14 @@ def _migrate(con) -> None:
     # Phase 18: everything recorded before tracking existed was a real trade.
     con.execute("UPDATE paper_positions SET book = 'taken' WHERE book IS NULL")
     con.execute("UPDATE paper_positions SET sample = 'manual' WHERE sample IS NULL")
+    # Phase 18 follow-up: rows logged before profiles were recorded were sized
+    # against the research `default` account ($3M). Their dollars are not an
+    # account's dollars; their probabilities and %-of-max-profit still count.
+    con.execute("UPDATE paper_positions SET sized_contracts = contracts "
+                "WHERE sized_contracts IS NULL")
+    con.execute("UPDATE paper_positions SET account_profile = 'default', profile_nlv = ?, "
+                "dollar_pnl_valid = (coalesce(book, 'taken') = 'taken') "
+                "WHERE account_profile IS NULL", [_default_nlv()])
     # Single-leg rows from before Phase 15 get their one leg. Idempotent: only
     # positions without any leg are touched.
     con.execute("""
@@ -191,6 +219,62 @@ def _migrate(con) -> None:
     """)
 
 
+def _default_nlv() -> float:
+    return float((load_config().get("account", {}) or {}).get("net_liquidating_value") or 0.0)
+
+
+def profile_stamp(profile: str | None, book: str) -> dict:
+    """The profile columns for a new row: name, account value at log time,
+    and whether its dollar P&L means anything (a taken trade always; a
+    tracked one only when sized against a real, non-placeholder profile)."""
+    from analytics import sizing
+    name = profile or "default"
+    cfg = sizing.account_config(name)
+    real = name != "default" and not cfg.get("placeholder")
+    return {"account_profile": name,
+            "profile_nlv": float(cfg.get("net_liquidating_value") or 0.0),
+            "dollar_pnl_valid": bool(book == "taken" or real)}
+
+
+def run_profile(run_id: str | None) -> str | None:
+    """The account profile a run's request was sized against."""
+    if not run_id:
+        return None
+    try:
+        import json
+
+        from core.paths import runs_dir
+        manifest = json.loads((runs_dir() / str(run_id) / "manifest.json")
+                              .read_text(encoding="utf-8"))
+        return (manifest.get("request") or {}).get("account_profile") or "default"
+    except (OSError, ValueError):
+        return None
+
+
+def add_flag(position_ids: list[int], flag: str) -> int:
+    """Tag positions with a data-quality flag (idempotent). Returns how many
+    rows gained it."""
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,39}", flag):
+        raise ValueError("flags are lower-case letters, digits and _")
+    con = _connect()
+    try:
+        changed = 0
+        for pid in position_ids:
+            row = con.execute("SELECT flags FROM paper_positions WHERE id = ?",
+                              [int(pid)]).fetchone()
+            if row is None:
+                continue
+            flags = [f for f in (row[0] or "").split(",") if f]
+            if flag in flags:
+                continue
+            con.execute("UPDATE paper_positions SET flags = ? WHERE id = ?",
+                        [",".join(flags + [flag]), int(pid)])
+            changed += 1
+        return changed
+    finally:
+        con.close()
+
+
 def _connect(read_only: bool = False):
     con = duckdb.connect(str(db_trade_log()), read_only=read_only)
     if not read_only:
@@ -200,6 +284,8 @@ def _connect(read_only: bool = False):
         try:
             from analytics import tracking
             for statement in tracking.SCHEMA:
+                con.execute(statement)
+            for statement in tracking.MIGRATIONS:
                 con.execute(statement)
         except ImportError:
             pass
@@ -394,7 +480,9 @@ def accept(recommendation: dict, contracts: int | None = None,
     `book` (Phase 18): `taken` (a real trade) or `tracked` (a forward test at
     the modelled fill: no wheel cycle, not counted against the account).
     `tracking` holds the extra Phase 18 columns (dedupe_key, trade_id,
-    entry_spot, entry_context, source_row, preset, rank_at_log, promoted_from).
+    entry_spot, entry_context, source_row, preset, rank_at_log, promoted_from,
+    account_profile, sized_contracts, flags). The account profile defaults to
+    the row's own, else the run's request, else `default`.
     """
     if book not in BOOKS:
         raise ValueError(f"book must be one of {BOOKS}")
@@ -510,7 +598,14 @@ def accept(recommendation: dict, contracts: int | None = None,
                      book, sample, dt.datetime.now(), position_id])
         extra = {k: v for k, v in (tracking or {}).items()
                  if k in ("dedupe_key", "preset", "rank_at_log", "trade_id", "entry_spot",
-                          "entry_context", "source_row", "promoted_from")}
+                          "entry_context", "source_row", "promoted_from", "flags")}
+        profile = ((tracking or {}).get("account_profile")
+                   or recommendation.get("account_profile") or run_profile(run_id))
+        extra.update(profile_stamp(profile, book))
+        sized = (tracking or {}).get("sized_contracts")
+        if sized is None:
+            sized = _num(recommendation.get("contracts"))
+        extra["sized_contracts"] = int(sized) if sized is not None else size
         for column, value in extra.items():
             con.execute(f"UPDATE paper_positions SET {column} = ? WHERE id = ?",
                         [value, position_id])
@@ -940,6 +1035,15 @@ def realized(frame: pd.DataFrame) -> pd.Series:
     return (fill - exit_price) * 100 * frame["contracts"].astype(float) - fees
 
 
+def dollar_valid(frame: pd.DataFrame) -> pd.Series:
+    """Rows whose dollar P&L belongs in a dollar report (see the module
+    docstring); rows without the column count."""
+    if "dollar_pnl_valid" not in frame:
+        return pd.Series(True, index=frame.index)
+    return frame["dollar_pnl_valid"].map(lambda v: True if v is None or pd.isna(v)
+                                         else bool(v)).astype(bool)
+
+
 def performance() -> dict:
     """Realised outcomes over closed positions, net of every fee."""
     frame = list_positions()
@@ -955,14 +1059,20 @@ def performance() -> dict:
     collateral = closed["collateral"].astype(float).replace(0, float("nan"))
     closed["annualised"] = (closed["realized"] / collateral) * (365.0 / days)
     closed["strategy"] = closed["strategy"].fillna("csp")
+    # Dollar totals only over rows sized against a real account (Phase 18
+    # follow-up); rates and probabilities use every closed row.
+    valid = dollar_valid(closed)
 
     by_strategy = {}
     for name, group in closed.groupby("strategy"):
+        money = group[valid.loc[group.index]]
         by_strategy[name] = {
             "n_closed": int(len(group)),
             "profit_rate": float((group["realized"] > 0).mean()),
-            "total_realized": float(group["realized"].sum()),
-            "mean_annualised": float(group["annualised"].mean()),
+            "total_realized": float(money["realized"].sum()),
+            "mean_annualised": float(money["annualised"].mean()) if len(money)
+            else float("nan"),
+            "n_dollar_excluded": int(len(group) - len(money)),
         }
 
     return {
@@ -971,8 +1081,10 @@ def performance() -> dict:
         "win_rate": float((closed["status"] == "expired_otm").mean()),
         "profit_rate": float((closed["realized"] > 0).mean()),
         "assignment_rate": float((closed["status"] == "assigned").mean()),
-        "total_realized": float(closed["realized"].sum()),
-        "mean_annualised": float(closed["annualised"].mean()),
+        "total_realized": float(closed.loc[valid, "realized"].sum()),
+        "mean_annualised": float(closed.loc[valid, "annualised"].mean()) if valid.any()
+        else float("nan"),
+        "n_dollar_excluded": int((~valid).sum()),
         "predicted_win_rate": float(closed["rec_prob_otm"].dropna().mean())
         if closed["rec_prob_otm"].notna().any() else float("nan"),
         "by_strategy": by_strategy,

@@ -28,7 +28,11 @@ GOLDEN = ROOT / "tests" / "fixtures" / "csp_golden"
 def test_csp_port_reproduces_the_pre_port_output():
     """Frozen 2026-09-27 from the pre-port `candidates.evaluate_strike` on real
     chain rows and bars (5 tickers, 21 strikes). Depends on the account,
-    liquidity, cost and entry settings in config.yaml as of that date."""
+    liquidity, cost and entry settings in config.yaml as of that date.
+
+    Re-checked on purpose for the Phase 19 CSP window change (5-10 -> 3-11
+    DTE, 7 +/- 4): the fixture's strikes sit at 5 and 8 DTE, inside both
+    windows, and every compared field is unchanged, so it was not rewritten."""
     golden = json.loads((GOLDEN / "golden.json").read_text())
     today = dt.date.fromisoformat(golden["today"])
     rows = pd.read_parquet(GOLDEN / "chain_rows.parquet")
@@ -258,7 +262,8 @@ def test_build_candidates_on_a_synthetic_chain():
     ctx = TickerContext("TST", 100.0, today, chain)
     reading = regime.RegimeReading(None, 15, 12, 17, 90, 140, 0.71, "calm", 1.0, True, "", "")
     request = ScanRequest.from_dict({"strategies": ["pcs"], "dte_min": 25, "dte_max": 35,
-                                     "strike_rule": "delta", "spread_widths": [1, 2.5, 5, 10]})
+                                     "strike_rule": "delta", "spread_widths": [1, 2.5, 5, 10],
+                                     "spread_width_pct": None, "pcs_dte_targets": None})
     rows = pcs.build_candidates("TST", ctx, daily, 5e8, sizing.AccountState(3e6, 3e6),
                                 candidates.load_config(), reading, request, checks={},
                                 today=today)
@@ -323,7 +328,8 @@ def test_snapped_width_far_from_the_request_is_warned():
         "TST", TickerContext("TST", 100.0, today, chain), daily, 5e8,
         sizing.AccountState(3e6, 3e6), candidates.load_config(), reading,
         ScanRequest.from_dict({"strategies": ["pcs"], "dte_min": 25, "dte_max": 35,
-                               "strike_rule": "delta", "spread_widths": [1, 5]}),
+                               "strike_rule": "delta", "spread_widths": [1, 5],
+                               "spread_width_pct": None, "pcs_dte_targets": None}),
         checks={}, today=today)
     assert [r.width for r in rows] == [5.0]                   # $1 and $5 both snap to 5: built once
     assert rows[0].requested_width == 1.0 and any("strike spacing" in w for w in rows[0].warnings)

@@ -262,5 +262,84 @@ def delete_scan_preset(name: str) -> bool:
     if name not in presets:
         return False
     del presets[name]
+    ((data.get("schedule") or {}).get("auto_presets") or {}).pop(name, None)
     _write(data)
     return True
+
+
+# --- Schedule (Phase 19) ---------------------------------------------------------------
+# Overrides of config.yaml -> schedule, edited on the Settings page:
+#
+#     schedule:
+#       scan_and_log: {time: "10:45"}
+#       auto_presets:
+#         csp_roth: {top_k: 5, control_m: 3, daily_cap: 11, observe_hourly: false}
+#
+# A preset can be marked auto only when it spells out every ScanRequest field,
+# so a later config change cannot silently change what is being tracked.
+
+_TIME = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+SCHEDULE_TIMES = {"mark": ("start", "end"), "scan_and_log": ("time",), "archive": ("time",),
+                  "nightly": ("time",)}
+
+
+def validate_schedule(fields: dict) -> dict:
+    """Coerce the schedule's own settings (not the auto presets)."""
+    out: dict = {}
+    for key, value in (fields or {}).items():
+        if key == "enabled":
+            out[key] = bool(value)
+        elif key in ("grace_minutes", "poll_seconds"):
+            number = int(value)
+            if number < (5 if key == "poll_seconds" else 0) or number > 240:
+                raise SettingsError(f"{key} must be between 5 and 240")
+            out[key] = number
+        elif key in SCHEDULE_TIMES:
+            block = dict(value or {})
+            for part in SCHEDULE_TIMES[key]:
+                if part in block and not _TIME.match(str(block[part])):
+                    raise SettingsError(f"{key}.{part} must be HH:MM (24-hour, ET)")
+            if key == "mark" and "every_minutes" in block:
+                block["every_minutes"] = int(block["every_minutes"])
+                if not 5 <= block["every_minutes"] <= 240:
+                    raise SettingsError("mark.every_minutes must be between 5 and 240")
+            out[key] = block
+        else:
+            raise SettingsError(f"unknown schedule setting '{key}'")
+    return out
+
+
+def save_schedule(fields: dict) -> None:
+    data = load()
+    current = data.get("schedule") or {}
+    data["schedule"] = {**current, **validate_schedule(fields)}
+    _write(data)
+
+
+def set_auto_preset(name: str, auto: dict | None) -> None:
+    """Mark a saved preset auto ({top_k, control_m, daily_cap, observe_hourly})
+    or clear it (None). Refused unless the preset is fully explicit."""
+    from analytics.scan_request import missing_fields
+    data = load()
+    schedule = data.setdefault("schedule", {})
+    autos = schedule.setdefault("auto_presets", {})
+    if auto is None:
+        autos.pop(name, None)
+        _write(data)
+        return
+    presets = data.get("scan_presets") or {}
+    if name not in presets:
+        raise SettingsError(f"no saved preset '{name}'")
+    missing = missing_fields(presets[name])
+    if missing:
+        raise SettingsError(f"'{name}' is not fully explicit (missing {', '.join(missing)}); "
+                            f"open it on the Screener and save it again first")
+    clean = {}
+    for key in ("top_k", "control_m", "daily_cap"):
+        if auto.get(key) is not None:
+            clean[key] = int(auto[key])
+            if not 0 <= clean[key] <= 100:
+                raise SettingsError(f"{key} must be between 0 and 100")
+    clean["observe_hourly"] = bool(auto.get("observe_hourly", False))
+    autos[name] = clean
+    _write(data)

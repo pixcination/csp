@@ -35,6 +35,15 @@ result can always be traced back to the question that produced it.
 `management.entry` DTE window and delta band. A run without `--request` does
 exactly what it did before, apart from pulling chains for the top N only.
 
+INHERITANCE (Phase 19, Tom 2026-09-28)
+--------------------------------------
+A JSON request or saved preset that leaves a field out inherits it from
+`config.yaml -> scan_defaults`, as `default()` always did, and says so:
+`request.inherited` lists those fields and the run records a warning. Saved
+presets are written with every field explicit (`to_dict`), and a preset
+marked "auto" must be fully explicit (`missing_fields`) so a later config
+change cannot silently change what is being tracked.
+
 WHAT IS APPLIED WHERE (Phase 11)
 --------------------------------
 Ranking and chain capture read the whole request. CSP construction applies
@@ -54,6 +63,7 @@ import dataclasses
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import ClassVar
 
 from core.paths import load_config
 
@@ -93,28 +103,35 @@ class ScanRequest:
     em_multiple: float = 1.0
     name: str = ""
 
+    #: Fields a from_dict() filled from scan_defaults (not a request field).
+    inherited: ClassVar[tuple[str, ...]] = ()
+
     # --- Construction ------------------------------------------------------
 
     @classmethod
     def default(cls, **overrides) -> "ScanRequest":
         """Config defaults, with `management.entry` filling the DTE window and
         delta band when `scan_defaults` leaves them null."""
-        cfg = load_config()
-        base = dict(cfg.get("scan_defaults") or {})
-        base.pop("dte_target_tolerance_days", None)
-        base.pop("pcs_dte_tolerance_days", None)
-        base.pop("prefer_monthly_from_dte", None)
+        base = scan_defaults()
         base.update({k: v for k, v in overrides.items() if v is not None})
-        return cls.from_dict(base)
+        return cls.from_dict(base, inherit=False)
 
     @classmethod
-    def from_dict(cls, data: dict) -> "ScanRequest":
-        known = {f.name for f in dataclasses.fields(cls)}
+    def from_dict(cls, data: dict, inherit: bool = True) -> "ScanRequest":
+        """Build and validate. With `inherit`, fields missing from `data`
+        come from scan_defaults and are listed in `request.inherited`."""
+        known = field_names()
         unknown = sorted(set(data) - known)
         if unknown:
             raise RequestError(f"unknown request field(s): {', '.join(unknown)}")
         entry = load_config().get("management", {}).get("entry", {})
         data = dict(data)
+        inherited: list[str] = []
+        if inherit:
+            for key, value in scan_defaults().items():
+                if key in known and key not in data:
+                    data[key] = value
+                    inherited.append(key)
         if data.get("dte_targets") in ([], None):
             data["dte_targets"] = None
             if data.get("dte_min") is None:
@@ -125,6 +142,7 @@ class ScanRequest:
             data["delta_range"] = list(entry.get("delta_band", [-0.30, -0.12]))
         request = cls(**data)
         request.validate()
+        request.inherited = tuple(sorted(inherited))
         return request
 
     @classmethod
@@ -136,7 +154,14 @@ class ScanRequest:
         return cls.from_json(Path(path).read_text(encoding="utf-8"))
 
     def to_dict(self) -> dict:
+        """Every field, explicitly -- what a saved preset stores."""
         return dataclasses.asdict(self)
+
+    def inherit_warning(self) -> str | None:
+        if not self.inherited:
+            return None
+        return (f"request{f' {self.name!r}' if self.name else ''} left out "
+                f"{', '.join(self.inherited)}; inherited from config.yaml scan_defaults")
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), indent=2)
@@ -390,6 +415,26 @@ class ScanRequest:
             dte = pcs if self.strategies == ["pcs"] else f"CSP {dte} + {pcs}"
             return f"{dte}, top {self.top_n_underlyings}"
         return f"{'+'.join(s.upper() for s in self.strategies)} {dte}, top {self.top_n_underlyings}"
+
+
+def field_names() -> set[str]:
+    return {f.name for f in dataclasses.fields(ScanRequest)}
+
+
+def scan_defaults() -> dict:
+    """config.yaml -> scan_defaults without the keys that are settings rather
+    than request fields (tolerances, the monthly preference)."""
+    base = dict(load_config().get("scan_defaults") or {})
+    for key in ("dte_target_tolerance_days", "pcs_dte_tolerance_days",
+                "prefer_monthly_from_dte"):
+        base.pop(key, None)
+    return base
+
+
+def missing_fields(data: dict) -> list[str]:
+    """Request fields a stored dict does not spell out (an auto preset must
+    have none)."""
+    return sorted(field_names() - set(data or {}))
 
 
 def resolve_universe(request: ScanRequest) -> list[str]:

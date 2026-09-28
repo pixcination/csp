@@ -269,11 +269,13 @@ def user_file(tmp_path, monkeypatch):
 def test_scan_presets_save_load_delete(user_file):
     from analytics.scan_request import ScanRequest
     from core import user_settings as us
-    request = ScanRequest.from_dict({"strategies": ["pcs"], "dte_min": 30, "dte_max": 45})
+    request = ScanRequest.from_dict({"strategies": ["pcs"], "dte_min": 30, "dte_max": 45,
+                                     "pcs_dte_targets": None})
     assert us.save_scan_preset("PCS_Monthly", request.to_dict()) == "pcs_monthly"
     stored = us.scan_presets()["pcs_monthly"]
     again = ScanRequest.from_dict(stored)
     assert again.strategies == ["pcs"] and again.dte_window() == (30, 45)
+    assert again.inherited == ()                          # saved with every field (Phase 19)
     assert stored["name"] == "pcs_monthly"
     with pytest.raises(us.SettingsError):
         us.save_scan_preset("bad", {"strategies": ["iron_fly"]})

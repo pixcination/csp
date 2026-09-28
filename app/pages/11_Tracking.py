@@ -13,6 +13,14 @@ now, the management verdict, and the P&L since the last mark split into
 delta / gamma / theta / vega / residual. Expire due settles positions whose
 expiry has closed and records the hold-to-expiry and managed outcomes.
 Everything is `analytics/tracking.py`.
+
+Each row carries the account profile it was sized against and the run it
+came from. P&L is shown per contract for every row (comparable across
+tickers and accounts); dollar P&L only for rows sized against a real
+profile -- the research `default` ($3M) and placeholder profiles count in
+probability and %-of-max reports, not in dollars. `flags` marks data-quality
+caveats (`pre_fix_bars`: priced before the Phase 18 partial-bar fix).
+Scheduled marks and auto-logs (Phase 19) run in pipeline/scheduler.py.
 """
 from __future__ import annotations
 
@@ -74,6 +82,12 @@ latest = (all_marks.sort_values("marked_at").groupby("position_id").tail(1).set_
           if not all_marks.empty else pd.DataFrame())
 
 
+def _dollars(row, value):
+    """Dollar P&L only where it is an account's dollars."""
+    valid = row.get("dollar_pnl_valid")
+    return value if valid is None or pd.isna(valid) or bool(valid) else None
+
+
 def _entry(row, key):
     try:
         return json.loads(row["entry_context"]).get(key) if row.get("entry_context") else None
@@ -91,12 +105,14 @@ if not open_rows.empty:
         get = (lambda k: None) if mark is None else (lambda k: mark.get(k))
         table.append({
             "id": int(row["id"]), "book": row.get("book"), "sample": row.get("sample"),
+            "profile": row.get("account_profile"), "flags": row.get("flags") or "",
             "ticker": row["ticker"], "strategy": row.get("strategy"),
             "legs": paper.leg_text(row), "expiry": row["expiration"],
             "DTE": get("dte_left"), "contracts": int(row["contracts"]),
             "credit": row["actual_fill"] if pd.notna(row.get("actual_fill"))
             else row["modelled_fill"],
-            "mark": get("mark"), "P&L": get("pnl"), "% max": get("profit_pct"),
+            "mark": get("mark"), "P&L / contract": get("pnl_per_contract"),
+            "P&L": _dollars(row, get("pnl")), "% max": get("profit_pct"),
             "best": get("best_pct"), "worst": get("worst_pct"),
             "P(target) entry": _entry(row, "p_hit_50"), "P(target) now": get("p_target_now"),
             "POP now": get("pop_now"), "verdict": get("verdict"),
@@ -106,6 +122,7 @@ if not open_rows.empty:
     st.dataframe(pd.DataFrame(table), hide_index=True, width="stretch", column_config={
         "credit": st.column_config.NumberColumn(format="$%.2f"),
         "mark": st.column_config.NumberColumn(format="$%.2f"),
+        "P&L / contract": st.column_config.NumberColumn(format="dollar"),
         "P&L": st.column_config.NumberColumn(format="dollar"),
         "% max": st.column_config.NumberColumn(format=pct),
         "best": st.column_config.NumberColumn(format=pct),
@@ -117,7 +134,9 @@ if not open_rows.empty:
         "why": st.column_config.TextColumn(width="large")})
     tracked_n = int((open_rows["book"] == "tracked").sum())
     st.caption(f"{tracked_n} tracked forward test(s) never count against the account; "
-               f"{len(open_rows) - tracked_n} taken trade(s) do (Portfolio page).")
+               f"{len(open_rows) - tracked_n} taken trade(s) do (Portfolio page). "
+               "P&L is blank for rows sized against the research default or a placeholder "
+               "profile; P&L / contract is gross, like the mark.")
 
 # --- One position --------------------------------------------------------------------------
 
@@ -201,10 +220,20 @@ closed = tracking.closed_outcomes(book)
 if closed.empty:
     st.caption("Nothing closed yet.")
 else:
+    valid = paper.dollar_valid(closed)
+    for column in ("hold_pnl", "managed_pnl"):
+        closed[column] = closed[column].where(valid)
     st.dataframe(closed, hide_index=True, width="stretch", column_config={
         "hold_pnl": st.column_config.NumberColumn("hold P&L", format="dollar"),
+        "hold_pnl_per_contract": st.column_config.NumberColumn("hold / contract",
+                                                               format="dollar"),
         "managed_pnl": st.column_config.NumberColumn("managed P&L", format="dollar"),
+        "managed_pnl_per_contract": st.column_config.NumberColumn("managed / contract",
+                                                                  format="dollar"),
         "rec_pop": st.column_config.NumberColumn("POP at entry", format="percent")})
+    if (~valid).any():
+        st.caption(f"{int((~valid).sum())} row(s) sized against the research default or a "
+                   "placeholder profile: dollar P&L left out; per-contract outcomes shown.")
 
 with st.expander("Chain archive"):
     from data_sources import chain_archive

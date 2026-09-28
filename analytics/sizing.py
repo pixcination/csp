@@ -105,6 +105,7 @@ class SizingResult:
     reasons: tuple[str, ...] = ()
     binding_constraint: str = ""
     limits: dict = field(default_factory=dict)
+    warnings: tuple[str, ...] = ()          # Phase 19: shown on the row, never a rejection
 
     @property
     def rejected(self) -> bool:
@@ -189,7 +190,9 @@ def max_contracts_for_position(per_contract: float, account: AccountState | None
     percent-of-volume caps still apply, so n contracts need OI >= n / 3% --
     the floor scales with the size, and the absolute floor is a minimum.
     A volume floor of 0 turns volume off as a cap and a gate: a 30-60 DTE
-    leg often trades nothing by mid-morning and is still fillable.
+    leg often trades nothing by mid-morning and is still fillable. A leg
+    that traded under `warn_option_volume` today is then a WARNING on the
+    row (Tom, 2026-09-28: OI 100, no volume gate, low volume shown).
     """
     liq = load_config().get("liquidity_limits", {})
     acct = account or account_from_config()
@@ -242,6 +245,8 @@ def max_contracts_for_position(per_contract: float, account: AccountState | None
     min_oi = floors.get("min_open_interest", liq.get("min_open_interest", 250))
     min_volume = floors.get("min_option_volume", liq.get("min_option_volume", 25))
     pct_oi = liq.get("max_pct_of_open_interest", 0.03)
+    warn_volume = floors.get("warn_option_volume") if not min_volume else None
+    warnings: list[str] = []
     for leg in legs:
         open_interest, option_volume = leg[0], leg[1]
         label = f"{leg[2]}: " if len(leg) > 2 and leg[2] else ""
@@ -255,6 +260,11 @@ def max_contracts_for_position(per_contract: float, account: AccountState | None
                 by_oi = math.floor(open_interest * pct_oi)
             limits["open_interest"] = min(limits.get("open_interest", by_oi), by_oi)
 
+        if option_volume is not None and warn_volume and option_volume < warn_volume:
+            warnings.append(f"{label}low volume: "
+                            + (f"{option_volume:,.0f} contracts traded today" if option_volume > 0
+                               else "no volume reported today (stale off-hours)")
+                            + f" (under {warn_volume:,}; not a gate)")
         if option_volume is not None and min_volume:
             # Off-hours snapshots report zero volume; that is a stale field, not a
             # dead contract, so fall back to open interest rather than rejecting.
@@ -285,6 +295,7 @@ def max_contracts_for_position(per_contract: float, account: AccountState | None
         reasons=tuple(reasons),
         binding_constraint=binding,
         limits=usable,
+        warnings=tuple(warnings),
     )
 
 

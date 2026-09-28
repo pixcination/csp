@@ -1,10 +1,12 @@
 """
-Settings -- account profiles and ranking-weight presets, defined by the user.
+Settings -- account profiles, ranking-weight presets and the schedule.
 
-Both are stored in config/user_settings.yaml (core/user_settings.py) and
+All are stored in config/user_settings.yaml (core/user_settings.py) and
 override the shipped config.yaml defaults of the same name. A scan request
 picks a profile with `account_profile` and weights with `ranking_weights`;
-the Command Center Run form offers both.
+the Command Center Run form offers both. The Schedule tab (Phase 19) edits
+the worker's timetable, marks saved presets auto, and shows the worker's
+heartbeat and job history (pipeline/scheduler.py).
 """
 from __future__ import annotations
 
@@ -24,7 +26,8 @@ st.title("Settings")
 st.caption(f"Saved to `{us.path()}`. Entries override the config.yaml defaults of the "
            f"same name; deleting an override restores the default.")
 
-tab_profiles, tab_weights = st.tabs(["Account profiles", "Ranking weights"])
+tab_profiles, tab_weights, tab_schedule = st.tabs(["Account profiles", "Ranking weights",
+                                                  "Schedule"])
 
 # --- Account profiles ----------------------------------------------------------
 
@@ -162,3 +165,155 @@ with tab_weights:
             if st.form_submit_button("Delete"):
                 us.delete_weight_preset(victim)
                 st.rerun()
+
+# --- Schedule (Phase 19) -------------------------------------------------------------
+
+with tab_schedule:
+    import datetime as dt
+
+    from analytics.scan_request import missing_fields
+    from pipeline import scheduler
+
+    info = scheduler.status()
+    beat = info["heartbeat"] or {}
+    cols = st.columns([1.2, 1.2, 1, 1])
+    if info["running"]:
+        age = ""
+        stamp = scheduler._parse(beat.get("at"))
+        if stamp:
+            age = f", heartbeat {(dt.datetime.now(stamp.tzinfo) - stamp).total_seconds():.0f}s ago"
+        cols[0].success(f"Worker running (pid {info['pid']}{age})")
+        cols[1].caption(f"State: {beat.get('state', '?')}")
+        if cols[3].button("Stop worker", help="The worker finishes its current job first."):
+            scheduler.request_stop()
+            st.rerun()
+    else:
+        cols[0].warning("Worker not running")
+        cols[1].caption("`python launch.py` starts it with the UI; so does the Task "
+                        "Scheduler entry at logon.")
+        if cols[3].button("Start worker", type="primary"):
+            pid = scheduler.start_worker()
+            st.success(f"Started (pid {pid}).")
+            st.rerun()
+    if not info["enabled"]:
+        st.info("The schedule is disabled: the worker runs but plans no slots.")
+    for entry in info["failures_today"]:
+        st.error(f"{entry['job']}{' (' + entry['preset'] + ')' if entry.get('preset') else ''} "
+                 f"{entry['status']}: {entry.get('message', '')}")
+
+    st.markdown("**Today**")
+    done = {h["key"]: h for h in info["today"]}
+    plan_rows = [{"time (ET)": slot.when.strftime("%H:%M"), "job": slot.job,
+                  "preset": slot.preset or "", "status": done.get(slot.key, {}).get("status",
+                                                                                    "pending"),
+                  "message": done.get(slot.key, {}).get("message", ""),
+                  "run": done.get(slot.key, {}).get("run_id") or ""}
+                 for slot in info["plan"]]
+    if plan_rows:
+        st.dataframe(pd.DataFrame(plan_rows), hide_index=True, width="stretch",
+                     column_config={"message": st.column_config.TextColumn(width="large")})
+    else:
+        st.caption("No slots today (market closed, or the schedule is disabled).")
+    upcoming = beat.get("next") or []
+    if upcoming:
+        st.caption("Next: " + "; ".join(n["label"] + f" ({n['when'][:10]})" for n in upcoming))
+
+    with st.expander("Job history (last 7 days)"):
+        recent = scheduler.history(since=dt.date.today() - dt.timedelta(days=7))
+        if recent:
+            frame = pd.DataFrame(recent[::-1])
+            keep = [c for c in ("planned", "job", "preset", "status", "started", "finished",
+                                "message", "run_id") if c in frame]
+            st.dataframe(frame[keep], hide_index=True, width="stretch",
+                         column_config={"message": st.column_config.TextColumn(width="large")})
+        else:
+            st.caption("No jobs recorded yet.")
+
+    cfg = scheduler.settings()
+    st.markdown("**Timetable** (ET, trading days; half days stop at the close)")
+    with st.form("schedule_form"):
+        c = st.columns(4)
+        enabled = c[0].checkbox("Schedule enabled", value=bool(cfg.get("enabled", True)))
+        grace = c[1].number_input("Grace for missed slots (min)", 0, 240,
+                                  value=int(cfg.get("grace_minutes", 30)))
+        c = st.columns(4)
+        mark_start = c[0].text_input("Marks from", cfg["mark"]["start"])
+        mark_end = c[1].text_input("Marks until", cfg["mark"]["end"])
+        every = c[2].number_input("Every (min)", 5, 240, value=int(cfg["mark"].get("every_minutes", 60)))
+        c = st.columns(4)
+        log_time = c[0].text_input("Auto-log (scan_and_log)", cfg["scan_and_log"]["time"],
+                                   help="Once a day per auto preset.")
+        archive_time = c[1].text_input("Chain archive", cfg["archive"]["time"])
+        nightly_time = c[2].text_input("Nightly data refresh", cfg["nightly"]["time"])
+        if st.form_submit_button("Save timetable", type="primary"):
+            try:
+                us.save_schedule({"enabled": enabled, "grace_minutes": int(grace),
+                                  "mark": {"start": mark_start, "end": mark_end,
+                                           "every_minutes": int(every)},
+                                  "scan_and_log": {"time": log_time},
+                                  "archive": {"time": archive_time},
+                                  "nightly": {"time": nightly_time}})
+                st.success("Saved; the worker picks it up at its next poll.")
+                st.rerun()
+            except (us.SettingsError, ValueError) as exc:
+                st.error(str(exc))
+
+    st.markdown("**Auto presets** -- logged once a day at the auto-log time: the top K, "
+                "M random passing rows lower down and M near-miss rejects; never naked or "
+                "research-only rows; at most the daily cap of new positions.")
+    saved = us.scan_presets()
+    autos = scheduler.auto_presets(cfg)
+    if not saved:
+        st.caption("No saved presets yet: save one on the Screener first.")
+    else:
+        rows = []
+        for name, fields in saved.items():
+            profile = fields.get("account_profile", "default")
+            pcfg = sizing.account_config(profile)
+            missing = missing_fields(fields)
+            auto = autos.get(name)
+            rows.append({"preset": name, "auto": auto is not None, "profile": profile,
+                         "placeholder profile": bool(pcfg.get("placeholder")),
+                         "fully explicit": not missing,
+                         "K": auto["top_k"] if auto else None,
+                         "M": auto["control_m"] if auto else None,
+                         "daily cap": auto["daily_cap"] if auto else None,
+                         "observe hourly": auto["observe_hourly"] if auto else None})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        blocked = [r["preset"] for r in rows if r["auto"] and r["placeholder profile"]]
+        if blocked:
+            st.warning(f"{', '.join(blocked)}: the profile holds placeholder values, so each "
+                       f"run will be refused (and shown as refused in the history) until the "
+                       f"profile's Placeholder box is cleared.")
+        with st.form("auto_form"):
+            c = st.columns([2, 1, 1, 1, 1, 1])
+            name = c[0].selectbox("Preset", list(saved))
+            current = autos.get(name) or {}
+            tcfg = (sizing.load_config().get("tracking") or {})
+            k = c[1].number_input("K (top)", 0, 50, value=int(current.get("top_k",
+                                                                          tcfg.get("top_k", 5))))
+            m = c[2].number_input("M (control)", 0, 50,
+                                  value=int(current.get("control_m", tcfg.get("control_m", 3))))
+            cap = c[3].number_input("Daily cap", 0, 100,
+                                    value=int(current.get("daily_cap", k + 2 * m)),
+                                    help="New positions per day for this preset (K + 2M = "
+                                         "one full sample).")
+            observe = c[4].checkbox("Observe hourly", value=bool(current.get("observe_hourly")),
+                                    help="Also run the preset at the other mark slots, adding "
+                                         "observations to already-tracked rows only (a full "
+                                         "scan each hour).")
+            on = c[5].checkbox("Auto", value=name in autos)
+            if st.form_submit_button("Save", type="primary"):
+                try:
+                    us.set_auto_preset(name, {"top_k": k, "control_m": m, "daily_cap": cap,
+                                              "observe_hourly": observe} if on else None)
+                    st.success(f"{name}: {'auto' if on else 'not auto'}.")
+                    st.rerun()
+                except us.SettingsError as exc:
+                    st.error(str(exc))
+
+    with st.expander("Start the worker at logon (Windows Task Scheduler)"):
+        st.markdown("Run once from `D:\\csp`:\n\n"
+                    "```\n.venv\\Scripts\\python scripts\\scheduler_task.py install\n```\n"
+                    "`status` shows the entry, `remove` deletes it. The worker refuses to start "
+                    "a second copy, so the logon entry and `launch.py` can both be used.")

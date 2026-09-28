@@ -77,8 +77,18 @@ def test_underlying_rank_clamps_iv_rank():
 
 # --- Profiles and B.2 --------------------------------------------------------------------
 
-def test_profiles_have_placeholders_and_labels():
+def test_profiles_have_placeholders_and_labels(tmp_path, monkeypatch):
+    # Tom's real values live in config/user_settings.yaml (entered 2026-09-28):
+    # test the behaviour on a file of our own.
     from core import user_settings as us
+    monkeypatch.setattr(us, "config_dir", lambda: tmp_path)
+    us.save_account_profile("roth_ira", {"net_liquidating_value": 100000.0,
+                                         "account_type": "roth_ira", "naked_approval": False,
+                                         "placeholder": True})
+    us.save_account_profile("traditional_ira", {"account_type": "traditional_ira",
+                                                "placeholder": True})
+    us.save_account_profile("taxable", {"account_type": "margin", "naked_approval": True,
+                                        "naked_research_only": True, "placeholder": True})
     names = us.profile_names()
     assert {"roth_ira", "traditional_ira", "taxable"} <= set(names)
     taxable = sizing.account_config("taxable")
@@ -267,7 +277,8 @@ def test_long_leg_snaps_to_open_interest():
 
 def test_spread_leg_floors():
     floors = sizing.spread_leg_floors()
-    assert floors == {"min_open_interest": 100, "min_option_volume": 0}
+    assert floors == {"min_open_interest": 100, "min_option_volume": 0,
+                      "warn_option_volume": 25}                  # Phase 19: a warning only
     acct = sizing.AccountState(net_liquidating_value=100_000, cash_available=100_000)
     legs = [(150, 3, "short leg"), (400, 0, "long leg")]
     single = sizing.max_contracts_for_position(400.0, acct, legs=legs)

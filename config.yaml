@@ -181,7 +181,8 @@ liquidity_limits:
   # 3%-of-OI cap above still scales the need with size (n contracts need OI >= n/0.03);
   # this is only the absolute minimum. Volume 0 = not a gate: a 30-60 DTE leg often
   # trades nothing by mid-morning (the fillability score still shows it).
-  spread_legs: {min_open_interest: 100, min_option_volume: 0}
+  # Confirmed by Tom 2026-09-28; a leg under warn_option_volume is a row warning.
+  spread_legs: {min_open_interest: 100, min_option_volume: 0, warn_option_volume: 25}
 
 # === Execution ===
 # Signals are generated here and executed elsewhere. The tool models TastyTrade
@@ -247,8 +248,11 @@ massive:
 management:
   entry:
     target_dte: 7
-    dte_min: 5
-    dte_max: 10
+    # 7 +/- 4 (Tom, 2026-09-28, Phase 17 open item, option b): 5-10 held no
+    # Friday on Mondays; 3-11 holds a Friday on every weekday, so the
+    # scheduled scan always finds a weekly.
+    dte_min: 3
+    dte_max: 11
     target_delta: -0.20
     delta_band: [-0.30, -0.12]
     min_credit_per_contract: 0.15     # below this, fees dominate
@@ -616,6 +620,21 @@ archive:
   dte_min: 0
   dte_max: 60
   time_et: "15:45"
+
+# --- Scheduler (Phase 19, pipeline/scheduler.py) --------------------------------
+# Times are ET, trading days only; the Settings page overrides any of this in
+# config/user_settings.yaml -> schedule. Auto presets are named there too:
+#   auto_presets: {csp_roth: {top_k: 5, control_m: 3, daily_cap: 11, observe_hourly: false}}
+# (daily_cap defaults to K + 2M = 11 new positions per preset per day).
+schedule:
+  enabled: true
+  mark: {start: "09:45", end: "15:45", every_minutes: 60}   # Tom: hourly marks, 7 slots
+  scan_and_log: {time: "10:45"}       # Tom 2026-09-28: auto-log once a day per auto preset
+  archive: {time: "15:45"}            # half days: 15 minutes before the close
+  nightly: {time: "18:30"}            # run --data-only, then settle expired tracked positions
+  grace_minutes: 30                   # a missed slot still runs if picked up within this
+  poll_seconds: 30
+  auto_presets: {}
 
 # --- Run and chain retention (Phase 18, pipeline/retention.py) ------------------
 # Manifests are kept forever; so is any run a logged position references.

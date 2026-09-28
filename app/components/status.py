@@ -36,7 +36,28 @@ def session_banner():
     severity, message = info.banner()
     banner(severity, message,
            "Regular session open" if info.is_open else "Outside regular hours")
+    scheduler_alerts()
     return info
+
+
+def scheduler_alerts() -> None:
+    """Phase 19: failed or refused jobs today, and a stopped worker during the
+    scheduled day (details on Settings -> Schedule)."""
+    try:
+        from pipeline import scheduler
+        state = scheduler.status()
+    except Exception as exc:          # never block the page on a status read
+        st.caption(f"Scheduler status unavailable: {exc}")
+        return
+    problems = [f"{e['job']}{' (' + e['preset'] + ')' if e.get('preset') else ''} "
+                f"{e['status']} at {str(e.get('planned', ''))[11:16]}: {e.get('message', '')}"
+                for e in state["failures_today"]]
+    if state["should_be_running"] and not state["running"]:
+        problems.insert(0, "the worker is not running, so today's marks and auto-logs will be "
+                           "missed (Settings -> Schedule -> Start worker)")
+    if problems:
+        import html
+        banner("error", "<br>".join(html.escape(p) for p in problems), "Scheduler")
 
 
 def freshness_summary() -> tuple[str, str, list]:

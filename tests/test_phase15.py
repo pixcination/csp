@@ -550,9 +550,17 @@ def test_default_request_builds_spreads_at_45_dte_and_4pct_wide():
 
 
 def test_explicit_requests_keep_dollar_widths_and_the_shared_window():
+    """Since Phase 19 a request that leaves spread_width_pct / pcs_dte_targets
+    out inherits scan_defaults' 4% / 45 DTE; dollars and the shared window
+    need them spelled out as null."""
     from analytics.scan_request import RequestError, ScanRequest
+    partial = ScanRequest.from_dict({"strategies": ["pcs"], "dte_min": 30, "dte_max": 45,
+                                     "spread_widths": [5, 10]})
+    assert partial.spread_width_pct == [4.0] and partial.pcs_dte_targets == [45]
+    assert {"spread_width_pct", "pcs_dte_targets"} <= set(partial.inherited)
     req = ScanRequest.from_dict({"strategies": ["pcs"], "dte_min": 30, "dte_max": 45,
-                                 "spread_widths": [5, 10]})
+                                 "spread_widths": [5, 10], "spread_width_pct": None,
+                                 "pcs_dte_targets": None})
     assert req.spread_width_pct is None and req.pcs_dte_targets is None
     assert req.pcs_widths(700.0) == [5.0, 10.0]
     assert req.accepts_dte(35, "pcs") and req.dte_window("pcs") == (30, 45)
