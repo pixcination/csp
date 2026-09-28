@@ -160,6 +160,12 @@ with tabs[0]:
             st.caption("None raised.")
     for note in row.get("notes") or []:
         st.caption(td.escape_md(note))
+    # Phase 20: the Outlook at this trade's own expiry (display only)
+    from analytics import outlook as outlook_mod
+    from app.components import outlook_view
+    st.markdown(f"**Outlook at this expiry ({dte} days)**")
+    outlook_view.gauges(outlook_mod.at(outlook_mod.load_latest(), str(row["ticker"]).upper(), dte),
+                        key="trade_detail")
 
 # --- Chart ----------------------------------------------------------------------------
 

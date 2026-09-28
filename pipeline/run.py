@@ -63,6 +63,7 @@ STAGES = [
     ("events", "Events calendar"),
     ("stage1", "Stage 1 screen"),
     ("technicals", "Technicals and level study"),
+    ("outlook", "Outlook dials"),
     ("rank_underlyings", "Underlying ranking"),
     ("chains", "Option chains"),
     ("analyse", "Analysis"),
@@ -337,6 +338,21 @@ def _stage_technicals(reporter: BaseReporter, manifest: RunManifest,
     for error in result["errors"][:5]:
         manifest.warnings.append(f"technicals: {error}")
     return result
+
+
+def _stage_outlook(reporter: BaseReporter, manifest: RunManifest,
+                   tickers: list[str]) -> dict:
+    """Outlook dials (Phase 20): refit the pooled model and its walk-forward
+    skill when older than `outlook.refit_days`, then the live table."""
+    from analytics import outlook
+    c = outlook.cfg()
+    age = outlook.model_age_days()
+    refit = age is None or age >= float(c["refit_days"])
+    if refit:
+        outlook.validate(load_universe(scope="all"), reporter=reporter, c=c)
+    frame = outlook.build(tickers, reporter=reporter, c=c)
+    return {"refit": refit, "rows": int(len(frame)),
+            "tickers": int(frame["ticker"].nunique()) if not frame.empty else 0}
 
 
 def _stage_rank(reporter: BaseReporter, manifest: RunManifest, request,
@@ -793,6 +809,7 @@ def run(tickers: list[str] | None = None, quick: bool = False,
             guarded("events", _stage_events, reporter, manifest, data_universe)
             guarded("stage1", _stage_stage1, reporter, manifest, data_universe)
             guarded("technicals", _stage_technicals, reporter, manifest, data_universe)
+            guarded("outlook", _stage_outlook, reporter, manifest, data_universe)
         if not data_only:
             holder: dict = {"ranked": None, "targets": None}
             guarded("rank_underlyings", _stage_rank, reporter, manifest, request,

@@ -536,3 +536,79 @@ def chain_liquidity_chart(window: pd.DataFrame) -> go.Figure:
     fig = _apply_layout(fig, height=320)
     fig.update_layout(hovermode="closest")
     return fig
+
+
+# --- Outlook (Phase 20) ---------------------------------------------------------
+
+OUTLOOK_POLES = {"direction": ("bearish", "neutral", "bullish"),
+                 "range": ("breakout", "its normal", "range-bound"),
+                 "volatility": ("IV cheap", "fair", "IV rich")}
+CONFIDENCE_DOTS = {"none": "○○○", "low": "●○○", "medium": "●●○", "high": "●●●"}
+
+
+def outlook_heatmap(table: pd.DataFrame, dial: str, value_column: str | None = None) -> go.Figure:
+    """Symbols x horizons for one dial. Diverging around 5 (red below, gray
+    at 5, blue above); each cell shows the score and confidence dots
+    (○○○ none ... ●●● high), the hover the probabilities behind it."""
+    column = value_column or dial
+    frame = table.dropna(subset=[column])
+    grid = frame.pivot_table(index="ticker", columns="horizon", values=column)
+    conf = frame.pivot_table(index="ticker", columns="horizon", values=f"{dial}_conf",
+                             aggfunc="first").reindex_like(grid)
+    grid = grid.sort_index(ascending=False)
+    conf = conf.reindex(grid.index)
+    text = [[("" if not np.isfinite(v) else f"{v:.1f} {CONFIDENCE_DOTS.get(c, '')}")
+             for v, c in zip(row, crow)] for row, crow in zip(grid.values, conf.values)]
+    low, mid, high = OUTLOOK_POLES[dial]
+    fig = go.Figure(go.Heatmap(
+        z=grid.values, x=[f"{h}d" for h in grid.columns], y=list(grid.index),
+        zmin=0, zmax=10, zmid=5,
+        colorscale=[[0, DIVERGING_NEGATIVE], [0.5, DIVERGING_MIDPOINT], [1, DIVERGING_POSITIVE]],
+        text=text, texttemplate="%{text}", textfont=dict(size=10, color=PRIMARY_INK),
+        xgap=2, ygap=2,
+        hovertemplate="%{y} @ %{x}: %{z:.2f}<extra></extra>",
+        colorbar=dict(title=dial, tickvals=[0, 5, 10], ticktext=[low, mid, high])))
+    fig.update_layout(xaxis_title="Horizon (calendar days)", xaxis_type="category",
+                      yaxis_type="category")
+    fig = _apply_layout(fig, height=max(360, 18 * len(grid) + 120))
+    fig.update_layout(hovermode="closest", xaxis_side="top")
+    return fig
+
+
+def outlook_gauge(dial: str, score: float | None, lo: float | None, hi: float | None,
+                  base: float | None, confidence: str | None = None) -> go.Figure:
+    """One dial as a horizontal line 0-10: the shaded band (uncertainty), the
+    arrow at the score, a tick at the stock's normal position, pole labels."""
+    low, mid, high = OUTLOOK_POLES[dial]
+    fig = go.Figure()
+    fig.add_shape(type="line", x0=0, x1=10, y0=0, y1=0, line=dict(color=BASELINE_INK, width=2))
+    for x in (0, 5, 10):
+        fig.add_shape(type="line", x0=x, x1=x, y0=-0.12, y1=0.12,
+                      line=dict(color=MUTED_INK, width=1))
+    if lo is not None and hi is not None and np.isfinite(lo) and np.isfinite(hi):
+        fig.add_shape(type="rect", x0=lo, x1=hi, y0=-0.3, y1=0.3, line_width=0,
+                      fillcolor="rgba(195,194,183,0.18)")
+    if base is not None and np.isfinite(base):
+        fig.add_shape(type="line", x0=base, x1=base, y0=-0.42, y1=0.42,
+                      line=dict(color=SECONDARY_INK, width=2, dash="dot"))
+    if score is not None and np.isfinite(score):
+        color = (DIVERGING_POSITIVE if score > 5.25 else DIVERGING_NEGATIVE if score < 4.75
+                 else SECONDARY_INK)
+        fig.add_trace(go.Scatter(
+            x=[score], y=[0.55], mode="markers+text", text=[f"{score:.1f}"],
+            textposition="top center", textfont=dict(color=PRIMARY_INK, size=13),
+            marker=dict(symbol="triangle-down", size=16, color=color,
+                        line=dict(color=CHART_SURFACE, width=2)),
+            hovertemplate=f"{dial} %{{x:.2f}}" + (f" (band {lo:.1f}-{hi:.1f})"
+                                                  if lo is not None and hi is not None else "")
+            + "<extra></extra>"))
+    fig.update_layout(**PLOTLY_TEMPLATE["layout"])
+    fig.update_layout(
+        height=120, margin=dict(l=10, r=10, t=28, b=8), showlegend=False,
+        title=dict(text=f"{dial.capitalize()}" + (f"  {CONFIDENCE_DOTS.get(confidence, '')} "
+                                                  f"{confidence}" if confidence else ""),
+                   font=dict(size=13, color=SECONDARY_INK), x=0.01),
+        xaxis=dict(range=[-0.4, 10.4], tickvals=[0, 5, 10], ticktext=[low, mid, high],
+                   showgrid=False, zeroline=False, tickfont=dict(color=MUTED_INK, size=11)),
+        yaxis=dict(range=[-0.6, 1.2], visible=False))
+    return fig

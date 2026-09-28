@@ -371,6 +371,45 @@ proposed_only = t[3].toggle("Only proposed", value=False)
 
 view = td.filter_grid(grid, pick_strat, pick_tickers, accepted_only, proposed_only,
                       best_only, min_pop_f or None, max_dte_f or None, sort_key, group)
+
+# Phase 20: Outlook dials on every row, and filters on them (display and filter only)
+from analytics import outlook  # noqa: E402
+outlook_table = outlook.load_latest()
+if not outlook_table.empty:
+    with st.expander("Outlook filters", expanded=False):
+        o = st.columns([1.4, 1, 1, 1, 1])
+        mode = o[0].radio("Read the dials at", ["each row's expiry", "a fixed horizon"],
+                          key="scr_outlook_mode",
+                          help="Each row's expiry: the dials interpolated to the row's DTE "
+                               "(what the option settles on). Fixed: one horizon for all rows.")
+        fixed = None
+        if mode == "a fixed horizon":
+            fixed = o[0].select_slider("Horizon (days)", list(outlook.HORIZONS), value=14,
+                                       key="scr_outlook_h")
+        use_dir = o[1].checkbox("Direction", key="scr_o_dir")
+        dir_b = o[1].slider("Direction", 0.0, 10.0, (6.0, 10.0), 0.5, key="scr_o_dir_b",
+                            label_visibility="collapsed", disabled=not use_dir)
+        use_rng = o[2].checkbox("Range", key="scr_o_rng")
+        rng_b = o[2].slider("Range", 0.0, 10.0, (7.0, 10.0), 0.5, key="scr_o_rng_b",
+                            label_visibility="collapsed", disabled=not use_rng)
+        use_vol = o[3].checkbox("Volatility", key="scr_o_vol")
+        vol_b = o[3].slider("Volatility", 0.0, 10.0, (6.0, 10.0), 0.5, key="scr_o_vol_b",
+                            label_visibility="collapsed", disabled=not use_vol)
+        conf = o[4].selectbox("Min confidence", list(outlook.LEVELS), index=0,
+                              key="scr_o_conf",
+                              help="Applies to each dial you filter on. Volatility is never "
+                                   "'high' (not walk-forward tested).")
+        use_window = o[4].checkbox("From-to DTE window", key="scr_o_win")
+        window = o[4].slider("DTE window", 0, 90, (21, 45), key="scr_o_win_b",
+                             label_visibility="collapsed", disabled=not use_window)
+        st.caption("Direction ≥ 6 = bullish, ≤ 4 = bearish; Range ≥ 7 = likelier than usual to "
+                   "stay inside ±1 EM; Volatility ≥ 6 = IV rich vs forecast realised vol. "
+                   "Direction has ~0 walk-forward skill on most names, so its dial mostly "
+                   "sits at 5 (Universe / Validation pages).")
+    view = outlook.annotate(view, outlook_table, horizon=fixed)
+    view = outlook.filter_rows(view, dir_b if use_dir else None, rng_b if use_rng else None,
+                               vol_b if use_vol else None, conf,
+                               tuple(window) if use_window else None).reset_index(drop=True)
 st.caption(f"{len(view):,} of {len(grid):,} rows · "
            + ("select rows to log them." if log_mode else
               "select a row to open its Trade Detail."))
@@ -415,6 +454,12 @@ config = {
     "proposed": st.column_config.CheckboxColumn("Proposed"),
     "best_per_ticker": st.column_config.CheckboxColumn("Best of ticker"),
     "why_not": st.column_config.TextColumn("Rejected because", width="large"),
+    "outlook_direction": st.column_config.NumberColumn("Direction", format="%.1f",
+                                                       help="Outlook at the row's expiry"),
+    "outlook_range": st.column_config.NumberColumn("Range", format="%.1f"),
+    "outlook_volatility": st.column_config.NumberColumn("Vol dial", format="%.1f"),
+    "outlook_direction_conf": None, "outlook_range_conf": None,
+    "outlook_volatility_conf": None,
 }
 event = st.dataframe(view, hide_index=True, width="stretch", height=520,
                      column_config=config, on_select="rerun",

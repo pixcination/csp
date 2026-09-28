@@ -198,7 +198,10 @@ with tabs[0]:
                 st.dataframe(pd.DataFrame([probs]).T.rename(columns={0: "blend"}),
                              width="stretch")
             st.caption(f"Conditions: {row.get('conditions')} · IV regime "
-                       f"{row.get('iv_regime')} · trend {row.get('trend_state')} · "
+                       f"{row.get('iv_regime')} · trend {row.get('trend_state')}"
+                       + (f" (Outlook Direction {row['outlook_direction']:.1f})"
+                          if row.get("trend_source") == "outlook"
+                          and pd.notna(row.get("outlook_direction")) else "") + " · "
                        f"models {row.get('models', '')}")
             if spec and spec.notes:
                 for note in spec.notes:
@@ -262,7 +265,9 @@ with tabs[1]:
 with tabs[2]:
     st.markdown("**IV regime x trend -> strategies whose entry conditions fit**")
     st.caption("Derived from the specs' `entry` blocks; earnings inside the trade blocks "
-               "most of them on top of this. IV regime: TastyTrade IV rank below "
+               "most of them on top of this. Trend (Phase 20): the Outlook's Direction dial at "
+               "the spec's nearest expiry -- >= 6 uptrend, <= 4 downtrend, else range; it sits "
+               "at 5 (range) where Direction has no walk-forward skill. IV regime: TastyTrade IV rank below "
                "recommender.iv_regime.low_below is low, above high_above is high.")
     if SPECS:
         st.dataframe(strategy_spec.condition_matrix(SPECS), hide_index=True, width="stretch")

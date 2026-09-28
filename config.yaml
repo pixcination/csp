@@ -514,6 +514,25 @@ account_profiles:
     spread_approval: true
     naked_approval: false             # Phase 16: naked specs (strangles) need this AND account_type: margin
 
+# --- Outlook v1 (Phase 20, analytics/outlook.py) --------------------------------
+# Direction / Range / Volatility dials per symbol on the horizon grid. Display and
+# filter only (review D.5): never a ranking weight. EM here = RV20-based, so the
+# Direction and Range probabilities are tested walk-forward (IV history comes later).
+outlook:
+  horizons: [3, 5, 7, 10, 14, 21, 30, 45, 60]   # calendar days
+  history_start: "2000-01-01"
+  test_start_year: 2015               # walk-forward: refit each January, predict that year weekly
+  step_days: 5                        # sample every 5th day (overlapping outcomes)
+  l2: 10.0                            # ridge penalty on standardised features
+  skill_none: 0.005                   # Brier skill at or below this: the dial sits at 5
+  skill_full: 0.03                    # ... at or above this: full length
+  skill_prior_n: 300                  # a symbol's skill is pulled toward the pooled one (n_eff vs K)
+  vol_full_ratio: 1.5                 # IV / forecast RV of 1.5 (or 1/1.5) = Volatility 10 (or 0)
+  n_paths: 4000                       # engine paths per symbol for the live dials
+  refit_days: 7                       # the pipeline refits the model (and skill) when older
+  recommender_source: outlook         # outlook | trend_state: what the recommender's trend
+                                      # condition reads (Direction >= 6 up, <= 4 down, else range)
+
 # --- Multi-strategy recommender (Phase 16, analytics/recommender.py) -----------
 # Specs live in strategies/*.yaml. A ticker's conditions: IV regime (below
 # low_below = low, above high_above = high), the technicals cache's trend

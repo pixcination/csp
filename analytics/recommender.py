@@ -5,9 +5,15 @@ For each ticker with a stored chain:
 
 1. **Conditions.** IV regime (low / mid / high from the TastyTrade IV
    percentile, clamped, with hysteresis against the previous snapshot --
-   Phase 17, `strategy_spec.iv_regime`), trend state (Phase 10, from the
-   technicals cache), and whether an earnings date falls inside each spec's
-   trade window.
+   Phase 17, `strategy_spec.iv_regime`), the trend condition, and whether an
+   earnings date falls inside each spec's trade window. Since Phase 20 the
+   trend condition is read from the OUTLOOK's Direction dial at the spec's
+   nearest expiration role (>= 6 uptrend, <= 4 downtrend, else range),
+   skill-shrunk: where Direction has no walk-forward skill the dial sits at 5
+   and the condition is `range`, so only specs that accept a range apply --
+   no directional structure is chosen on a direction nobody can forecast.
+   `outlook.recommender_source: trend_state` restores the Phase 10 technical
+   trend state; a ticker without an Outlook row falls back to it.
 2. **Applicable strategies.** Every spec whose `entry` conditions the ticker
    meets (the condition matrix is those conditions laid out -- see
    `strategy_spec.condition_matrix`). With explicit `spec_ids` the specs are
@@ -49,7 +55,8 @@ TARGETS = [25, 50, 100]
 
 def _conditions(ticker: str, today: dt.date, metrics: dict, latest: pd.DataFrame,
                 events_frame: pd.DataFrame | None, horizon_days: int,
-                previous: dict | None = None) -> dict:
+                previous: dict | None = None, outlook_table: pd.DataFrame | None = None,
+                outlook_days: int | None = None) -> dict:
     ivr = metrics.get("ivr")
     rcfg = strategy_spec.regime_config()
     value, measure = strategy_spec.regime_value(metrics, rcfg)
@@ -61,6 +68,13 @@ def _conditions(ticker: str, today: dt.date, metrics: dict, latest: pd.DataFrame
         if not mine.empty and "trend_state" in mine:
             state = mine["trend_state"].iloc[0]
             trend = state if isinstance(state, str) else None
+    trend_source, direction, direction_conf = "trend_state", None, None
+    if outlook_table is not None and not outlook_table.empty and outlook_days:
+        from analytics import outlook
+        rec = outlook.at(outlook_table, ticker, outlook_days)
+        if rec and rec.get("direction") is not None:
+            direction, direction_conf = rec["direction"], rec.get("direction_conf")
+            trend, trend_source = outlook.trend_class(direction), "outlook"
     earnings = None
     if events_frame is not None and not events_frame.empty:
         rows = events_frame[(events_frame["symbol"] == ticker)
@@ -69,9 +83,26 @@ def _conditions(ticker: str, today: dt.date, metrics: dict, latest: pd.DataFrame
         earnings = min(rows["date"]) if not rows.empty else None
     return {"ivr": ivr, "ivp": metrics.get("ivp"), "iv_value": value, "iv_measure": measure,
             "iv_regime": strategy_spec.iv_regime(value, prior, rcfg),
-            "iv_regime_previous": prior, "trend": trend,
+            "iv_regime_previous": prior, "trend": trend, "trend_source": trend_source,
+            "outlook_direction": direction, "outlook_direction_conf": direction_conf,
             "next_earnings": earnings,
             "earnings_in_window": bool(earnings and (earnings - today).days <= horizon_days)}
+
+
+def _front_days(spec) -> int:
+    """The spec's nearest expiration role's target: the horizon its trend
+    condition is read at."""
+    return min(int(e["dte_target"]) for e in spec.expirations.values())
+
+
+def _outlook_table() -> pd.DataFrame | None:
+    from analytics import outlook
+    if (outlook.cfg().get("recommender_source") or "outlook") != "outlook":
+        return None
+    try:
+        return outlook.load_latest()
+    except Exception:
+        return None
 
 
 def _horizon(spec) -> int:
@@ -203,6 +234,7 @@ def run(tickers: list[str], request=None, spec_ids: list[str] | None = None,
     profile_cfg = sizing.account_config(request.account_profile)
     naked_research_only = bool(profile_cfg.get("naked_research_only", False))
     latest = technical_study.load_latest()
+    outlook_table = _outlook_table()
     started = time.perf_counter()
     rows, conditions = [], []
     with reporter.stage("strategies", "Strategy recommender", total=len(tickers)):
@@ -221,7 +253,8 @@ def run(tickers: list[str], request=None, spec_ids: list[str] | None = None,
             mine = []
             for sid, spec in wanted.items():
                 cond = _conditions(ticker, today, metrics.get(ticker) or {}, latest,
-                                   events_frame, _horizon(spec), previous.get(ticker))
+                                   events_frame, _horizon(spec), previous.get(ticker),
+                                   outlook_table, _front_days(spec))
                 met, why = strategy_spec.applies(spec, cond)
                 fit = strategy_spec.regime_fit(spec, cond["iv_regime"])
                 conditions.append({"ticker": ticker, "strategy": sid, "iv_regime": cond["iv_regime"],
@@ -229,6 +262,9 @@ def run(tickers: list[str], request=None, spec_ids: list[str] | None = None,
                                    "iv_regime_previous": cond["iv_regime_previous"],
                                    "regime_fit": fit,
                                    "ivr": cond["ivr"], "ivp": cond["ivp"], "trend": cond["trend"],
+                                   "trend_source": cond["trend_source"],
+                                   "outlook_direction": cond["outlook_direction"],
+                                   "outlook_direction_conf": cond["outlook_direction_conf"],
                                    "earnings_in_window": cond["earnings_in_window"],
                                    "applies": met, "why_not": "; ".join(why)})
                 if not met and not spec_ids:
@@ -246,7 +282,9 @@ def run(tickers: list[str], request=None, spec_ids: list[str] | None = None,
                                 "regime_fit": fit is not False,
                                 "research_only": bool(spec.margin_class == "naked"
                                                       and naked_research_only),
-                                "trend_state": cond["trend"]})
+                                "trend_state": cond["trend"],
+                                "trend_source": cond["trend_source"],
+                                "outlook_direction": cond["outlook_direction"]})
                 mine.extend(resolved)
             if mine:
                 earnings = next((c.get("next_earnings") for c in [

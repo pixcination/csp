@@ -434,3 +434,57 @@ try:
                 st.markdown(f"- {caveat}")
 except Exception as exc:
     st.caption(f"Could not read the PCS backtest: {exc}")
+
+# --- Outlook skill (Phase 20) --------------------------------------------------
+
+st.divider()
+st.subheader("Outlook: walk-forward skill")
+try:
+    from analytics import outlook as outlook_mod
+    skill = outlook_mod.load_skill()
+    meta = outlook_mod.load_model().get("meta") or {}
+    if skill.empty:
+        st.info("No Outlook validation yet: `python scripts/validate_outlook.py`, or any "
+                "pipeline run with data stages (it refits weekly).")
+    else:
+        st.caption(
+            f"Refit every January from {meta.get('test_start_year', '?')} on everything whose "
+            f"outcome was known by then, predicting that year weekly; {len(meta.get('symbols', []))} "
+            f"symbols, fitted {meta.get('fitted_at', '?')}. Brier skill score vs each stock's own "
+            "point-in-time base rate: 0 = no better than the base rate, 0.05 = 5% lower Brier "
+            "score. up / down = beyond a quarter of the RV20 expected move; inside = within "
+            "one. blend = the dials' mix of the pooled logistic model and the historical "
+            "analogue (the engine's H).")
+        pooled = skill[skill["symbol"] == "ALL"].pivot_table(
+            index="horizon", columns=["event", "component"], values="bss")
+        st.dataframe(pooled.style.format("{:+.4f}"), width="stretch")
+        direction = skill[(skill["symbol"] == "ALL") & (skill["component"] == "blend")
+                          & skill["event"].isin(["up", "down"])]["bss"]
+        inside = skill[(skill["symbol"] == "ALL") & (skill["component"] == "blend")
+                       & (skill["event"] == "inside")]["bss"]
+        c = outlook_mod.cfg()
+        st.markdown(
+            f"**Direction: skill is about zero** (pooled {direction.min():+.3f} to "
+            f"{direction.max():+.3f} across horizons). Price-based features do not predict "
+            f"up vs down beyond each stock's base rate by more than noise, so the Direction "
+            f"dial is shrunk to neutral wherever a symbol's skill is under "
+            f"{c['skill_none']:.3f}, and full length only from {c['skill_full']:.2f}. "
+            f"**Range has real skill** ({inside.min():+.3f} to {inside.max():+.3f}, rising "
+            f"with the horizon) -- mostly volatility clustering and its mean reversion. "
+            "**Volatility** is not tested here: it needs IV history, which the chain archive "
+            "is building (Phase 14's vol-rank IC +0.14 is the evidence so far).")
+        h = st.select_slider("Per symbol, at horizon", sorted(skill["horizon"].unique()),
+                             value=30, key="outlook_skill_h")
+        per = skill[(skill["symbol"] != "ALL") & (skill["component"] == "blend")
+                    & (skill["horizon"] == h)]
+        table = per.pivot_table(index="symbol", columns="event",
+                                values=["bss", "bss_shrunk"]).round(4)
+        table.columns = [f"{e} {'(used)' if m == 'bss_shrunk' else '(own)'}" for m, e in table.columns]
+        table["n_eff"] = per.groupby("symbol")["n_eff"].first().round(0)
+        st.dataframe(table, width="stretch")
+        st.caption("'own' is the symbol's own walk-forward skill (noisy: n_eff is the number "
+                   "of independent outcomes); 'used' is pulled toward the pooled skill in "
+                   f"proportion to the sample (prior weight {c['skill_prior_n']}), and it is "
+                   "what sets each dial's length and confidence.")
+except Exception as exc:
+    st.caption(f"Could not read the Outlook validation: {exc}")

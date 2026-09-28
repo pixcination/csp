@@ -200,6 +200,44 @@ if not sym_events.empty:
     st.dataframe(sym_events[["date", "symbol", "type", "time_of_day", "confirmed",
                              "source", "note"]], hide_index=True, width="stretch")
 
+# --- Outlook (Phase 20) ------------------------------------------------------
+
+st.divider()
+st.subheader("Outlook")
+from analytics import outlook  # noqa: E402
+from app.components import outlook_view  # noqa: E402
+from app.components.charts import outlook_heatmap  # noqa: E402
+
+table = outlook.load_latest()
+if table.empty:
+    st.caption("No Outlook yet: the pipeline's data stages build it (Command Center run, or "
+               "the nightly job).")
+else:
+    st.caption(f"As of the {table['as_of'].max()} close. Three dials per symbol and horizon "
+               "(analytics/outlook.py): Direction (P(up) vs P(down) beyond a quarter of the "
+               "expected move), Range (P(inside ±1 EM) against the stock's own normal), "
+               "Volatility (IV vs the realised vol the engine forecasts). Direction and Range "
+               "are shrunk toward 5 by their walk-forward skill (Validation page).")
+    c = st.columns([2, 2, 3])
+    dial = c[0].segmented_control("Dial", list(outlook.DIALS), default="direction",
+                                  key="outlook_dial") or "direction"
+    raw = c[1].toggle("Model reading (before the skill shrink)", value=False,
+                      disabled=dial == "volatility",
+                      help="What the models say before shrinking by skill. Where skill is ~0 "
+                           "this is noise, which is why the default view shrinks it.")
+    column = f"{dial}_raw" if raw and dial != "volatility" else dial
+    st.plotly_chart(outlook_heatmap(table, dial, column), width="stretch", key="outlook_heat")
+    if dial == "direction" and not raw:
+        share = (table["direction_conf"] == "none").mean()
+        st.caption(f"{share:.0%} of cells have no measurable Direction skill and sit at 5. "
+                   "That is the honest answer for most names (review D.1), not a missing value.")
+    grid = [int(h) for h in sorted(table["horizon"].unique())]
+    horizon = st.select_slider("Horizon for the gauges", grid, value=30 if 30 in grid else grid[0],
+                               key="outlook_h")
+    mine = table[(table["ticker"] == choice) & (table["horizon"] == horizon)]
+    st.markdown(f"**{choice}**")
+    outlook_view.gauges(mine.iloc[0].to_dict() if not mine.empty else None, key="universe")
+
 # --- Market calendar --------------------------------------------------------
 
 st.divider()
