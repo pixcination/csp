@@ -189,15 +189,20 @@ in 376 s.
 - **Costs:** tastytrade fees on every leg, and 40% of the modelled
   half-spread on every open and close.
 - **Walk-forward:** choose the best set on 5 years, score it on the next
-  year, and compare it with the shipped rules as a fixed baseline (45 DTE,
-  0.20Δ, 2% wide, 50% target, 2× stop, no time stop).
+  year, and compare it with the shipped rules as a fixed baseline: 45 DTE,
+  0.20Δ, 4% wide, 50% target, 2× stop and 21-DTE time stop (re-run on
+  2026-09-28 after your decisions, in 368 s).
 
 **Walk-forward (60 folds)**
-- In-sample: 125.4% a year on BPR. Out-of-sample: 72.3%. The fixed
-  baseline scored 2.3% out-of-sample.
+- In-sample: 125.4% a year on BPR. Out-of-sample: 72.3%. The shipped
+  baseline scored **13.8%** out-of-sample. By ticker: SPY 29.7%, QQQ 10.4%,
+  IWM 9.3%, DIA 5.9%.
+- Over the full 20 years the baseline averages 11.6% a year:
+  - SPY 22.2%, QQQ 16.6%, IWM 11.6%, DIA −3.9%.
+  - Win rates are 76–80%, with no trades at max loss.
 - The drop from in-sample to out-of-sample is 42% of the in-sample figure
   (the roadmap's "substantial" band).
-- Re-choosing the rules beat the baseline in 78% of folds.
+- Re-choosing the rules beat the shipped baseline in 72% of folds.
 - Every set the walk-forward chose had no loss stop, no breach close and no
   time stop.
 
