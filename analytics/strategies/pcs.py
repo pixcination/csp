@@ -82,6 +82,7 @@ class SpreadRecommendation:
     delta: float | None               # short leg delta (chain sign)
     long_delta: float | None
     implied_vol: float | None         # short leg IV
+    long_iv: float | None
 
     # Sizing and economics
     contracts: int
@@ -420,6 +421,7 @@ def _evaluate(ticker, ctx, s_row, l_row, rules, exp_date, root, settlement_type,
         net_mid=fill["net_mid"], natural=fill["natural"], modelled_fill=credit,
         bid=sb, ask=sa, mid=legs[0].mid, long_bid=lb, long_ask=la, long_mid=legs[1].mid,
         delta=legs[0].delta, long_delta=legs[1].delta, implied_vol=legs[0].iv,
+        long_iv=legs[1].iv,
         contracts=contracts, collateral=bpr_total, binding_constraint=size.binding_constraint,
         scales=size.scales, gross_credit=econ.gross_credit, fees=econ.entry_fees,
         net_credit=econ.net_credit, cost_drag=econ.cost_drag_pct,

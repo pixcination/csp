@@ -251,3 +251,50 @@ try:
         })
 except Exception as exc:
     st.caption(f"Could not read IV history: {exc}")
+
+# --- 6. Probability engine (Phase 13) ---------------------------------------
+
+st.divider()
+st.subheader("Probability engine: predicted vs observed")
+st.caption("Walk-forward on real price history: at each entry date a synthetic 25-delta "
+           "short put is priced at an IV proxy (20-day RV x the backtest VRP multiplier); "
+           "models G / H / T predict using only data up to that date, and the actual path "
+           "decides what happened. Run `python scripts/validate_prob_engine.py` "
+           "(add `--dte 7` for weeklies) to refresh.")
+try:
+    import json
+
+    from core.paths import validation_dir
+    folder = validation_dir()
+    found = sorted(folder.glob("prob_engine_summary*.json"))
+    if not found:
+        st.info("No validation run on disk yet.")
+    for path in found:
+        summary = json.loads(path.read_text(encoding="utf-8"))
+        st.markdown(f"**{summary['dte']} DTE** · {', '.join(summary['tickers'])} · "
+                    f"{summary['entries']:,} entries (~{summary['effective_entries_approx']:,} "
+                    f"independent) · {summary['years']}y · run {summary['run_at']}")
+        scores = pd.DataFrame(summary["scores"])
+        st.dataframe(scores.pivot_table(index="target", columns="model", values="gap"),
+                     width="stretch")
+        st.caption("Mean predicted minus mean observed, by target (25 / 50 = reach that % of "
+                   "max profit by expiry, 100 = expire worthless, touch = close at or below "
+                   "the strike). Brier scores: " + ", ".join(
+                       f"{r['model']}/{r['target']} {r['brier']:.3f}"
+                       for r in summary["scores"] if r["target"] in ("50", "100")))
+        cal_path = folder / path.name.replace("summary", "calibration").replace(".json", ".parquet")
+        if cal_path.exists():
+            import plotly.express as px
+            cal = pd.read_parquet(cal_path)
+            cal = cal[(cal["target"] == "100") & (cal["n"] >= 20)]
+            fig = px.scatter(cal, x="predicted", y="observed", color="model", size="n",
+                             labels={"predicted": "predicted P(expire worthless)",
+                                     "observed": "observed frequency"})
+            fig.add_shape(type="line", x0=0.6, y0=0.6, x1=1, y1=1, line=dict(dash="dot"))
+            fig.update_layout(height=300, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(fig, width="stretch")
+        with st.expander("Caveats"):
+            for caveat in summary.get("caveats", []):
+                st.markdown(f"- {caveat}")
+except Exception as exc:
+    st.caption(f"Could not read the probability-engine validation: {exc}")

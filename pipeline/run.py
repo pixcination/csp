@@ -67,6 +67,7 @@ STAGES = [
     ("chains", "Option chains"),
     ("analyse", "Analysis"),
     ("candidates", "Ranking candidates"),
+    ("probabilities", "Probability engine"),
     ("wheel", "Wheel management"),
     ("portfolio", "Portfolio construction"),
 ]
@@ -430,6 +431,25 @@ def _stage_analyse(reporter: BaseReporter, manifest: RunManifest,
     from analytics.scan_request import ScanRequest
     request = request or ScanRequest.default()
     full_sheet = evaluate_universe(tickers, reporter=reporter, request=request)
+    # Phase 13: three-model probabilities on every row, then the sheet is
+    # re-ranked by blended EV per day on buying power (rejected rows last).
+    prob_tables: dict = {}
+    if not full_sheet.empty:
+        try:
+            from analytics import probabilities
+            census = full_sheet.attrs.get("census")
+            engine = probabilities.run_sheet(full_sheet, request, reporter=reporter)
+            full_sheet = engine["sheet"]
+            if census:
+                full_sheet.attrs["census"] = census
+            prob_tables = {k: engine[k] for k in ("policies", "metrics", "curves")}
+            results["probabilities"] = {
+                "seconds": round(engine["seconds"], 1), "trades": engine.get("trades"),
+                "tickers": engine.get("tickers")}
+            reporter.log(f"probability engine: {engine.get('trades')} trade(s) on "
+                         f"{engine.get('tickers')} ticker(s) in {engine['seconds']:.1f}s")
+        except Exception as exc:
+            manifest.warnings.append(f"probability engine: {type(exc).__name__}: {exc}")
     if not full_sheet.empty and "strategy" in full_sheet:
         results["by_strategy"] = {
             k: {"rows": int(len(g)), "accepted": int(g["accepted"].sum())}
@@ -480,9 +500,14 @@ def _stage_analyse(reporter: BaseReporter, manifest: RunManifest,
             long = row.get("long_strike")
             legs = (f"${row['strike']:g}/${long:g} put spread"
                     if long is not None and long == long else f"${row['strike']:g}p")
+            blended = row.get("headline_annualised")
             reporter.log(f"  {row['ticker']} {row['expiration']} {legs} "
                          f"x{row['contracts']} @ ~${row['modelled_fill']:.2f} -- "
-                         f"EV {row['ev_annualised']:.1%} annualised")
+                         + (f"blended {row.get('headline_policy')}: EV "
+                            f"${row.get('headline_ev', 0):,.0f}, {blended:.1%} annualised, "
+                            f"POP {row.get('pop_blend', 0):.0%}"
+                            if blended is not None and blended == blended else
+                            f"EV {row['ev_annualised']:.1%} annualised"))
 
         # Stress the resulting book, existing positions included.
         try:
@@ -518,7 +543,7 @@ def _stage_analyse(reporter: BaseReporter, manifest: RunManifest,
             manifest.run_id,
             run_results.annotate_sheet(full_sheet, best, proposed),
             results.get("open_positions", []),
-            underlyings=ranked)
+            underlyings=ranked, **prob_tables)
         results["persisted"] = written
     except Exception as exc:
         manifest.warnings.append(f"could not persist run tables: {exc}")

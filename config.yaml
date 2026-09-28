@@ -488,3 +488,23 @@ pcs:
 premium_flags:
   min_ivp: 0.50                       # TastyTrade IV percentile
   min_iv_rv: 1.20                     # short-leg IV / DTE-matched RV
+
+# --- Probability engine (Phase 13) --------------------------------------------
+# analytics/prob_engine.py + analytics/probabilities.py. Three models, one
+# daily Black-Scholes repricing core; see the module docstring.
+prob_engine:
+  n_paths: 20000
+  seed: 20260927                      # fixed per run: results are reproducible
+  antithetic: true                    # G only (bootstraps keep their skew)
+  block_days: 5                       # H/T block bootstrap block length
+  lookback_years: 10
+  vol_band: 0.25                      # H: blocks from days with RV within +/-25% of today's
+  min_starts: 250                     # H/T: fewer matching days -> relax (T) / unconditioned (H)
+  weights: {G: 0.3333, H: 0.3333, T: 0.3333}   # blend; models absent are renormalised out
+  iv_reversion_half_life_days: null   # null = sticky strike, no mean reversion toward RV
+  earnings_crush: 0.30                # IV x (1 - 0.30) from an earnings date inside the trade
+  time_stop_dte: 21                   # policies with a time stop exist only above this DTE
+  headline_policy: auto               # auto = hold at <= 14 DTE, else close at the target nearest 50%
+  auto_hold_max_dte: 14
+  rsi_buckets: [30, 50, 70]           # T: RSI state
+  support_atr_buckets: [1.0, 3.0]     # T: distance to the strongest support, ATR

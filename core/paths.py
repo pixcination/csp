@@ -74,6 +74,11 @@ def logs_dir() -> Path:
     return _ensure(data_dir() / ".job_logs")
 
 
+def validation_dir() -> Path:
+    """Validation outputs (Phase 13 probability-engine walk-forward)."""
+    return _ensure(data_dir() / "validation")
+
+
 def runs_dir() -> Path:
     """One subdirectory per pipeline run: manifest, stage logs, timings."""
     return _ensure(data_dir() / "runs")

@@ -75,6 +75,60 @@ else:
                f"collateral, after fees and after charging the full empirical loss "
                f"tail — so the ranking never assumes a favourable second leg.")
 
+    policies_all = run_results.prob_policies if run_results is not None else pd.DataFrame()
+    metrics_all = run_results.prob_metrics if run_results is not None else pd.DataFrame()
+    curves_all = run_results.prob_curves if run_results is not None else pd.DataFrame()
+
+    def probability_panel(rec: dict) -> None:
+        """Phase 13: the three models side by side, the blend, and every
+        management policy net of fees."""
+        trade_id = rec.get("trade_id")
+        if not trade_id or metrics_all.empty:
+            return
+        if rec.get("pop_blend") is not None:
+            st.markdown(
+                f"**Probabilities (blend):** P(profit at expiry) {rec['pop_blend']:.0%} · "
+                + " · ".join(f"P({t}%) {rec[f'p_hit_{t}_blend']:.0%}"
+                             for t in (25, 30, 50, 100) if rec.get(f"p_hit_{t}_blend") is not None)
+                + f" · headline `{rec.get('headline_policy')}`: EV "
+                  f"${rec.get('headline_ev') or 0:,.0f} over ~{rec.get('headline_days') or 0:.0f} days")
+        with st.expander("Probability table — models G / H / T, policies, curves"):
+            m = metrics_all[metrics_all["trade_id"] == trade_id]
+            if not m.empty:
+                table = m.pivot_table(index="metric", columns="model", values="value",
+                                      aggfunc="first")
+                order = [c for c in ["G", "H", "T", "blend"] if c in table.columns]
+                st.dataframe(table[order], width="stretch")
+            st.caption(rec.get("prob_labels", "") + (f" · T: {rec['t_flag']}"
+                                                     if rec.get("t_flag") else ""))
+            st.caption("G = what option prices imply (risk-neutral at the short leg's IV: its "
+                       "EV is ~minus costs by construction); H = this stock's own history at a "
+                       "similar volatility; T = H from days in a similar technical state. "
+                       "100% = expire worthless, only reached by holding to expiry. Touch is "
+                       "measured on daily closes and understates intraday touches.")
+            pol = policies_all[(policies_all["trade_id"] == trade_id)
+                               & (policies_all["model"] == "blend")]
+            if not pol.empty:
+                st.markdown("**Management policies (blend, net of all fees)**")
+                st.dataframe(pol[["policy", "ev", "p_profit", "days", "annualised",
+                                  "net_gain_when_hit", "below_min_gain"]],
+                             hide_index=True, width="stretch",
+                             column_config={
+                                 "ev": st.column_config.NumberColumn("EV $", format="$%.0f"),
+                                 "p_profit": st.column_config.NumberColumn("P(profit)", format="percent"),
+                                 "days": st.column_config.NumberColumn("Days held", format="%.1f"),
+                                 "annualised": st.column_config.NumberColumn("Annualised", format="percent"),
+                                 "net_gain_when_hit": st.column_config.NumberColumn("Net $ if target hit", format="$%.0f"),
+                                 "below_min_gain": st.column_config.CheckboxColumn("Below min gain")})
+            cur = curves_all[curves_all["trade_id"] == trade_id]
+            if not cur.empty:
+                import plotly.express as px
+                fig = px.line(cur.sort_values("day"), x="day", y="prob", color="model",
+                              facet_col="target", labels={"day": "calendar days",
+                                                          "prob": "P(reached by day)"})
+                fig.update_layout(height=260, margin=dict(l=10, r=10, t=30, b=10))
+                st.plotly_chart(fig, width="stretch")
+
     def pcs_card(rec: dict) -> None:
         """A put credit spread proposal (Phase 12). Recording it needs the
         multi-leg paper book (Phase 15), so there is no accept form yet."""
@@ -97,6 +151,7 @@ else:
                            if rec.get("prob_max_loss") is not None else "--")
             cols[5].metric("Credit / width", f"{rec['credit_width']:.0%}")
             st.caption(rec.get("rationale", ""))
+            probability_panel(rec)
             chips = [f"short strike: {rec.get('strike_rule_reason', '')}"]
             if rec.get("short_distance_em") == rec.get("short_distance_em") and                     rec.get("short_distance_em") is not None:
                 chips.append(f"{rec['short_distance_em']:+.2f} EM ({rec.get('em_method')})")
@@ -147,6 +202,7 @@ else:
                             if rec.get("iv_rv_ratio") else "--")
 
             st.caption(rec.get("rationale", ""))
+            probability_panel(rec)
 
             chips = []
             if rec.get("ivr") is not None and rec.get("ivr") == rec.get("ivr"):
@@ -221,12 +277,24 @@ if not sheet.empty and run_results.has_full_sheet:
         if best_only:
             flag = "best_per_ticker" if "best_per_ticker" in view else "selected"
             view = view[view[flag].fillna(False).astype(bool)] if flag in view else view
+        from analytics.probabilities import SORTS
+        sorts = {k: v for k, v in SORTS.items() if k in view.columns}
+        if sorts:
+            sort_key = st.selectbox("Sort by", list(sorts), format_func=sorts.get,
+                                    help="The default is the engine's ranking: blended EV per "
+                                         "calendar day held, per dollar of buying power. "
+                                         "Rejected strikes always sort last.")
+            view = view.assign(_rejected=~view["accepted"].astype(bool)).sort_values(
+                ["_rejected", sort_key], ascending=[True, False]).drop(columns="_rejected")
         view = view.copy()
         if "rejections" in view:
             view["why_not"] = view["rejections"].map(
                 lambda r: "; ".join(r) if r is not None and len(r) else "")
         columns = [c for c in ["ticker", "strategy", "expiration", "strike", "long_strike",
                                "width", "tier", "dte_calendar", "modelled_fill", "delta",
+                               "ev_per_day_bpr", "headline_policy", "headline_ev",
+                               "headline_annualised", "pop_blend", "p_hit_50_blend",
+                               "median_days_50_blend", "p_touch_blend",
                                "prob_otm_empirical", "prob_max_loss", "credit_width",
                                "ev_annualised", "short_distance_em", "strike_rule",
                                "iv_rv_ratio", "ivr", "ivp", "open_interest", "fillability",
@@ -238,6 +306,13 @@ if not sheet.empty and run_results.has_full_sheet:
             column_config={
                 "prob_otm_empirical": st.column_config.NumberColumn("P(OTM) / POP", format="percent"),
                 "prob_max_loss": st.column_config.NumberColumn("P(max loss)", format="percent"),
+                "ev_per_day_bpr": st.column_config.NumberColumn("EV/day/BPR", format="%.5f"),
+                "headline_ev": st.column_config.NumberColumn("Headline EV", format="$%.0f"),
+                "headline_annualised": st.column_config.NumberColumn("Headline ann.", format="percent"),
+                "pop_blend": st.column_config.NumberColumn("POP blend", format="percent"),
+                "p_hit_50_blend": st.column_config.NumberColumn("P(50%)", format="percent"),
+                "median_days_50_blend": st.column_config.NumberColumn("Days to 50%", format="%.1f"),
+                "p_touch_blend": st.column_config.NumberColumn("P(touch)", format="percent"),
                 "credit_width": st.column_config.NumberColumn("Credit/width", format="percent"),
                 "short_distance_em": st.column_config.NumberColumn("Short (EM)", format="%.2f"),
                 "ev_annualised": st.column_config.NumberColumn("EV ann.", format="percent"),

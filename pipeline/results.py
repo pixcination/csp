@@ -35,6 +35,9 @@ MANIFEST = "manifest.json"
 CANDIDATES = "candidates.parquet"
 POSITIONS = "positions.parquet"
 UNDERLYINGS = "underlyings.parquet"
+#: Phase 13 probability-engine tables, keyed by trade_id
+PROB_TABLES = {"policies": "prob_policies.parquet", "metrics": "prob_metrics.parquet",
+               "curves": "prob_curves.parquet"}
 KEY = ["ticker", "expiration", "strike"]
 
 
@@ -46,6 +49,9 @@ class RunResults:
     candidates: pd.DataFrame = field(default_factory=pd.DataFrame)
     positions: pd.DataFrame = field(default_factory=pd.DataFrame)
     underlyings: pd.DataFrame = field(default_factory=pd.DataFrame)
+    prob_policies: pd.DataFrame = field(default_factory=pd.DataFrame)
+    prob_metrics: pd.DataFrame = field(default_factory=pd.DataFrame)
+    prob_curves: pd.DataFrame = field(default_factory=pd.DataFrame)
     has_full_sheet: bool = False
 
     @property
@@ -129,7 +135,10 @@ def annotate_sheet(full: pd.DataFrame, selected: pd.DataFrame,
 
 def write_tables(run_id: str, candidates: pd.DataFrame | None,
                  positions: list[dict] | pd.DataFrame | None,
-                 underlyings: pd.DataFrame | None = None) -> dict:
+                 underlyings: pd.DataFrame | None = None,
+                 policies: pd.DataFrame | None = None,
+                 metrics: pd.DataFrame | None = None,
+                 curves: pd.DataFrame | None = None) -> dict:
     """Write the run's tables. Returns {name: rows written}."""
     folder = runs_dir() / run_id
     folder.mkdir(parents=True, exist_ok=True)
@@ -144,6 +153,10 @@ def write_tables(run_id: str, candidates: pd.DataFrame | None,
     if underlyings is not None and not underlyings.empty:
         _parquet_safe(underlyings).to_parquet(folder / UNDERLYINGS, index=False)
         written["underlyings"] = len(underlyings)
+    for name, frame in (("policies", policies), ("metrics", metrics), ("curves", curves)):
+        if frame is not None and not frame.empty:
+            _parquet_safe(frame).to_parquet(folder / PROB_TABLES[name], index=False)
+            written[f"prob_{name}"] = len(frame)
     return written
 
 
@@ -187,6 +200,12 @@ def load_run(run_id: str) -> RunResults | None:
             pass
     elif analyse.get("open_positions"):
         result.positions = pd.DataFrame(analyse["open_positions"])
+    for name, file in PROB_TABLES.items():
+        if (folder / file).exists():
+            try:
+                setattr(result, f"prob_{name}", pd.read_parquet(folder / file))
+            except Exception:
+                pass
     if (folder / UNDERLYINGS).exists():
         try:
             result.underlyings = pd.read_parquet(folder / UNDERLYINGS)
