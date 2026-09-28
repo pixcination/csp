@@ -49,7 +49,7 @@ and is not repeated here. Read the docstring before changing a module.
  analytics/  (pure functions; no Streamlit)
    moves · costs · sizing · candidates · strategies/{csp,pcs} · prob_engine · expected_move
    liquidity · portfolio · regime · vrp · skew · surface · gaps · exit_rules
-   roll_engine · covered_call · paper · …
+   roll_engine · covered_call · paper · book · pcs_backtest · …
           │
           ▼
  data/runs/<id>/  manifest.json · candidates.parquet · positions.parquet
@@ -131,9 +131,9 @@ D:\csp\
 | `data/stage3_chains/<date>/` | `scripts/04` | Legacy chain snapshots; still read by `iv_history.py`. |
 | `data/iv_history.duckdb` | `analytics/iv_history.py` | IV observations per ticker/block, rolled up from snapshots. |
 | `data/reference/*.parquet` | `reference.py`, `yfinance_sync.py` | `treasury_rates`, `vol_indices`, `earnings`, `dividends`. |
-| `data/trade_log.duckdb` | `analytics/paper.py` | The paper book: `cycles`, `paper_positions`, `share_lots`. (The legacy `positions` table is left in place, unused.) |
+| `data/trade_log.duckdb` | `analytics/paper.py` | The paper book: `cycles`, `paper_positions` (one row per position/package: short `strike`, `long_strike`/`width` for a spread, `collateral` = BPR, package quote, `rolled_from`/`rolls_used`, best profit seen), `paper_legs` (Phase 15: one row per leg; pre-Phase-15 rows migrated to one short-put leg on connect), `paper_marks` (marks while open: pipeline and manual), `paper_predictions` (what the engine claimed at entry, per metric and model), `share_lots`. (The legacy `positions` table is left in place, unused.) |
 | `data/runs/<id>/` | `pipeline/run.py`, `pipeline/results.py` | `manifest.json` (with the scan request), `candidates.parquet`, `positions.parquet`, `underlyings.parquet` (the ranking, Phase 11), `prob_policies` / `prob_metrics` / `prob_curves.parquet` (the probability engine per trade_id and model, Phase 13). |
-| `data/validation/` | `scripts/validate_prob_engine.py` | Walk-forward calibration of the probability engine: trades, calibration bins, summary JSON (per DTE). |
+| `data/validation/` | `scripts/validate_prob_engine.py`, `scripts/backtest_pcs.py` | Walk-forward calibration of the probability engine: trades, calibration bins, summary JSON (per DTE; spreads as `prob_engine_pcs_*`, Phase 15). The PCS rule backtest: `pcs_backtest_sweep` / `_folds.parquet`, `pcs_backtest_summary.json` (Phase 15). |
 
 ### 3.2 The price-basis rule (Phase 8)
 
@@ -268,10 +268,10 @@ Pure Python, config-driven, no Streamlit imports. Grouped by job:
 | Technicals (Phase 10) | `indicators.py` (SMA/EMA 9–200, RSI, ATR, Bollinger, MACD, ADX, 52-week, volume ratio; daily and weekly as `w_*`), `trend_state.py` (uptrend/range/downtrend per day), `level_respect.py` (MA test events → held/bounced/broke, pierce depth, Wilson CIs, **block-bootstrap placebo**, slope split, `support_map`), `oscillator_study.py` (RSI-extreme episodes vs baseline), `technical_study.py` (cache and pipeline stage) |
 | Trade construction | `candidates.py` (the sheet: `evaluate_universe(request=…)` builds CSP and PCS rows per ticker, `trade_id`, `select_sheet`, census), `strategies/` package (Phase 12: `base.py` Leg/Position -- payoff, value, max profit/loss, breakevens, BPR, net Greeks; `csp.py` the CSP evaluation moved verbatim from candidates, numbers pinned by a golden test; `pcs.py` put credit spreads -- strike rules, width ladder, tiers, empirical POP/P(max loss)/EV; `context.py` EM, support, liquidity and premium flags on every row), `costs.py` (tastytrade fees, single- and multi-leg fill models, vertical exit fees per outcome), `sizing.py` (capital and liquidity caps; `max_contracts_for_position` caps every leg; account profiles) |
 | Options analytics (Phase 12) | `expected_move.py` (tastytrade platform formula 0.6 straddle + 0.3 / 0.1 strangles, IV method, 0.85 x straddle; bands; EM distance; historical containment), `liquidity.py` (per-leg OI / volume / spread, fillability 0-1, weakest leg, OI walls) |
-| Book | `portfolio.py` (correlation clusters, marginal risk, simultaneous-assignment stress), `paper.py` (paper book, slippage, calibration inputs) |
-| Management | `exit_rules.py` (hold/close/roll/accept, net of fees), `roll_engine.py`, `covered_call.py` |
+| Book | `portfolio.py` (correlation clusters, marginal risk, simultaneous-assignment stress), `paper.py` (multi-leg paper book: accept CSP/PCS with net or leg fills, close / settle / roll, marks, stored predictions, slippage, performance by strategy), `book.py` (Phase 15: the open book marked on the latest chains -- mark, natural, unrealised, Greeks from the chain or Black-Scholes, 1-year beta on SPY, beta-weighted delta, theta/day, vega, BPR utilisation, event calendar) |
+| Management | `exit_rules.py` (CSP: hold/close/roll/accept, net of fees; Phase 15 PCS: value floor, loss stop at k x credit, breach/delta roll trigger, profit target above the hold horizon net of fees, optional time stop, the empirical expected-value test; `spread_roll_candidates` for net-credit rolls), `roll_engine.py`, `covered_call.py` |
 | Trade Detail (Phase 14) | `trade_detail.py` (no Streamlit: the persisted row as plain python, plain-English thesis/verdict/risk flags, payoff at expiry and T+n, net Greeks over time, price × IV scenario grid, empirical vs lognormal terminal distributions, EM cones, chain window around the legs, management plan, the Screener grid, filters and Excel export) |
-| Validation | `wheel_backtest.py` (full wheel cycles, synthetic BS pricing), `walkforward.py`, `regimes.py`, `calibration.py` |
+| Validation | `wheel_backtest.py` (full wheel cycles, synthetic BS pricing; since Phase 15 on the price basis with explicit dividend credits while shares are held), `walkforward.py`, `regimes.py`, `calibration.py` (POP reliability per strategy, P(reach X%) hit/miss/censored scoring from marks, package-quote fill calibration), `pcs_backtest.py` (Phase 15: one spread at a time on real paths, synthetic skewed BS prices, the exit_rules order of rules, grid sweep and walk-forward against a fixed baseline) |
 | Shared | `chain_utils.py`, `strategies/__init__.py` (`STRATEGIES` label registry, import-compatible), `config.py` (shim over `core.paths`) |
 
 Gates are **rejections, not penalties**. Every probability reports its
@@ -286,12 +286,12 @@ sample size.
 | Page | Shows | Run data from |
 |---|---|---|
 | **Screener** (default, Phase 14) | session banner + credentials, regime and a data-freshness line; the full scan-request form (strategy, DTE range or targets, risk mode + value, widths, profit targets, profile, universe, top N, ranking weights, event overrides, strike rule) with **saved requests** (`scan_presets`) and the example files; **Run** with stage progress; the **results grid** (every candidate, blended probabilities as progress bars, filters, best-per-ticker and group-by-ticker toggles, CSV/Excel); selecting a row opens Trade Detail with `?run=&trade=` | `active_run()` + `candidates.parquet` |
-| **Trade Detail** (Phase 14) | one trade from a persisted run, by query parameters (else the Screener's selection, else the top row): Summary (thesis, verdict, why this strike, risk flags) · Chart (daily/weekly candles, MAs, respected levels, strike lines, IV and straddle EM cones, events) · Expected move (three EM methods, containment, empirical vs lognormal terminal distribution, P(below) table) · Payoff (expiry + T+n, any legs) · Probabilities (target × model, curves, policy comparison under any model) · Greeks (now, over time, price × IV heatmap) · Chain & liquidity · Management plan (+ CSP roll and covered-call previews) · Context (IV, regime, earnings reactions, gap risk, correlation with the book) · Accept (CSP → paper book; "Send to Decisions") | `load_run(run)` + prob tables + chains, bars, levels |
-| Command Center | session banner, **Run** button with a scan-request form (strategies, DTE, profile, ranking weights, top N or all) and stage progress, open-position decisions, capacity | `active_run()` |
-| Decisions | the **Screener selection first** (Phase 14); the run's scan request; proposed trades with a **probability panel** (G/H/T/blend table, management policies net of fees, P(reach X% by day) curves) and a **sort selector** on the full sheet (CSP cards with accept; PCS cards with legs, max loss, POP, P(max loss), credit/width -- recording spreads waits for Phase 15), accept with actual fill → paper book; expander with **every evaluated strike** and why each was rejected, with a **best per ticker** toggle; the **underlying ranking** with component scores and exclusions | `active_run()` + `candidates.parquet` + `underlyings.parquet` |
-| Wheel | defensive rolls, covered calls against assigned lots, wheel backtest (total basis) | `active_run()` |
-| Validation | calibration, slippage, IV coverage, walk-forward, **probability engine predicted vs observed** (Phase 13), **ranking-component ICs** (Phase 14) | disk |
-| Portfolio | exposure, clusters, stress, correlation | `active_run()` |
+| **Trade Detail** (Phase 14) | one trade from a persisted run, by query parameters (else the Screener's selection, else the top row): Summary (thesis, verdict, why this strike, risk flags) · Chart (daily/weekly candles, MAs, respected levels, strike lines, IV and straddle EM cones, events) · Expected move (three EM methods, containment, empirical vs lognormal terminal distribution, P(below) table) · Payoff (expiry + T+n, any legs) · Probabilities (target × model, curves, policy comparison under any model) · Greeks (now, over time, price × IV heatmap) · Chain & liquidity · Management plan (+ CSP roll and covered-call previews) · Context (IV, regime, earnings reactions, gap risk, correlation with the book) · Accept (CSP or PCS → paper book, net credit or leg fills; "Send to Decisions") | `load_run(run)` + prob tables + chains, bars, levels |
+| Command Center | session banner, **Run** button with a scan-request form (strategies, DTE, profile, ranking weights, top N or all) and stage progress, open-position decisions (CSPs and spreads; spread roll candidates for a net credit), capacity | `active_run()` |
+| Decisions | the **Screener selection first** (Phase 14); the run's scan request; proposed trades with a **probability panel** (G/H/T/blend table, management policies net of fees, P(reach X% by day) curves) and a **sort selector** on the full sheet (CSP and PCS cards with legs, max loss, POP, P(max loss), credit/width, each with an accept form), accept with actual fill → paper book; the book by strategy with forms to mark an outcome (expired / closed / assigned / settled at a price), roll (two linked positions) and record a mark; expander with **every evaluated strike** and why each was rejected, with a **best per ticker** toggle; the **underlying ranking** with component scores and exclusions | `active_run()` + `candidates.parquet` + `underlyings.parquet` |
+| Wheel | defensive rolls, covered calls against assigned lots, wheel backtest (price basis + dividends, Phase 15) | `active_run()` |
+| Validation | calibration (POP by strategy, **P(reach X%) predicted vs observed** from the book, Phase 15), slippage, IV coverage, walk-forward, **probability engine predicted vs observed** (Phase 13; spreads too), **ranking-component ICs** (Phase 14), **PCS rule backtest** (Phase 15) | disk |
+| Portfolio | **open book** (Phase 15: marks, P&L, beta-weighted delta, theta/day, vega, BPR utilisation, event calendar), exposure, clusters, stress, correlation, capital recycling | `paper` + chains, `active_run()` |
 | Signals | **Levels** (universe chance check, support map with %/ATR/EM distances, every level ranked by edge CI, chart of tests, RSI extremes), gap risk, skew, term structure | technicals cache, disk |
 | Settings | user account profiles (capital, caps, permissions) and ranking-weight presets; saved to `config/user_settings.yaml` | disk |
 | Universe | registry editor (add / deactivate / tag), IVR/IVP, next earnings and disagreements, Stage 1 verdicts, per-symbol weekly bars and earnings reactions, 45-day market-event calendar with policy | registry, metrics, events |
@@ -323,6 +323,7 @@ Headless check: `python scripts/check_pages.py` runs every page through
 | `chain_capture` | DTE windows, RTH refresh interval; roll buffer, put/call strike windows in EM, minimum window %, per-symbol subscription cap (Phase 11) | `chains.py`, `scan_request.py` |
 | `massive` | archive pacing | `massive_sync.py` |
 | `management.entry/exit/defense/covered_call` | entry gates and DTE band, exit test, roll limits, call rules | `candidates.py`, `exit_rules.py`, `roll_engine.py`, `covered_call.py` |
+| `management.spread` | Phase 15 PCS rules: profit target, loss-stop multiple, time stop (off by default), roll triggers, max rolls, roll-out window, value floor | `exit_rules.py`, `trade_detail.management_plan` |
 | `signals` | skew / gap / backwardation gates | `candidates.py` |
 | `portfolio` | cluster and correlation limits, stress horizon | `portfolio.py` |
 | `regime` | VIX term-structure thresholds and size multiplier | `regime.py` |
@@ -382,6 +383,8 @@ the meeting before it.
 | `python -m pytest legacy/tests -q` | retired stack |
 | `python scripts/check_pages.py` | headless run of every page |
 | `python scripts/validate.py` | engine validation (calibration, IV coverage, walk-forward, signals) |
+| `python scripts/validate_prob_engine.py [--strategy pcs]` | probability engine walk-forward, puts or spreads |
+| `python scripts/backtest_pcs.py` | PCS rule backtest and walk-forward (~6 min for 4 ETFs x 768 rule sets) |
 
 ### 8.4 Universe rebuild from the 1-minute archive (scripts 01–06)
 
@@ -418,11 +421,11 @@ re-pulls `daily_bars_raw`, runs the adjustment check, drops
 
 - **Option prices in backtests are synthetic** (Black-Scholes on a trailing
   RV proxy). TastyTrade has no historical chain API.
-- **The wheel backtest does not credit dividends explicitly.** It runs on the
-  total basis, so dividends arrive through the adjusted path, but strikes are
-  placed against adjusted rather than traded prices. The correct model (price
-  basis plus an explicit dividend credit while shares are held) is deferred to
-  Phase 15.
+- **Backtest option prices ignore the real surface.** The PCS backtest adds
+  a linear put skew to the RV proxy, but a spread's credit is a difference of
+  two synthetic prices, so its return LEVEL is indicative only; compare rule
+  sets, not absolute numbers. Rules fire on daily closes; no rolls, no early
+  assignment (PHASE15_SUMMARY.md §4).
 - **IV rank from own captures** needs 10+ capture dates per ticker. The
   TastyTrade IVR/IVP is informational on every candidate, and since Phase 11
   a component of the underlying ranking; it is not a trade gate.
@@ -438,9 +441,10 @@ re-pulls `daily_bars_raw`, runs the adjustment check, drops
   says so. Trend state and level stats are informational until Phases 11–13.
 - **Indices take PCS only.** Index chains (SPX, XSP, NDX, RUT) are captured
   and spreads built for PCS requests; CSP never applies to them.
-- **Spreads cannot be recorded yet.** PCS rows are built, ranked and
-  proposed (Phase 12), but the paper book is single-leg until Phase 15;
-  `paper.accept` refuses a spread. Profit-target odds arrive in Phase 13.
+- **P(reach X%) calibration from the book is a lower bound.** Marks are
+  sampled (one per pipeline run plus manual marks), so a target touched
+  between marks is missed; positions closed early without reaching a target
+  are censored, not misses.
 - **Probabilities are model outputs, not guarantees.** The engine's blend
   was within ~2 points of observed frequencies in a synthetic-price
   walk-forward (PHASE13_SUMMARY.md §3); G is a zero-edge baseline by
@@ -451,8 +455,10 @@ re-pulls `daily_bars_raw`, runs the adjustment check, drops
   index-sized widths.
 - **Implied-move history** for earnings reactions starts accumulating with the
   first daily metrics snapshot (2026-09-27).
-- **No multi-leg book yet.** Multi-leg pricing and fees exist (Phase 12);
-  the book and PCS management are Phase 15.
+- **The paper book records CSPs and put credit spreads only.** Other
+  structures wait for the Phase 16 strategy DSL. A physically settled spread
+  that finishes between its strikes is booked at the settlement price; the
+  shares it would really leave in the account are noted, not tracked.
 - **European Black-Scholes** throughout; no early-exercise modelling.
 - **Earnings dates** come from free yfinance data (roughly 90% reliable). An
   unknown date fails safe (blocks) unless the calendar as a whole is

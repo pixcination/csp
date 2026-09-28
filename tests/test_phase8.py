@@ -277,9 +277,22 @@ def test_probability_and_strike_modules_use_the_price_basis(path):
     assert _load_daily_bases(path) == {"price"}
 
 
+def _loads_dividends(path: str) -> bool:
+    tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+             and getattr(node.func, "id", None) == "load_daily"]
+    return bool(calls) and all(
+        any(k.arg == "with_dividends" and getattr(k.value, "value", False) for k in c.keywords)
+        for c in calls)
+
+
 @pytest.mark.parametrize("path", TOTAL_BASIS)
-def test_long_run_performance_modules_use_the_total_basis(path):
-    assert _load_daily_bases(path) == {"total"}
+def test_long_run_performance_modules_use_price_basis_with_dividends(path):
+    """Phase 8 put the wheel on the total basis and deferred the right model to
+    Phase 15: traded prices for the strikes, plus each dividend as cash while
+    shares are held (`wheel_backtest.run_wheel`)."""
+    assert _load_daily_bases(path) == {"price"}
+    assert _loads_dividends(path)
 
 
 # --- Persisted run results --------------------------------------------------

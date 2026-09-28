@@ -124,17 +124,129 @@ def reliability_curve(predicted: pd.Series, outcomes: pd.Series,
                         mean_p, mean_a, verdict)
 
 
-def probability_calibration() -> Reliability | None:
-    """Reliability of the engine's prob-OTM claims against the paper book."""
+def outcomes(closed: pd.DataFrame) -> pd.Series:
+    """1 when a closed position finished profitable, per share before fees.
+
+    A CSP's POP claim is about assignment, so `assigned` is the loss and
+    expiry the win. Otherwise -- a spread, or any early close or roll -- the
+    outcome is whether the net debit paid back was below the credit taken
+    in. (Before Phase 15 every `closed_early` CSP counted as a win, even one
+    bought back at a loss.)
+    """
+    fill = closed["actual_fill"].fillna(closed["modelled_fill"]).astype(float)
+    exit_price = closed["exit_price"].fillna(0.0).astype(float)
+    won = (fill - exit_price > 0).astype(float)
+    won[closed["status"] == "assigned"] = 0.0
+    won[closed["status"] == "expired_otm"] = 1.0
+    return won
+
+
+def probability_calibration(strategy: str | None = None) -> Reliability | None:
+    """Reliability of the engine's POP claims against the paper book.
+
+    The claim is the recommendation's empirical `prob_otm` (a CSP's P(expire
+    OTM), a spread's P(finish above breakeven)); `strategy` restricts it to
+    one strategy, None pools them.
+    """
     positions = paper.list_positions()
     if positions.empty:
         return None
     closed = positions[positions["status"] != "open"].copy()
     closed = closed[closed["rec_prob_otm"].notna()]
+    if strategy:
+        closed = closed[closed["strategy"].fillna("csp") == strategy]
     if closed.empty:
         return None
-    outcomes = closed["status"].isin(WIN_STATUSES).astype(float)
-    return reliability_curve(closed["rec_prob_otm"].astype(float), outcomes)
+    return reliability_curve(closed["rec_prob_otm"].astype(float), outcomes(closed))
+
+
+def by_strategy() -> dict[str, dict]:
+    """POP reliability per strategy -- a spread and a put are different
+    claims, and pooling them can hide an error in either."""
+    positions = paper.list_positions()
+    out = {}
+    if positions.empty:
+        return out
+    for name in sorted(positions["strategy"].fillna("csp").unique()):
+        rel = probability_calibration(name)
+        if rel is not None:
+            out[name] = rel.to_dict()
+    return out
+
+
+# --- P(reach X% of max profit) ---------------------------------------------
+
+def target_outcomes() -> pd.DataFrame:
+    """One row per closed position x profit target it carried a prediction for.
+
+        hit       the best profit seen (marks and the exit) reached X% of max
+        miss      it did not, AND the position was held to expiry, so the
+                  whole path is known
+        censored  closed early or rolled without reaching X: the rest of the
+                  path was never seen, so it is neither -- excluded
+
+    Marks are sampled (once per pipeline run, plus any you record), so a hit
+    between marks can be missed: the observed rate is a LOWER bound, and a
+    model that looks slightly optimistic here may be right.
+    """
+    positions = paper.list_positions()
+    if positions.empty:
+        return pd.DataFrame()
+    closed = positions[positions["status"] != "open"]
+    preds = paper.list_predictions()
+    if closed.empty or preds.empty:
+        return pd.DataFrame()
+    preds = preds[preds["metric"].str.fullmatch(r"p_hit_\d+") & (preds["model"] == "blend")]
+    rows = []
+    for _, pos in closed.iterrows():
+        seen = pos.get("max_profit_pct_seen")
+        seen = float(seen) if seen is not None and pd.notna(seen) else None
+        held = pos["status"] in paper.HELD_TO_EXPIRY
+        for _, p in preds[preds["position_id"] == pos["id"]].iterrows():
+            target = int(p["metric"].split("_")[-1])
+            if target >= 100:
+                # "100%" is P(expire worthless): judged only at expiry.
+                result = ("hit" if pos["status"] == "expired_otm" else
+                          "miss" if held else "censored")
+            elif seen is not None and seen >= target / 100.0 - 1e-9:
+                result = "hit"
+            else:
+                result = "miss" if held else "censored"
+            rows.append({"position_id": int(pos["id"]), "ticker": pos["ticker"],
+                         "strategy": pos.get("strategy") or "csp", "target": target,
+                         "predicted": float(p["value"]), "result": result,
+                         "observed": {"hit": 1.0, "miss": 0.0}.get(result)})
+    return pd.DataFrame(rows)
+
+
+def target_calibration() -> dict:
+    """Predicted vs observed P(reach X%) per target, censored rows excluded."""
+    frame = target_outcomes()
+    if frame.empty:
+        return {"n": 0, "table": pd.DataFrame(), "reliability": {},
+                "verdict": "no closed positions with stored P(reach X%) predictions yet"}
+    scored = frame[frame["result"] != "censored"]
+    table = frame.groupby("target").agg(
+        n=("result", "size"), censored=("result", lambda r: int((r == "censored").sum())))
+    if not scored.empty:
+        table = table.join(scored.groupby("target").agg(
+            scored=("observed", "size"), predicted=("predicted", "mean"),
+            observed=("observed", "mean")))
+        table["gap"] = table["observed"] - table["predicted"]
+    reliability = {}
+    for target, group in scored.groupby("target"):
+        rel = reliability_curve(group["predicted"], group["observed"])
+        if rel is not None:
+            reliability[int(target)] = rel.to_dict()
+    n = int(len(scored))
+    censored = int((frame["result"] == "censored").sum())
+    enough = n and scored.groupby("target").size().max() >= MIN_FOR_VERDICT
+    verdict = (f"{n} scored target predictions, {censored} censored. "
+               + ("Observed rates are lower bounds: marks are sampled, so a touch of the "
+                  "target between marks goes unseen." if enough else
+                  f"Too few to judge: {MIN_FOR_VERDICT} per target is the minimum."))
+    return {"n": n, "table": table.reset_index(), "reliability": reliability,
+            "verdict": verdict}
 
 
 # --- Fill calibration ------------------------------------------------------
@@ -152,6 +264,23 @@ class FillCalibration:
 
     def to_dict(self) -> dict:
         return dict(self.__dict__)
+
+
+def _package_quote(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """(net mid, summed half-spread) per position: the stored package quote,
+    else the single leg's bid/ask for rows recorded before Phase 15."""
+    nan = pd.Series(np.nan, index=frame.index, dtype=float)
+    mid = frame["quote_net_mid"].astype(float) if "quote_net_mid" in frame else nan.copy()
+    half = (frame["quote_half_spread"].astype(float) if "quote_half_spread" in frame
+            else nan.copy())
+    if {"quote_bid", "quote_ask"}.issubset(frame.columns):
+        bid, ask = frame["quote_bid"].astype(float), frame["quote_ask"].astype(float)
+        single = (frame["strategy"].fillna("csp") != "pcs" if "strategy" in frame
+                  else pd.Series(True, index=frame.index))
+        legacy = single & mid.isna() & bid.notna() & ask.notna() & (ask > bid)
+        mid = mid.where(~legacy, (bid + ask) / 2.0)
+        half = half.where(~legacy, (ask - bid) / 2.0)
+    return mid, half
 
 
 def fill_calibration() -> FillCalibration | None:
@@ -178,25 +307,22 @@ def fill_calibration() -> FillCalibration | None:
     #   sell fill = mid - f x half_spread   =>   f = (mid - fill) / half_spread
     # Rows without a stored quote (entered before Phase 5, or on a one-sided
     # market) are skipped rather than guessed at.
+    # A spread is judged against its PACKAGE quote (net mid, summed
+    # half-spreads -- `costs.package_fill`), stored at entry since Phase 15.
     implied = None
-    if {"quote_bid", "quote_ask"}.issubset(real.columns):
-        quoted = real[real["quote_bid"].notna() & real["quote_ask"].notna()].copy()
-        quoted = quoted[quoted["quote_ask"] > quoted["quote_bid"]]
-        if not quoted.empty:
-            mid = (quoted["quote_bid"].astype(float)
-                   + quoted["quote_ask"].astype(float)) / 2.0
-            half = (quoted["quote_ask"].astype(float)
-                    - quoted["quote_bid"].astype(float)) / 2.0
-            fractions = ((mid - quoted["actual_fill"].astype(float))
-                         / half.replace(0, np.nan)).dropna()
-            if len(fractions):
-                # Median, not mean: one fill on an unusually wide market would
-                # otherwise dominate a small sample.
-                implied = float(np.clip(fractions.median(), -0.5, 1.5))
+    mid, half = _package_quote(real)
+    usable = mid.notna() & half.notna() & (half > 0)
+    if usable.any():
+        fractions = ((mid[usable] - real.loc[usable, "actual_fill"].astype(float))
+                     / half[usable]).dropna()
+        if len(fractions):
+            # Median, not mean: one fill on an unusually wide market would
+            # otherwise dominate a small sample.
+            implied = float(np.clip(fractions.median(), -0.5, 1.5))
 
     mean_slip = float(slippage.mean())
     recommendation = None
-    quoted_n = int(real["quote_bid"].notna().sum()) if "quote_bid" in real.columns else 0
+    quoted_n = int(usable.sum())
     if quoted_n >= MIN_FOR_VERDICT and implied is not None:
         # Move only part of the way toward the measurement: a sample this size
         # is noisy, and over-correcting on it is its own error.
@@ -213,7 +339,8 @@ def fill_calibration() -> FillCalibration | None:
     elif mean_slip < 0:
         verdict = (f"Fills come in {abs(mean_slip):.3f} BELOW the model on average -- "
                    f"every displayed yield is optimistic. Raising the slippage "
-                   f"fraction toward {recommendation:.0%} would make them honest.")
+                   + (f"fraction toward {recommendation:.0%} would make them honest."
+                      if recommendation is not None else "fraction would make them honest."))
     else:
         verdict = (f"Fills beat the model by {mean_slip:.3f} on average. The "
                    f"{assumed:.0%} assumption is too pessimistic and is suppressing "
@@ -261,6 +388,8 @@ def report() -> dict:
 
     return {
         "probability": probability.to_dict() if probability else None,
+        "by_strategy": by_strategy(),
+        "targets": target_calibration(),
         "reliability_buckets": probability.buckets if probability else None,
         "fills": fills.to_dict() if fills else None,
         "performance": performance,

@@ -247,7 +247,7 @@ def across_universe(tickers: list[str] | None = None, years: int = 20,
     with reporter.stage("walkforward", "Walk-forward validation", total=len(tickers)):
         for ticker in tickers:
             try:
-                daily = load_daily(ticker, basis="total")
+                daily = load_daily(ticker, basis="price", with_dividends=True)
                 if daily.empty:
                     reporter.advance(1, note=f"{ticker} no history")
                     continue

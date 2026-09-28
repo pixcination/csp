@@ -257,6 +257,25 @@ management:
     require_net_credit_to_roll: true
     max_rolls_per_cycle: 2            # then accept assignment; wheels are not traps
     roll_out_weeks: [1, 2]
+  # Put credit spreads (Phase 15, analytics/exit_rules.evaluate_put_spread).
+  # Targets and the time stop apply only to trades entered above
+  # prob_engine.auto_hold_max_dte; below it spreads are held like weekly CSPs.
+  spread:
+    profit_target_pct: 50             # close at 50% of max profit (net gain must clear min_net_gain_to_close_early)
+    loss_stop_multiple: 2.0           # close when the loss reaches 2x the credit taken in. A priced
+                                      # risk control: the Phase 15 backtest has it cutting max-loss
+                                      # trades from 3.5% to 0.1% and return from 58.5% to 20.7%/yr
+    # 21 = close at 21 calendar DTE (entries above it only). Off by default: measured
+    # against twice -- Phase 13 (lower EV under H and T on SPY/QQQ) and the Phase 15
+    # PCS backtest (45 DTE 0.20d 4%-wide 50%-target: 58.5%/yr without it, 29.8% with).
+    time_stop_dte: null
+    roll_when_short_delta_beyond: -0.45
+    roll_when_price_below_short: true
+    min_dte_to_roll: 5                # calendar days
+    max_rolls: 1                      # then close; a spread is never "taken" like CSP shares
+    require_net_credit_to_roll: true
+    roll_out_days: [7, 35]            # later expirations searched, calendar days past the current one
+    close_when_remaining_value_below: 0.05
   covered_call:
     target_delta: 0.25
     dte_min: 5

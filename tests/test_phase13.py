@@ -246,9 +246,11 @@ def test_validation_strike_for_delta_and_observation():
     from analytics.options_math import bs_price_greeks
     strike = v.strike_for_delta(100.0, 0.25, 30, 0.045, -0.25)
     assert bs_price_greeks(100.0, strike, 30, 0.25, 0.045, "put").delta == pytest.approx(-0.25, abs=1e-6)
+    # Phase 15: observe takes the Position (any number of legs).
+    put = Position("csp", "X", [Leg("put", "short", strike, "x", iv=0.25)], 1.0)
     flat = np.full(21, 100.0)
-    obs = v.observe(flat, strike, 1.0, 0.25, 30, 0.045)
+    obs = v.observe(flat, put, 30, 0.045)
     assert obs["obs_hit_100"] == 1.0 and obs["obs_touch"] == 0.0 and obs["obs_hit_50"] == 1.0
     crash = np.linspace(99, 80, 21)
-    obs = v.observe(crash, strike, 1.0, 0.25, 30, 0.045)
+    obs = v.observe(crash, put, 30, 0.045)
     assert obs["obs_hit_100"] == 0.0 and obs["obs_touch"] == 1.0

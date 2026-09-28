@@ -114,6 +114,31 @@ else:
                        "accepting a trade — leaving it at the modelled value tells "
                        "the calibration nothing.")
 
+    by_strategy = report.get("by_strategy") or {}
+    if len(by_strategy) > 1 or any(k != "csp" for k in by_strategy):
+        st.markdown("**POP by strategy**")
+        st.caption("A CSP's claim is P(expire OTM); a spread's is P(finish above "
+                   "breakeven). Pooled, an error in one can hide in the other.")
+        st.dataframe(pd.DataFrame([{"strategy": k.upper(), "n": v["n"],
+                                    "predicted": v["mean_predicted"],
+                                    "realised": v["mean_actual"], "brier": v["brier"],
+                                    "verdict": v["verdict"]}
+                                   for k, v in by_strategy.items()]),
+                     hide_index=True, width="stretch",
+                     column_config={"predicted": st.column_config.NumberColumn(format="percent"),
+                                    "realised": st.column_config.NumberColumn(format="percent")})
+
+    targets = report.get("targets") or {}
+    st.markdown("**P(reach X% of max profit): predicted vs observed**")
+    table = targets.get("table")
+    if table is not None and not table.empty:
+        st.dataframe(table, hide_index=True, width="stretch",
+                     column_config={c: st.column_config.NumberColumn(format="percent")
+                                    for c in ("predicted", "observed", "gap")})
+    st.caption(targets.get("verdict", "") + " A target counts as a miss only when the "
+               "position was held to expiry; closed early without reaching it is censored "
+               "(the rest of the path was never seen).")
+
     if report["recommendations"]:
         st.markdown("**Suggested config changes**")
         st.caption("Evidence-backed, deliberately not applied automatically.")
@@ -266,12 +291,14 @@ try:
 
     from core.paths import validation_dir
     folder = validation_dir()
-    found = sorted(folder.glob("prob_engine_summary*.json"))
+    found = sorted(folder.glob("prob_engine*summary*.json"))
     if not found:
         st.info("No validation run on disk yet.")
     for path in found:
         summary = json.loads(path.read_text(encoding="utf-8"))
-        st.markdown(f"**{summary['dte']} DTE** · {', '.join(summary['tickers'])} · "
+        kind = ("put spread, long leg " + f"{summary.get('width_pct') or 0:.0%} below"
+                if summary.get("strategy") == "pcs" else "short put")
+        st.markdown(f"**{summary['dte']} DTE {kind}** · {', '.join(summary['tickers'])} · "
                     f"{summary['entries']:,} entries (~{summary['effective_entries_approx']:,} "
                     f"independent) · {summary['years']}y · run {summary['run_at']}")
         scores = pd.DataFrame(summary["scores"])
@@ -279,7 +306,8 @@ try:
                      width="stretch")
         st.caption("Mean predicted minus mean observed, by target (25 / 50 = reach that % of "
                    "max profit by expiry, 100 = expire worthless, touch = close at or below "
-                   "the strike). Brier scores: " + ", ".join(
+                   "the strike, max_loss = a spread finishing below its long strike). "
+                   "Brier scores: " + ", ".join(
                        f"{r['model']}/{r['target']} {r['brier']:.3f}"
                        for r in summary["scores"] if r["target"] in ("50", "100")))
         cal_path = folder / path.name.replace("summary", "calibration").replace(".json", ".parquet")
@@ -349,3 +377,60 @@ try:
             "vol.")
 except Exception as exc:
     st.caption(f"Could not read the ranking calibration: {exc}")
+
+
+# --- 8. PCS rule backtest (Phase 15) ------------------------------------------
+
+st.divider()
+st.subheader("Put credit spreads: which management rules pay?")
+st.caption("Every rule set (entry DTE x short delta x width x profit target x loss stop x "
+           "breach close x time stop) simulated one spread at a time on real daily paths "
+           "with synthetic Black-Scholes prices, then walked forward: the best set on 5 "
+           "years is scored on the next 1, beside a fixed baseline. Run "
+           "`python scripts/backtest_pcs.py` to refresh.")
+try:
+    import json
+
+    from core.paths import validation_dir
+    path = validation_dir() / "pcs_backtest_summary.json"
+    if not path.exists():
+        st.info("No PCS backtest on disk yet.")
+    else:
+        bt = json.loads(path.read_text(encoding="utf-8"))
+        if "verdict" in bt:
+            cols = st.columns(4)
+            cols[0].metric("In-sample", f"{bt['mean_in_sample']:.1%}",
+                           help="Annualised return on buying power of the best set, in "
+                                "the window it was chosen on.")
+            cols[1].metric("Out-of-sample", f"{bt['mean_out_of_sample']:.1%}",
+                           delta=f"{bt['mean_out_of_sample'] - bt['mean_in_sample']:+.1%}")
+            cols[2].metric("Fixed baseline OOS", f"{bt['mean_baseline_oos']:.1%}",
+                           help=bt.get("baseline", ""))
+            cols[3].metric("Folds", f"{bt['folds']}", delta=f"{len(bt.get('per_ticker', []))} "
+                                                           f"tickers", delta_color="off")
+            st.caption(f"{bt['verdict']} Baseline: {bt.get('baseline')}. Run {bt['run_at']}.")
+        shape = bt.get("shape") or {}
+        if shape:
+            st.markdown("**The shape of the grid** (mean over every other setting and ticker)")
+            axes = list(shape)
+            columns = st.columns(min(len(axes), 4))
+            for i, axis in enumerate(axes):
+                with columns[i % len(columns)]:
+                    frame = pd.DataFrame(shape[axis])
+                    st.dataframe(frame, hide_index=True, width="stretch",
+                                 column_config={
+                                     "annualised_on_bpr": st.column_config.NumberColumn(
+                                         "Annualised", format="percent"),
+                                     "win_rate": st.column_config.NumberColumn(
+                                         "Win", format="percent"),
+                                     "pct_max_loss": st.column_config.NumberColumn(
+                                         "Max loss", format="percent")})
+        if bt.get("top_sets_in_sample"):
+            with st.expander("Top rule sets over the full history (in-sample)"):
+                st.dataframe(pd.DataFrame(bt["top_sets_in_sample"]), hide_index=True,
+                             width="stretch")
+        with st.expander("Caveats"):
+            for caveat in bt.get("caveats", []):
+                st.markdown(f"- {caveat}")
+except Exception as exc:
+    st.caption(f"Could not read the PCS backtest: {exc}")

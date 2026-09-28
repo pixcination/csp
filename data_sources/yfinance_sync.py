@@ -352,13 +352,17 @@ def total_return_factor(frame: pd.DataFrame) -> pd.Series:
 
 
 def load_daily(ticker: str, start=None, end=None, basis: str = "price",
-               allow_fallback: bool = True) -> pd.DataFrame:
+               allow_fallback: bool = True, with_dividends: bool = False) -> pd.DataFrame:
     """Daily bars on an explicit price basis -- see the module docstring.
 
     `basis="price"` (default): split-adjusted traded prices. Use for anything
     a strike, level or probability is computed from.
     `basis="total"`: dividend-adjusted, derived locally from stored dividends.
     Use only for long-run holder-return comparisons.
+    `with_dividends`: keep the per-share cash `dividends` column (0 on most
+    days, the amount on each ex-date) -- the price basis plus explicit
+    dividend credits is the right model for anything that holds shares
+    (Phase 15: the wheel backtest). The legacy fallbacks carry none.
 
     Falls back to the legacy tables when `daily_bars_raw` has no rows for the
     ticker, because 25 MB of usable history should not sit unread while every
@@ -393,7 +397,7 @@ def load_daily(ticker: str, start=None, end=None, basis: str = "price",
                     factor = total_return_factor(frame)
                     for column in ("open", "high", "low", "close"):
                         frame[column] = frame[column] * factor
-                frame = frame[BAR_COLUMNS]
+                frame = frame[BAR_COLUMNS + (["dividends"] if with_dividends else [])]
                 frame.attrs["price_basis"] = basis
                 return frame
 

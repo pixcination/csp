@@ -218,7 +218,7 @@ def build(tickers: list[str] | None = None, params: WheelParams | None = None,
     with reporter.stage("regimes", "Regime scorecard", total=len(tickers)):
         for ticker in tickers:
             try:
-                daily = load_daily(ticker, basis="total")
+                daily = load_daily(ticker, basis="price", with_dividends=True)
                 if daily.empty:
                     reporter.advance(1, note=f"{ticker} no history")
                     continue

@@ -35,6 +35,11 @@ HONEST LIMITS
   the numbers are net. The old harness charged nothing.
 * Early assignment is not modelled on the put side. For OTM short puts held to
   a weekly expiry that is a reasonable simplification.
+* Price basis plus explicit dividends (Phase 15). Give it bars from
+  `load_daily(basis="price", with_dividends=True)`: strikes sit on traded
+  prices, and each cash dividend is credited while the cycle holds shares.
+  Bars without a `dividends` column (the old total-return basis) simply get
+  no credit, which is right for them -- the adjusted path already carries it.
 * Cycles are sequential per ticker, one at a time. That matches how capital
   actually works in a cash-secured account and makes capital-days meaningful.
 """
@@ -108,6 +113,7 @@ class WheelParams:
     never_below_basis: bool = True
     slippage_fraction: float = 0.40
     max_cycle_days: int = 504         # abandon a cycle after ~2 years
+    credit_dividends: bool = True     # when the bars carry a `dividends` column
 
     def label(self) -> str:
         return (f"{abs(self.put_delta):.2f}d put / {self.put_dte}d, "
@@ -129,11 +135,12 @@ class Cycle:
     outcome: str = "open"             # expired | called_away | abandoned
     basis: float = 0.0
     trading_days: int = 0
+    dividends: float = 0.0            # cash dividends received while holding shares
 
     @property
     def net_pnl(self) -> float:
         return (self.put_premium + self.call_premium_total
-                + self.stock_pnl - self.fees)
+                + self.stock_pnl + self.dividends - self.fees)
 
     @property
     def collateral(self) -> float:
@@ -176,6 +183,19 @@ def run_wheel(daily: pd.DataFrame, ticker: str,
 
     close = frame["close"].to_numpy(dtype=float)
     dates = frame.index.date
+    # Price basis plus explicit dividend credits (Phase 15): strikes are placed
+    # on traded prices, and the cash a shareholder receives is added while the
+    # cycle holds shares -- ex-dates after assignment up to and including the
+    # day the shares are called away (the holder at the prior close is paid).
+    dividends = (frame["dividends"].fillna(0.0).to_numpy(dtype=float)
+                 if params.credit_dividends and "dividends" in frame.columns
+                 else np.zeros(len(close)))
+    div_cumulative = np.concatenate([[0.0], np.cumsum(dividends)])
+
+    def dividends_between(first: int, last: int) -> float:
+        """Per-share dividends with ex-dates in (first, last]."""
+        last = min(last, len(close) - 1)
+        return float(div_cumulative[last + 1] - div_cumulative[first + 1]) if last > first else 0.0
     log_ret = np.log(frame["close"]).diff()
     rv = (log_ret.rolling(params.rv_window).std() * np.sqrt(TRADING_DAYS)).to_numpy()
 
@@ -287,6 +307,7 @@ def run_wheel(daily: pd.DataFrame, ticker: str,
             # by simply never closing.
             cycle.stock_pnl = (close[end_index] - strike) * shares
 
+        cycle.dividends = dividends_between(expiry, min(cursor, n - 1)) * shares
         cycles.append(cycle)
         i = min(cursor, n - 1) + 1
 
@@ -299,6 +320,7 @@ def run_wheel(daily: pd.DataFrame, ticker: str,
         "put_strike": c.put_strike, "assigned": c.assigned,
         "calls_written": c.calls_written, "put_premium": c.put_premium,
         "call_premium": c.call_premium_total, "stock_pnl": c.stock_pnl,
+        "dividends": c.dividends,
         "fees": c.fees, "net_pnl": c.net_pnl, "collateral": c.collateral,
         "trading_days": c.trading_days, "capital_days": c.capital_days,
         "return_on_collateral": c.return_on_collateral,
@@ -329,6 +351,7 @@ def _summarise(table: pd.DataFrame, params: WheelParams) -> dict:
         "mean_cycle_pnl": float(table["net_pnl"].mean()),
         "pct_profitable_cycles": float((table["net_pnl"] > 0).mean()),
         "total_fees": float(table["fees"].sum()),
+        "total_dividends": float(table["dividends"].sum()) if "dividends" in table else 0.0,
         # The number that matters: return per dollar of collateral per day,
         # annualised. Comparable across tickers and across parameter sets in a
         # way per-trade return is not.
@@ -404,7 +427,14 @@ def compare_to_buy_and_hold(daily: pd.DataFrame, result: WheelResult) -> dict:
         return {}
 
     years = max((end - start).days / 365.25, 1e-9)
-    bh_total = float(window["close"].iloc[-1] / window["close"].iloc[0] - 1.0)
+    if "dividends" in window.columns:
+        # Price-basis bars: the holder's return adds each dividend back on its
+        # ex-date, the same cash the wheel is credited with.
+        close = window["close"].astype(float)
+        growth = (close + window["dividends"].fillna(0.0).astype(float)) / close.shift(1)
+        bh_total = float(growth.iloc[1:].prod() - 1.0)
+    else:
+        bh_total = float(window["close"].iloc[-1] / window["close"].iloc[0] - 1.0)
     bh_annual = (1.0 + bh_total) ** (1.0 / years) - 1.0
 
     wheel_annual = result.summary.get("annualised_on_capital_deployed", float("nan"))

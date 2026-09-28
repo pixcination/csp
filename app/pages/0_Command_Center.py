@@ -19,6 +19,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
@@ -192,14 +193,24 @@ else:
             head.markdown(f"**{item.get('headline','')}**")
             action.markdown(f"`{item.get('action','').upper()}`")
             st.caption(item.get("rationale", ""))
-            metrics = st.columns(3)
+            metrics = st.columns(4)
             if item.get("prob_assignment") is not None:
-                metrics[0].metric("Assignment odds",
-                                   f"{item['prob_assignment']:.0%}")
+                metrics[0].metric("Short-ITM odds" if item.get("strategy") == "pcs"
+                                  else "Assignment odds", f"{item['prob_assignment']:.0%}")
             if item.get("edge_per_share") is not None:
                 metrics[1].metric("Edge / share", f"${item['edge_per_share']:.2f}")
             if item.get("effective_n"):
                 metrics[2].metric("Effective sample", f"{item['effective_n']}")
+            if item.get("profit_pct") is not None:
+                metrics[3].metric("Of max profit", f"{item['profit_pct']:.0%}",
+                                  delta=f"${item.get('pnl_if_closed', 0):,.0f} net if closed",
+                                  delta_color="off")
+            rolls = item.get("roll_candidates")
+            if rolls:
+                st.markdown("Rolls for a net credit (same width, later expiry):")
+                st.dataframe(pd.DataFrame(rolls), hide_index=True, width="stretch")
+            elif item.get("action") == "roll" and item.get("strategy") == "pcs":
+                st.caption("No roll in the stored chain pays a net credit: close instead.")
 
 st.divider()
 

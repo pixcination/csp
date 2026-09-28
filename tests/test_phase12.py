@@ -293,10 +293,12 @@ def test_trade_ids_are_unique_across_widths_and_roots():
     assert len(set(ids)) == 4 and ids[3] == "csp|AAPL|2026-11-20|330"
 
 
-def test_paper_book_refuses_spreads_until_phase_15():
+def test_paper_book_refuses_unknown_strategies():
+    """Spreads are recorded since Phase 15 (tests/test_phase15.py); anything
+    else the book cannot describe as legs is still refused."""
     from analytics import paper
-    with pytest.raises(ValueError, match="Phase 15"):
-        paper.accept({"strategy": "pcs", "ticker": "SPY", "strike": 700,
+    with pytest.raises(ValueError, match="records CSP, PCS"):
+        paper.accept({"strategy": "iron_condor", "ticker": "SPY", "strike": 700,
                       "expiration": "2026-11-20", "modelled_fill": 1.0, "contracts": 1})
 
 

@@ -171,7 +171,8 @@ if run_one or run_sweep:
     from analytics.wheel_backtest import (WheelParams, compare_to_buy_and_hold,
                                             run_wheel, sweep)
 
-    daily = load_daily(ticker, basis="total")
+    # Price basis plus explicit dividend credits while shares are held (Phase 15).
+    daily = load_daily(ticker, basis="price", with_dividends=True)
     if daily.empty:
         st.error(f"No daily history for {ticker}. Run the pipeline first.")
     else:

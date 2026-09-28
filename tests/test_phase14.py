@@ -148,7 +148,8 @@ def test_management_plan_time_stop_only_above_21_dte():
     pcs = {**td.record(results, "pcs|AAA|2026-10-30|95|90"), "headline_policy": "close_50"}
     plan = {p["rule"]: p["detail"] for p in td.management_plan(pcs)}
     assert "buy back at about $0.60" in plan["Profit target"]
-    assert plan["Time stop"].startswith("reassess at 21 DTE")
+    assert plan["Time stop"].startswith(("close at 21 DTE", "none"))  # Phase 15 spread rule
+    assert "2x the credit" in plan["Loss stop"]
     assert "Max loss" in plan
     weekly = {**td.record(results, "csp|BBB|2026-10-30|90"), "dte_calendar": 5,
               "headline_policy": "hold"}

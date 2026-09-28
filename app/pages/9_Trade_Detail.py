@@ -11,8 +11,8 @@ Chain & liquidity · Management plan · Context · Accept.
 
 Everything is built from `analytics.trade_detail` (no Streamlit there) and the
 chart builders in app/components/charts.py, which work on a `Position` of any
-number of legs. Recording a spread needs the multi-leg paper book (Phase 15);
-until then Accept records CSPs only. Nothing here places an order.
+number of legs. Accept records CSPs and put credit spreads to the multi-leg
+paper book (Phase 15). Nothing here places an order.
 """
 from __future__ import annotations
 
@@ -387,8 +387,9 @@ with tabs[7]:
     st.dataframe(pd.DataFrame(plan), hide_index=True, width="stretch",
                  column_config={"detail": st.column_config.TextColumn("Detail", width="large")})
     if is_pcs:
-        st.caption("Spread rolls and the PCS loss stop arrive with the multi-leg paper book "
-                   "(Phase 15). The roll trigger above is monitored on the short leg.")
+        st.caption("Once recorded, the pipeline applies these rules to the spread on every "
+                   "run (`exit_rules.evaluate_put_spread`) and lists rolls for a net credit "
+                   "on the Command Center when the roll trigger fires.")
     else:
         with st.expander("Roll preview (if the trigger fired on today's chain)"):
             try:
@@ -491,32 +492,50 @@ with tabs[9]:
             st.switch_page("pages/1_Decisions.py")
         except Exception:
             st.info("Selection saved; open Decisions from the sidebar.")
-    if is_pcs:
-        st.info("Recording a spread needs the multi-leg paper book (Phase 15). Until then, "
-                "note the trade and enter it by hand at your broker.", icon=":material/info:")
-    elif not row.get("accepted"):
-        st.warning("This strike failed an entry gate; recording it is still allowed, but the "
+    if not row.get("accepted"):
+        st.warning("This trade failed an entry gate; recording it is still allowed, but the "
                    "reasons are on the Summary tab.")
-    if not is_pcs:
-        from analytics import paper
-        from core.paths import load_config
-        allow = (load_config().get("execution", {}) or {}).get("allow_manual_fill_override", True)
-        with st.form("accept_detail"):
-            f = st.columns(4)
-            size = f[0].number_input("Contracts", 1, 1000, contracts)
-            fill = f[1].number_input("Actual fill", 0.0, value=float(row["modelled_fill"]),
-                                     step=0.01, format="%.2f", disabled=not allow,
-                                     help="What you really got. Calibrates the slippage model.")
-            entry = f[2].date_input("Entry date", value=dt.date.today())
-            note = f[3].text_input("Note", "")
-            submitted = st.form_submit_button("Accept and record", type="primary")
-        if submitted:
-            try:
-                used_real = abs(fill - float(row["modelled_fill"])) > 1e-9
-                result = paper.accept(row, contracts=int(size),
-                                      actual_fill=float(fill) if used_real else None,
-                                      entry_date=entry, run_id=results.run_id, notes=note)
-                st.success(result.message)
-            except Exception as exc:
-                st.error(f"{type(exc).__name__}: {exc}")
+    from analytics import paper
+    from core.paths import load_config
+
+    def _price(value) -> float:
+        value = pd.to_numeric(value, errors="coerce")
+        return float(value) if pd.notna(value) else 0.0
+
+    allow = (load_config().get("execution", {}) or {}).get("allow_manual_fill_override", True)
+    with st.form("accept_detail"):
+        f = st.columns(4)
+        size = f[0].number_input("Contracts", 1, 1000, contracts)
+        fill = f[1].number_input("Actual net credit" if is_pcs else "Actual fill", 0.0,
+                                 value=float(row["modelled_fill"]), step=0.01, format="%.2f",
+                                 disabled=not allow,
+                                 help="What you really got. Calibrates the slippage model.")
+        entry = f[2].date_input("Entry date", value=dt.date.today())
+        note = f[3].text_input("Note", "")
+        leg_fills = None
+        if is_pcs:
+            g = st.columns(4)
+            use_legs = g[0].checkbox("Enter leg fills instead", value=False,
+                                     help="If the broker filled the legs separately: the net "
+                                          "credit is short minus long.")
+            short_fill = g[1].number_input(f"Short \\${row['strike']:g} sold at", 0.0,
+                                           value=_price(row.get("bid")), step=0.01,
+                                           format="%.2f", disabled=not allow)
+            long_fill = g[2].number_input(f"Long \\${row['long_strike']:g} bought at", 0.0,
+                                          value=_price(row.get("long_ask")), step=0.01,
+                                          format="%.2f", disabled=not allow)
+            if use_legs:
+                leg_fills = [float(short_fill), float(long_fill)]
+        submitted = st.form_submit_button("Accept and record", type="primary")
+    if submitted:
+        try:
+            used_real = abs(fill - float(row["modelled_fill"])) > 1e-9
+            result = paper.accept(row, contracts=int(size),
+                                  actual_fill=None if leg_fills else
+                                  (float(fill) if used_real else None),
+                                  leg_fills=leg_fills, entry_date=entry,
+                                  run_id=results.run_id, notes=note)
+            st.success(result.message)
+        except Exception as exc:
+            st.error(f"{type(exc).__name__}: {exc}")
     st.caption("Research tool only: nothing here places an order.")

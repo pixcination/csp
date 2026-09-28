@@ -228,6 +228,282 @@ def evaluate_short_put(position: OpenPut, daily: pd.DataFrame,
         f"Insufficient history for an empirical estimate -- managing on structure alone.")
 
 
+# --- Put credit spreads (Phase 15) ------------------------------------------
+#
+# A spread is managed differently from a weekly CSP, for three reasons:
+#
+# * It is usually entered at 30-45 DTE, where "close at 50%" does pay: the
+#   freed buying power can be redeployed with weeks of theta left, and the
+#   close fee is small against a larger credit. Below
+#   `prob_engine.auto_hold_max_dte` the CSP logic still holds -- targets are
+#   off and the trade is held -- matching the probability engine's headline
+#   policy.
+# * Its loss is capped but reached quickly once the short strike is through,
+#   so a LOSS STOP (close when the loss reaches k x the credit) replaces the
+#   CSP's "accept assignment" fallback. Nobody wants shares from a spread.
+# * The same net-of-fee rule applies to every early close: a target whose
+#   net gain after the close fee is under `min_net_gain_to_close_early` is
+#   not worth taking.
+#
+# The economic test from the CSP carries over: hold while the price of the
+# remaining risk (the mark) exceeds its empirical expected terminal value.
+
+@dataclass(frozen=True)
+class OpenSpread:
+    ticker: str
+    short_strike: float
+    long_strike: float
+    contracts: int
+    entry_credit: float            # net, per share
+    spot: float
+    current_mark: float            # net debit to close now, per share
+    calendar_days_left: int
+    trading_days_left: int
+    entry_dte_calendar: int
+    short_delta: float | None = None
+    rolls_used: int = 0
+    cash_settled: bool = False
+
+    @property
+    def width(self) -> float:
+        return abs(self.short_strike - self.long_strike)
+
+    @property
+    def profit_pct(self) -> float:
+        return (self.entry_credit - self.current_mark) / self.entry_credit \
+            if self.entry_credit else 0.0
+
+
+def spread_config() -> dict:
+    cfg = load_config()
+    spread = dict((cfg.get("management", {}) or {}).get("spread", {}) or {})
+    exit_cfg = (cfg.get("management", {}) or {}).get("exit", {}) or {}
+    engine = cfg.get("prob_engine", {}) or {}
+    spread.setdefault("profit_target_pct", 50)
+    spread.setdefault("loss_stop_multiple", 2.0)
+    spread.setdefault("time_stop_dte", None)
+    spread.setdefault("roll_when_short_delta_beyond", -0.45)
+    spread.setdefault("roll_when_price_below_short", True)
+    spread.setdefault("min_dte_to_roll", 5)
+    spread.setdefault("max_rolls", 1)
+    spread.setdefault("require_net_credit_to_roll", True)
+    spread.setdefault("roll_out_days", [7, 35])
+    spread.setdefault("close_when_remaining_value_below", 0.05)
+    spread["min_net_gain"] = float(exit_cfg.get("min_net_gain_to_close_early", 5.0))
+    spread["hold_max_dte"] = int(engine.get("auto_hold_max_dte", 14))
+    return spread
+
+
+def spread_expected_value(daily: pd.DataFrame, spot: float, short: float, long: float,
+                          horizon: int, current_rv: float | None = None) -> dict | None:
+    """Empirical expected terminal value of a put spread (per share): the mean
+    of clip(short - S_T, 0, width) over the same vol-conditioned windows the
+    CSP test uses."""
+    if horizon <= 0 or daily is None or daily.empty:
+        return None
+    selected = moves.select_windows(daily, horizon, lookback_years=10, vol_conditioned=True,
+                                    current_rv=current_rv, min_observations=40)
+    if selected is None:
+        return None
+    windows, label = selected
+    s_t = spot * (1.0 + windows["terminal_return"].astype(float))
+    width = abs(short - long)
+    value = (short - s_t).clip(lower=0.0, upper=width)
+    return {"expected_value": float(value.mean()),
+            "prob_short_itm": float((s_t < short).mean()),
+            "prob_max_loss": float((s_t <= long).mean()),
+            "sample": label, "effective_n": moves._effective_n(len(windows), horizon)}
+
+
+def evaluate_put_spread(position: OpenSpread, daily: pd.DataFrame | None = None,
+                        current_rv: float | None = None) -> Decision:
+    """Decide what to do with one open put credit spread, right now.
+
+    Order: nothing left to earn -> loss stop -> short strike threatened ->
+    profit target (net of fees) -> time stop -> economic test -> hold.
+    """
+    cfg = spread_config()
+    n = max(position.contracts, 1)
+    close_fees = costs.legs_close([("buy", n), ("sell", n)]).total
+    open_fees = costs.legs_open([("sell", n), ("buy", n)]).total
+    credit, mark = position.entry_credit, position.current_mark
+    pnl_if_closed = (credit - mark) * 100 * n - open_fees - close_fees
+    numbers = {"profit_pct": round(position.profit_pct, 4),
+               "pnl_if_closed": round(pnl_if_closed, 2),
+               "cost_to_close": round(mark + close_fees / (100.0 * n), 4)}
+    what = f"{position.ticker} ${position.short_strike:g}/${position.long_strike:g}"
+    days = position.calendar_days_left
+    can_roll = (days >= cfg["min_dte_to_roll"]
+                and position.rolls_used < int(cfg["max_rolls"]))
+
+    # 1. Nothing left in it.
+    if mark <= float(cfg["close_when_remaining_value_below"]) and days > 0:
+        return Decision(
+            Action.CLOSE, "routine", f"{what}: take it off, nothing left in it",
+            f"The spread costs ${mark:.2f} to close with {days} day(s) left -- "
+            f"${pnl_if_closed:,.2f} net locked in. The remaining ${mark:.2f} is not worth "
+            f"carrying gap risk over, and closing frees ${position.width * 100 * n - credit * 100 * n:,.0f} "
+            f"of buying power.", numbers=numbers)
+
+    # 2. Loss stop: the loss has reached k x the credit.
+    k = cfg.get("loss_stop_multiple")
+    if k and mark - credit >= float(k) * credit:
+        return Decision(
+            Action.ROLL if can_roll else Action.CLOSE, "act_now",
+            f"{what}: loss stop hit",
+            f"Closing costs ${mark:.2f} against a ${credit:.2f} credit: the loss is "
+            f"{(mark - credit) / credit:.1f}x the credit, past the {float(k):g}x stop "
+            f"(${pnl_if_closed:,.0f} net if closed now; max loss "
+            f"${(position.width - credit) * 100 * n:,.0f}). "
+            + ("Roll down and out only if a later expiry pays a net credit for it; "
+               "otherwise close." if can_roll else "Close it: the stop exists so the "
+                                                   "remaining max loss is never ridden out."),
+            numbers=numbers)
+
+    # 3. Short strike threatened.
+    breached = cfg.get("roll_when_price_below_short", True) and \
+        position.spot < position.short_strike
+    deep = (position.short_delta is not None
+            and position.short_delta <= float(cfg["roll_when_short_delta_beyond"]))
+    if breached or deep:
+        why = (f"spot ${position.spot:.2f} is below the ${position.short_strike:g} short strike"
+               if breached else f"the short put's delta is {position.short_delta:.2f}")
+        if can_roll:
+            return Decision(
+                Action.ROLL, "act_now" if breached else "attention",
+                f"{what}: short strike under threat",
+                f"{why.capitalize()} with {days} day(s) left. Roll out in time (same width, "
+                f"same or lower strikes) only for a net credit -- a debit roll pays to "
+                f"postpone. If none pays, close.", numbers=numbers)
+        settle = ("cash-settled, so no shares change hands, but the loss is real"
+                  if position.cash_settled else
+                  "an American equity short put this deep can be assigned early")
+        return Decision(
+            Action.CLOSE, "act_now", f"{what}: close, no roll left",
+            f"{why.capitalize()} with {days} day(s) left and "
+            f"{'no rolls remaining' if position.rolls_used >= int(cfg['max_rolls']) else 'too little time to roll'}. "
+            f"Close it ({settle}).", numbers=numbers)
+
+    # 4. Profit target, net of fees, only where early closes pay.
+    target = cfg.get("profit_target_pct")
+    targets_apply = target and position.entry_dte_calendar > cfg["hold_max_dte"]
+    if targets_apply and position.profit_pct >= float(target) / 100.0:
+        net_gain = pnl_if_closed
+        if net_gain >= cfg["min_net_gain"]:
+            return Decision(
+                Action.CLOSE, "routine", f"{what}: profit target reached",
+                f"{position.profit_pct:.0%} of max profit captured (target {target}%): "
+                f"${net_gain:,.2f} net of every fee. Close and free "
+                f"${(position.width - credit) * 100 * n:,.0f} of buying power for a fresh "
+                f"trade with its theta still ahead of it.", numbers=numbers)
+        numbers["below_min_gain"] = True
+        return Decision(
+            Action.HOLD, "routine", f"{what}: target reached, but not worth the fee",
+            f"{position.profit_pct:.0%} of max profit, but closing nets only "
+            f"${net_gain:,.2f} after fees, under the ${cfg['min_net_gain']:.2f} minimum. "
+            f"Hold.", numbers=numbers)
+
+    # 5. Time stop.
+    stop = cfg.get("time_stop_dte")
+    if stop and position.entry_dte_calendar > int(stop) and days <= int(stop):
+        return Decision(
+            Action.CLOSE, "attention", f"{what}: time stop ({stop} DTE)",
+            f"{days} day(s) left: the trade has entered the gamma zone the {stop}-DTE stop "
+            f"exists to avoid. {position.profit_pct:.0%} of max profit so far, "
+            f"${pnl_if_closed:,.2f} net if closed now.", numbers=numbers)
+
+    # 6. Economic test.
+    empirical = None
+    if daily is not None and position.trading_days_left > 0:
+        empirical = spread_expected_value(daily, position.spot, position.short_strike,
+                                          position.long_strike, position.trading_days_left,
+                                          current_rv)
+    if empirical:
+        edge = mark - empirical["expected_value"]
+        numbers.update({"expected_value": round(empirical["expected_value"], 4),
+                        "prob_max_loss": empirical["prob_max_loss"],
+                        "sample": empirical["sample"],
+                        "effective_n": empirical["effective_n"]})
+        if edge < 0:
+            return Decision(
+                Action.CLOSE, "attention", f"{what}: remaining risk is underpriced",
+                f"Buying the spread back costs ${mark:.2f}, but on comparable history it "
+                f"is worth ${empirical['expected_value']:.2f} at expiry "
+                f"({empirical['prob_short_itm']:.0%} short-ITM odds). The market is "
+                f"paying less than the risk is worth: close.",
+                edge_per_share=edge, prob_assignment=empirical["prob_short_itm"],
+                numbers=numbers)
+        return Decision(
+            Action.HOLD, "routine", f"{what}: hold",
+            f"{position.profit_pct:.0%} of max profit so far. The ${mark:.2f} to close is "
+            f"${edge:.2f}/share above the ${empirical['expected_value']:.2f} expected "
+            f"terminal value, so the remaining risk is still overpaid.",
+            edge_per_share=edge, prob_assignment=empirical["prob_short_itm"],
+            numbers=numbers)
+
+    return Decision(
+        Action.HOLD, "routine", f"{what}: hold",
+        f"{position.profit_pct:.0%} of max profit with {days} day(s) left; spot "
+        f"${position.spot:.2f} above the ${position.short_strike:g} short strike. "
+        f"No rule has fired.", numbers=numbers)
+
+
+def spread_roll_candidates(chain: pd.DataFrame, position: OpenSpread,
+                           expiration, today=None, limit: int = 5) -> pd.DataFrame:
+    """Rolls for a put spread: later expirations (within `roll_out_days`),
+    the same width, short strike at or below the current one, priced at the
+    modelled package fill. `net` is per share after closing the current
+    spread at its mark and paying both sides' fees; with
+    `require_net_credit_to_roll` only net credits are returned. Sorted by
+    the lowest short strike that still pays, then the nearest expiry."""
+    import datetime as dt
+    cfg = spread_config()
+    if chain is None or chain.empty:
+        return pd.DataFrame()
+    today = today or dt.date.today()
+    frame = chain.copy()
+    frame["expiration"] = pd.to_datetime(frame["expiration"]).dt.date
+    frame["strike_price"] = frame["strike_price"].astype(float)
+    current = pd.Timestamp(expiration).date()
+    lo, hi = (list(cfg["roll_out_days"]) + [35])[:2]
+    n = max(position.contracts, 1)
+    fees = (costs.legs_close([("buy", n), ("sell", n)]).total
+            + costs.legs_open([("sell", n), ("buy", n)]).total) / (100.0 * n)
+    rows = []
+    for exp, group in frame.groupby("expiration"):
+        gap = (exp - current).days
+        if gap < lo or gap > hi:
+            continue
+        by_strike = group.set_index("strike_price")
+        for short in sorted(by_strike.index, reverse=True):
+            if short > position.short_strike:
+                continue
+            long = short - position.width
+            if long not in by_strike.index:
+                continue
+            s, l = by_strike.loc[short], by_strike.loc[long]
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[0]
+            if isinstance(l, pd.DataFrame):
+                l = l.iloc[0]
+            fill = costs.package_fill(s.get("put_bid"), s.get("put_ask"),
+                                      l.get("put_bid"), l.get("put_ask"))
+            if fill is None or fill["modelled"] <= 0:
+                continue
+            net = fill["modelled"] - position.current_mark - fees
+            rows.append({"expiration": exp, "dte": (exp - today).days,
+                         "short_strike": short, "long_strike": long,
+                         "new_credit": fill["modelled"], "close_debit": position.current_mark,
+                         "net": round(net, 4), "short_delta": s.get("put_delta")})
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    if cfg["require_net_credit_to_roll"]:
+        out = out[out["net"] > 0]
+    return out.sort_values(["short_strike", "expiration"], ascending=[True, True]) \
+        .head(limit).reset_index(drop=True)
+
+
 # --- Entry-side gate -------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -331,5 +607,21 @@ def recommended_starting_rules() -> dict:
                 "the strategy working, not the strategy failing.",
             "under 2 sessions left, stop rolling":
                 "There is no time value left to harvest and rolls price badly.",
+        },
+        "spread": {
+            "close at 50% of max profit (entries above 14 DTE)":
+                "At 30-45 DTE the freed buying power can be redeployed with weeks of "
+                "theta left, and the close fee is small against the credit. The same "
+                "minimum net gain applies as for a CSP.",
+            "loss stop at 2x the credit":
+                "A spread's loss is capped but arrives fast once the short strike is "
+                "through. The stop keeps a bad trade from being ridden to max loss.",
+            "no time stop (21 DTE available)":
+                "The conventional exit before the gamma zone. Measured against twice: "
+                "Phase 13 (lower EV on SPY/QQQ) and the Phase 15 backtest (roughly half "
+                "the annualised return at 45 DTE). Set management.spread.time_stop_dte "
+                "to use it.",
+            "roll only for a net credit, at most once":
+                "Same logic as the CSP: a debit roll pays to postpone.",
         },
     }

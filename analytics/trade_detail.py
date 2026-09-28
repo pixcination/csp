@@ -465,22 +465,46 @@ def management_plan(row: dict) -> list[dict]:
                      "detail": f"hold to expiry -- at {dte} DTE the fees of an early close "
                                f"eat most of the remaining credit (P(expire worthless) "
                                f"{_pct(row.get('p_hit_100_blend'))})"})
-    stop = int(engine.get("time_stop_dte", 21))
-    if dte > stop:
-        plan.append({"rule": "Time stop",
-                     "detail": f"reassess at {stop} DTE (day {dte - stop}); reported as a "
-                               f"policy, not the headline"})
+    is_pcs = row.get("strategy") == "pcs"
+    if is_pcs:
+        from analytics.exit_rules import spread_config
+        spread = spread_config()
+        stop = spread.get("time_stop_dte")
     else:
-        plan.append({"rule": "Time stop", "detail": f"none: the trade starts inside "
-                                                    f"{stop} DTE"})
-    defense = mgmt.get("defense", {}) or {}
-    plan.append({"rule": "Roll trigger",
-                 "detail": f"short delta beyond {defense.get('roll_when_delta_beyond', -0.45)}"
-                           + (" or price below the short strike"
-                              if defense.get("roll_when_price_below_strike") else "")
-                           + f" (P {_pct(row.get('p_roll_blend'))}); roll only for a net "
-                             f"credit, at most {defense.get('max_rolls_per_cycle', 2)} times, "
-                             f"not under {defense.get('min_dte_to_roll', 2)} DTE"})
+        stop = int(engine.get("time_stop_dte", 21))
+    if stop and dte > int(stop):
+        plan.append({"rule": "Time stop",
+                     "detail": (f"close at {stop} DTE (day {dte - int(stop)})" if is_pcs else
+                                f"reassess at {stop} DTE (day {dte - stop}); reported as a "
+                                f"policy, not the headline")})
+    else:
+        plan.append({"rule": "Time stop",
+                     "detail": f"none: the trade starts inside {stop} DTE" if stop
+                     else "none (management.spread.time_stop_dte is off)"})
+    if is_pcs:
+        k = spread.get("loss_stop_multiple")
+        if k:
+            stop_at = credit * (1 + float(k))
+            plan.append({"rule": "Loss stop",
+                         "detail": f"close when the loss reaches {float(k):g}x the credit: "
+                                   f"spread marked at about ${stop_at:.2f} (a loss of "
+                                   f"${credit * float(k) * 100 * contracts:,.0f} before fees)"})
+        plan.append({"rule": "Roll trigger",
+                     "detail": f"short delta beyond {spread['roll_when_short_delta_beyond']}"
+                               + (" or price below the short strike"
+                                  if spread.get("roll_when_price_below_short") else "")
+                               + f" (P {_pct(row.get('p_roll_blend'))}); roll out, same width, "
+                                 f"only for a net credit, at most {spread['max_rolls']} time(s), "
+                                 f"not under {spread['min_dte_to_roll']} DTE; otherwise close"})
+    else:
+        defense = mgmt.get("defense", {}) or {}
+        plan.append({"rule": "Roll trigger",
+                     "detail": f"short delta beyond {defense.get('roll_when_delta_beyond', -0.45)}"
+                               + (" or price below the short strike"
+                                  if defense.get("roll_when_price_below_strike") else "")
+                               + f" (P {_pct(row.get('p_roll_blend'))}); roll only for a net "
+                                 f"credit, at most {defense.get('max_rolls_per_cycle', 2)} times, "
+                                 f"not under {defense.get('min_dte_to_roll', 2)} DTE"})
     exit_cfg = mgmt.get("exit", {}) or {}
     plan.append({"rule": "Minimum gain",
                  "detail": f"never close early for under "

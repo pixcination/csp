@@ -7,8 +7,11 @@ nuisance. Twenty-five correlated positions immobilised together is the wheel
 stopping — there is no cash left to sell puts with, so the strategy does not
 recover, it just waits.
 
-Four views, in the order they change a decision:
+Views, in the order they change a decision:
 
+  0. Open book (Phase 15) — every open position, puts and spreads alike:
+     mark, P&L, beta-weighted delta, theta per day, vega, buying power
+     against the account, and the events that fall inside each trade
   1. Exposure — where the collateral actually is, by correlation cluster
   2. Stress — how many positions would have assigned in the same week
   3. Correlation — what moves with what
@@ -25,6 +28,7 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+from analytics import book as open_book  # noqa: E402
 from analytics import paper, portfolio  # noqa: E402
 from core.paths import load_config, load_universe  # noqa: E402
 
@@ -63,6 +67,86 @@ def current_book() -> list[dict]:
 
 
 book = current_book()
+
+# --- 0. Open book ------------------------------------------------------------
+
+st.subheader("Open book")
+
+
+@st.cache_data(ttl=300, show_spinner="Marking the open book...")
+def _open_book():
+    frame = open_book.open_book()
+    return frame, open_book.event_calendar(frame)
+
+
+held, calendar = _open_book()
+if held.empty:
+    st.caption("No open positions in the paper book. Accept a trade on Trade Detail or "
+               "Decisions and it appears here with its marks and Greeks.")
+else:
+    totals = open_book.summary(held, nlv or None)
+    cols = st.columns(6)
+    cols[0].metric("Positions", totals["positions"], delta=f"{totals['names']} names",
+                   delta_color="off")
+    cols[1].metric("Buying power held", f"${totals['bpr']:,.0f}",
+                   delta=f"{totals['utilisation']:.1%} of net liq"
+                   if totals.get("utilisation") is not None else None, delta_color="off")
+    cols[2].metric("Beta-weighted delta",
+                   f"{totals['bw_delta']:+,.0f} SPY sh" if totals.get("bw_delta") is not None
+                   else "--",
+                   help="Position deltas in SPY-share equivalents: delta x beta x spot / "
+                        "SPY. Positive = the book gains when the market rises.")
+    cols[3].metric("Theta / day", f"${totals['theta_day']:+,.0f}"
+                   if totals.get("theta_day") is not None else "--",
+                   help="Dollars of time decay per calendar day at today's prices.")
+    cols[4].metric("Vega", f"${totals['vega']:+,.0f}" if totals.get("vega") is not None
+                   else "--", help="Dollars per 1 vol point. Negative = short volatility.")
+    cols[5].metric("Unrealised", f"${totals['unrealized']:+,.0f}"
+                   if totals.get("unrealized") is not None else "--",
+                   help="Credit minus the current mark, before exit fees.")
+    if totals.get("utilisation") is not None:
+        st.progress(min(totals["utilisation"], 1.0),
+                    text=f"Buying power in use: {totals['utilisation']:.1%} of "
+                         f"${totals['nlv']:,.0f}"
+                         + "".join(f" · {k.upper()} ${v:,.0f}"
+                                   for k, v in totals["by_strategy"].items()))
+    if totals.get("unpriced"):
+        st.warning(f"{totals['unpriced']} position(s) have no mark in the stored chains; "
+                   f"their P&L is blank and their Greeks are modelled. Run the pipeline to "
+                   f"refresh chains.", icon=":material/warning:")
+    show = ["id", "ticker", "legs", "expiration", "dte", "contracts", "credit", "mark",
+            "profit_pct", "unrealized", "spot", "bpr", "max_loss", "beta", "delta_shares",
+            "bw_delta", "theta_day", "vega", "greeks_source"]
+    st.dataframe(
+        held[[c for c in show if c in held.columns]], hide_index=True, width="stretch",
+        column_config={
+            "credit": st.column_config.NumberColumn("Credit", format="$%.2f"),
+            "mark": st.column_config.NumberColumn("Mark", format="$%.2f"),
+            "profit_pct": st.column_config.ProgressColumn("Of max profit", min_value=-1.0,
+                                                          max_value=1.0, format="percent"),
+            "unrealized": st.column_config.NumberColumn("Unrealised", format="$%.0f"),
+            "bpr": st.column_config.NumberColumn("BPR", format="$%.0f"),
+            "max_loss": st.column_config.NumberColumn("Max loss", format="$%.0f"),
+            "beta": st.column_config.NumberColumn("Beta", format="%.2f"),
+            "delta_shares": st.column_config.NumberColumn("Delta (sh)", format="%.0f"),
+            "bw_delta": st.column_config.NumberColumn("BW delta (SPY sh)", format="%.0f"),
+            "theta_day": st.column_config.NumberColumn("Theta/day", format="$%.2f"),
+            "vega": st.column_config.NumberColumn("Vega", format="$%.0f"),
+        })
+    st.caption("Greeks from the latest chain snapshot where the leg is quoted, else "
+               "Black-Scholes at the leg's entry IV. Beta: 1-year daily regression on SPY.")
+
+    st.markdown("**Event calendar**")
+    if calendar.empty:
+        st.caption("No stored events fall inside an open position.")
+    else:
+        st.dataframe(calendar, hide_index=True, width="stretch",
+                     column_config={"bpr_exposed": st.column_config.NumberColumn(
+                         "BPR exposed", format="$%.0f")})
+        st.caption("Each event with the positions whose life it falls inside. Market-wide "
+                   "events (FOMC, CPI, OPEX...) hit every position still open on the day.")
+
+st.divider()
 
 # --- 1. Exposure -----------------------------------------------------------
 

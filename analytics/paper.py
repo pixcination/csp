@@ -23,14 +23,35 @@ Accumulate a few hundred of those and you can calibrate
 it -- which is the single input most likely to be wrong today, and the one
 that most distorts every yield the tool displays.
 
-The schema is wheel-shaped from the start: positions link to cycles, and cycles
-own share lots. Nothing here writes an order anywhere. When live execution is
+MULTI-LEG (Phase 15)
+--------------------
+`paper_positions` is the position (package) table: one row per trade, its
+net credit, size, buying power and the recommendation it came from. `strike`
+is the SHORT strike, `long_strike` / `width` are set for a spread, and
+`collateral` is the buying-power reduction (strike x 100 for a cash-secured
+put, max loss for a defined-risk spread). Each position owns its legs in
+`paper_legs` -- the single-leg rows recorded before Phase 15 are migrated to
+one short-put leg each, idempotently, on every connect.
+
+Two more tables feed calibration:
+
+    paper_predictions   what the engine claimed at entry (POP, P(reach X%),
+                        P(max loss)...), one row per metric and model
+    paper_marks         marks taken while the trade is open (the pipeline
+                        records one per run; you can add your own), so
+                        "did it reach 50% of max profit?" has an answer
+
+The schema stays wheel-shaped: CSPs link to cycles, and cycles own share lots.
+A spread does not open a cycle -- its worst case is a defined loss, not
+shares. Nothing here writes an order anywhere. When live execution is
 eventually built, it fills in `broker_order_id` and stops depending on
 `entered_by = 'manual'`; the ledger does not otherwise change.
 """
 from __future__ import annotations
 
 import datetime as dt
+import math
+import re
 from dataclasses import dataclass
 
 import duckdb
@@ -39,13 +60,19 @@ import pandas as pd
 from analytics import costs
 from core.paths import db_trade_log, load_config
 
-STATUSES = ["open", "expired_otm", "closed_early", "rolled", "assigned"]
+STATUSES = ["open", "expired_otm", "closed_early", "rolled", "assigned", "settled"]
 CYCLE_STATES = ["put_open", "shares_held", "call_open", "closed"]
+STRATEGIES = ("csp", "pcs")
+# Outcomes that observe the whole path to expiry: a P(reach X%) prediction can
+# be scored as a miss only on these. A position closed early without reaching
+# X never showed what the rest of the path would have done.
+HELD_TO_EXPIRY = {"expired_otm", "assigned", "settled"}
 
 SCHEMA = [
     "CREATE SEQUENCE IF NOT EXISTS cycle_id_seq START 1",
     "CREATE SEQUENCE IF NOT EXISTS paper_position_id_seq START 1",
     "CREATE SEQUENCE IF NOT EXISTS share_lot_id_seq START 1",
+    "CREATE SEQUENCE IF NOT EXISTS paper_leg_id_seq START 1",
     """
     CREATE TABLE IF NOT EXISTS cycles (
         cycle_id INTEGER PRIMARY KEY DEFAULT nextval('cycle_id_seq'),
@@ -80,7 +107,61 @@ SCHEMA = [
         disposed_date DATE, disposal_price DOUBLE
     )
     """,
+    # --- Phase 15 ---
+    """
+    CREATE TABLE IF NOT EXISTS paper_legs (
+        leg_id INTEGER PRIMARY KEY DEFAULT nextval('paper_leg_id_seq'),
+        position_id INTEGER, leg_index INTEGER,
+        option_type VARCHAR, side VARCHAR, strike DOUBLE, expiration DATE,
+        qty INTEGER,
+        entry_price DOUBLE, modelled_price DOUBLE,
+        quote_bid DOUBLE, quote_ask DOUBLE, quote_mid DOUBLE,
+        iv DOUBLE, delta DOUBLE, exit_price DOUBLE, root_symbol VARCHAR
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS paper_marks (
+        position_id INTEGER, mark_date DATE, spot DOUBLE, mark DOUBLE,
+        profit_pct DOUBLE, source VARCHAR, recorded_at TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS paper_predictions (
+        position_id INTEGER, metric VARCHAR, model VARCHAR, value DOUBLE
+    )
+    """,
 ]
+
+# Columns added to paper_positions in Phase 15 (existing books are altered).
+POSITION_COLUMNS = {
+    "long_strike": "DOUBLE", "width": "DOUBLE", "max_loss": "DOUBLE",
+    "settlement_type": "VARCHAR", "root_symbol": "VARCHAR",
+    "quote_net_mid": "DOUBLE", "quote_half_spread": "DOUBLE",
+    "rec_pop": "DOUBLE", "rec_headline_policy": "VARCHAR",
+    "rolled_from": "INTEGER", "rolls_used": "INTEGER",
+    "max_profit_pct_seen": "DOUBLE", "settlement_price": "DOUBLE",
+}
+
+
+def _migrate(con) -> None:
+    for column, kind in POSITION_COLUMNS.items():
+        con.execute(f"ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS {column} {kind}")
+    # Single-leg rows from before Phase 15 get their one leg. Idempotent: only
+    # positions without any leg are touched.
+    con.execute("""
+        INSERT INTO paper_legs (position_id, leg_index, option_type, side, strike,
+                                expiration, qty, entry_price, modelled_price,
+                                quote_bid, quote_ask, quote_mid)
+        SELECT p.id, 0,
+               CASE WHEN lower(coalesce(p.strategy, '')) LIKE '%call%' THEN 'call'
+                    ELSE 'put' END,
+               'short', p.strike, p.expiration, 1,
+               coalesce(p.actual_fill, p.modelled_fill), p.modelled_fill,
+               p.quote_bid, p.quote_ask, p.quote_mid
+        FROM paper_positions p
+        WHERE coalesce(p.strategy, 'csp') <> 'pcs'
+          AND NOT EXISTS (SELECT 1 FROM paper_legs l WHERE l.position_id = p.id)
+    """)
 
 
 def _connect(read_only: bool = False):
@@ -88,6 +169,7 @@ def _connect(read_only: bool = False):
     if not read_only:
         for statement in SCHEMA:
             con.execute(statement)
+        _migrate(con)
     return con
 
 
@@ -130,9 +212,88 @@ def migrate_legacy_trade_log() -> int:
                  row["exit_price"], float(row["strike"]) * 100 * contracts,
                  "; ".join(x for x in (tag, row["notes"]) if isinstance(x, str) and x)])
             copied += 1
+        _migrate(con)
         return copied
     finally:
         con.close()
+
+
+# --- Legs from a recommendation --------------------------------------------
+
+def _num(value) -> float | None:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def legs_from_recommendation(rec: dict) -> list[dict]:
+    """The legs a sheet row describes, in the paper_legs shape (per contract)."""
+    strategy = rec.get("strategy") or "csp"
+    expiration = pd.Timestamp(rec["expiration"]).date()
+    root = rec.get("root_symbol")
+    short = {"option_type": "put", "side": "short", "strike": float(rec["strike"]),
+             "expiration": expiration, "qty": 1,
+             "quote_bid": _num(rec.get("bid")), "quote_ask": _num(rec.get("ask")),
+             "quote_mid": _num(rec.get("mid")), "iv": _num(rec.get("implied_vol")),
+             "delta": _num(rec.get("delta")), "root_symbol": root}
+    if strategy == "csp":
+        return [short]
+    if strategy == "pcs":
+        long = {"option_type": "put", "side": "long", "strike": float(rec["long_strike"]),
+                "expiration": expiration, "qty": 1,
+                "quote_bid": _num(rec.get("long_bid")), "quote_ask": _num(rec.get("long_ask")),
+                "quote_mid": _num(rec.get("long_mid")),
+                "iv": _num(rec.get("long_iv")) or _num(rec.get("implied_vol")),
+                "delta": _num(rec.get("long_delta")), "root_symbol": root}
+        return [short, long]
+    raise ValueError(f"the paper book records {', '.join(s.upper() for s in STRATEGIES)}; "
+                     f"got {strategy!r}")
+
+
+def _package_quote(legs: list[dict]) -> tuple[float | None, float | None]:
+    """Net mid and summed half-spread of the package at entry -- what the
+    fill calibration needs to recover the realised slippage fraction."""
+    net_mid, half = 0.0, 0.0
+    for leg in legs:
+        bid, ask = leg.get("quote_bid"), leg.get("quote_ask")
+        if bid is None or ask is None or ask < bid:
+            return None, None
+        sign = -1.0 if leg["side"] == "short" else 1.0
+        net_mid -= sign * leg["qty"] * (bid + ask) / 2.0
+        half += leg["qty"] * (ask - bid) / 2.0
+    return net_mid, half
+
+
+def _fee_sides(legs: list[dict], contracts: int, opening: bool) -> list[tuple[str, int]]:
+    out = []
+    for leg in legs:
+        short = leg["side"] == "short"
+        side = ("sell" if short else "buy") if opening else ("buy" if short else "sell")
+        out.append((side, contracts * int(leg.get("qty") or 1)))
+    return out
+
+
+PREDICTION_KEYS = re.compile(
+    r"^(pop|p_hit_\d+|median_days_\d+|p_max_loss|p_touch|p_assign|p_short_itm|p_roll)_blend$")
+
+
+def predictions_from_recommendation(rec: dict) -> list[tuple[str, str, float]]:
+    """(metric, model, value) triples the engine claimed at entry."""
+    out = []
+    for key, value in rec.items():
+        match = PREDICTION_KEYS.match(str(key))
+        number = _num(value)
+        if match and number is not None:
+            out.append((match.group(1), "blend", number))
+    if _num(rec.get("prob_otm_empirical")) is not None:
+        out.append(("pop", "empirical", float(rec["prob_otm_empirical"])))
+    if _num(rec.get("prob_touch")) is not None:
+        out.append(("p_touch", "empirical", float(rec["prob_touch"])))
+    if _num(rec.get("prob_max_loss")) is not None:
+        out.append(("p_max_loss", "empirical", float(rec["prob_max_loss"])))
+    return out
 
 
 # --- Accepting a recommendation -------------------------------------------
@@ -140,7 +301,7 @@ def migrate_legacy_trade_log() -> int:
 @dataclass
 class AcceptResult:
     position_id: int
-    cycle_id: int
+    cycle_id: int | None
     contracts: int
     actual_fill: float
     modelled_fill: float
@@ -150,48 +311,90 @@ class AcceptResult:
     message: str
 
 
-def accept(recommendation: dict, contracts: int | None = None,
-            actual_fill: float | None = None, entry_date: dt.date | None = None,
-            run_id: str | None = None, notes: str = "") -> AcceptResult:
-    """Record an accepted trade.
+def describe(strategy: str, ticker: str, expiration, strike: float,
+             long_strike: float | None = None) -> str:
+    if strategy == "pcs" and long_strike is not None:
+        return f"{ticker} {expiration} ${strike:g}/${long_strike:g} put spread"
+    return f"{ticker} {expiration} ${strike:g} put"
 
-    `actual_fill` is what you really got in the executing account. Leave it None
-    and the modelled fill is used, but the row is still marked so calibration
-    can exclude it -- an assumed fill is not evidence about slippage.
+
+def accept(recommendation: dict, contracts: int | None = None,
+           actual_fill: float | None = None, entry_date: dt.date | None = None,
+           run_id: str | None = None, notes: str = "",
+           leg_fills: list[float] | None = None,
+           _cycle_id: int | None = None, _rolled_from: int | None = None,
+           _rolls_used: int = 0) -> AcceptResult:
+    """Record an accepted trade -- a cash-secured put or a put credit spread.
+
+    `actual_fill` is the NET credit you really got in the executing account
+    (per share). Leave it None and the modelled fill is used, but the row is
+    still marked so calibration can exclude it -- an assumed fill is not
+    evidence about slippage. For a spread you can give `leg_fills` instead
+    (one price per leg, in leg order: short, long); the net is derived.
 
     `contracts` overrides the recommended size; you may have taken less because
     the fill dried up, or more because you disagreed with the cap. Either way,
     what is recorded is what happened.
     """
     cfg = load_config().get("execution", {})
-    if not cfg.get("allow_manual_fill_override", True) and actual_fill is not None:
+    if not cfg.get("allow_manual_fill_override", True) and (
+            actual_fill is not None or leg_fills):
         raise ValueError("manual fill override is disabled in config")
 
     strategy = recommendation.get("strategy") or "csp"
-    if strategy != "csp":
-        raise ValueError(f"the paper book records single-leg CSPs only; {strategy.upper()} "
-                         f"needs the multi-leg schema that arrives in Phase 15")
+    legs = legs_from_recommendation({**recommendation, "strategy": strategy})
     ticker = str(recommendation["ticker"]).upper()
     strike = float(recommendation["strike"])
+    long_strike = float(recommendation["long_strike"]) if strategy == "pcs" else None
     expiration = pd.Timestamp(recommendation["expiration"]).date()
     modelled = float(recommendation["modelled_fill"])
     size = int(contracts if contracts is not None else recommendation["contracts"])
     if size < 1:
         raise ValueError("contracts must be at least 1")
 
+    if leg_fills:
+        if len(leg_fills) != len(legs):
+            raise ValueError(f"{len(legs)} leg fill(s) needed, got {len(leg_fills)}")
+        for leg, price in zip(legs, leg_fills):
+            leg["entry_price"] = float(price)
+        if actual_fill is None:
+            actual_fill = sum((1 if l["side"] == "short" else -1) * l["qty"] * l["entry_price"]
+                              for l in legs)
+    elif len(legs) == 1:
+        legs[0]["entry_price"] = float(actual_fill) if actual_fill is not None else modelled
+
     fill = float(actual_fill) if actual_fill is not None else modelled
+    if strategy == "pcs" and not 0 < fill < abs(strike - long_strike):
+        raise ValueError(f"a put credit spread's net credit must be between 0 and the "
+                         f"width ${abs(strike - long_strike):g}; got ${fill:.2f}")
     slippage = fill - modelled
     entry_date = entry_date or dt.date.today()
-    entry_fees = costs.option_open(size, "sell").total
-    collateral = strike * 100.0 * size
+    entry_fees = costs.legs_open(_fee_sides(legs, size, opening=True)).total
+    width = abs(strike - long_strike) if long_strike is not None else None
+    if strategy == "pcs":
+        max_loss = (width - fill) * 100.0 * size
+        collateral = max_loss
+    else:
+        max_loss = (strike - fill) * 100.0 * size
+        collateral = strike * 100.0 * size
     net_credit = fill * 100.0 * size - entry_fees
+    net_mid, half = _package_quote(legs)
+    predictions = predictions_from_recommendation(recommendation)
+    pop = next((v for m, model, v in predictions if m == "pop" and model == "blend"),
+               _num(recommendation.get("prob_otm_empirical")))
 
     con = _connect()
     try:
-        cycle_id = con.execute(
-            "INSERT INTO cycles (ticker, state, opened_date, total_premium, total_fees) "
-            "VALUES (?, 'put_open', ?, ?, ?) RETURNING cycle_id",
-            [ticker, entry_date, fill * 100.0 * size, entry_fees]).fetchone()[0]
+        cycle_id = _cycle_id
+        if strategy == "csp" and cycle_id is None:
+            cycle_id = con.execute(
+                "INSERT INTO cycles (ticker, state, opened_date, total_premium, total_fees) "
+                "VALUES (?, 'put_open', ?, ?, ?) RETURNING cycle_id",
+                [ticker, entry_date, fill * 100.0 * size, entry_fees]).fetchone()[0]
+        elif cycle_id is not None:
+            con.execute("UPDATE cycles SET state = 'put_open', "
+                        "total_premium = total_premium + ?, total_fees = total_fees + ? "
+                        "WHERE cycle_id = ?", [fill * 100.0 * size, entry_fees, cycle_id])
 
         position_id = con.execute(
             """INSERT INTO paper_positions
@@ -200,62 +403,167 @@ def accept(recommendation: dict, contracts: int | None = None,
                 entry_date, entry_fees,
                 status, collateral, rec_prob_otm, rec_expected_value,
                 rec_ev_annualised, rec_iv_rv, rec_sample, rec_rationale,
-                entered_by, run_id, notes)
-               VALUES (?, ?, 'csp', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?, ?) RETURNING id""",
-            [cycle_id, ticker, strike, expiration, size, modelled,
+                entered_by, run_id, notes,
+                long_strike, width, max_loss, settlement_type, root_symbol,
+                quote_net_mid, quote_half_spread, rec_pop, rec_headline_policy,
+                rolled_from, rolls_used)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id""",
+            [cycle_id, ticker, strategy, strike, expiration, size, modelled,
              fill if actual_fill is not None else None, slippage,
-             recommendation.get("bid"), recommendation.get("ask"),
-             recommendation.get("mid"),
+             _num(recommendation.get("bid")), _num(recommendation.get("ask")),
+             _num(recommendation.get("mid")),
              entry_date, entry_fees,
-             collateral, recommendation.get("prob_otm_empirical"),
-             recommendation.get("expected_value"),
-             recommendation.get("ev_annualised"), recommendation.get("iv_rv_ratio"),
+             collateral, _num(recommendation.get("prob_otm_empirical")),
+             _num(recommendation.get("expected_value")),
+             _num(recommendation.get("ev_annualised")),
+             _num(recommendation.get("iv_rv_ratio")),
              recommendation.get("sample_label"), recommendation.get("rationale"),
-             "manual", run_id, notes]).fetchone()[0]
+             "manual", run_id, notes,
+             long_strike, width, max_loss,
+             _settlement(recommendation, ticker),
+             recommendation.get("root_symbol"),
+             net_mid, half, pop, recommendation.get("headline_policy"),
+             _rolled_from, int(_rolls_used)]).fetchone()[0]
+
+        for index, leg in enumerate(legs):
+            con.execute(
+                "INSERT INTO paper_legs (position_id, leg_index, option_type, side, strike, "
+                "expiration, qty, entry_price, modelled_price, quote_bid, quote_ask, "
+                "quote_mid, iv, delta, root_symbol) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [position_id, index, leg["option_type"], leg["side"], leg["strike"],
+                 leg["expiration"], leg["qty"], leg.get("entry_price"),
+                 leg.get("quote_mid"), leg.get("quote_bid"), leg.get("quote_ask"),
+                 leg.get("quote_mid"), leg.get("iv"), leg.get("delta"),
+                 leg.get("root_symbol")])
+        for metric, model, value in predictions:
+            con.execute("INSERT INTO paper_predictions VALUES (?, ?, ?, ?)",
+                        [position_id, metric, model, value])
     finally:
         con.close()
 
-    note = (f"Recorded {size} {ticker} {expiration} ${strike:g} put at ${fill:.2f}"
+    what = describe(strategy, ticker, expiration, strike, long_strike)
+    note = (f"Recorded {size} {what} at ${fill:.2f}"
             + (f" ({slippage:+.3f} vs modelled ${modelled:.2f})"
                if actual_fill is not None else " (modelled fill -- excluded from "
                                                "slippage calibration)"))
     return AcceptResult(position_id, cycle_id, size, fill, modelled, slippage,
-                         net_credit, collateral, note)
+                        net_credit, collateral, note)
 
 
 # --- Lifecycle -------------------------------------------------------------
 
+def _position(con, position_id: int) -> dict:
+    frame = con.execute("SELECT * FROM paper_positions WHERE id = ?", [position_id]).fetchdf()
+    if frame.empty:
+        raise ValueError(f"no paper position {position_id}")
+    return frame.iloc[0].to_dict()
+
+
+def _legs(con, position_id: int) -> pd.DataFrame:
+    return con.execute("SELECT * FROM paper_legs WHERE position_id = ? ORDER BY leg_index",
+                       [position_id]).fetchdf()
+
+
+def settlement_value(legs: pd.DataFrame, price: float) -> tuple[float, list[float], int]:
+    """Net debit per share to settle the package at `price` (short intrinsic
+    minus long intrinsic), each leg's intrinsic, and how many legs are ITM."""
+    values, net, itm = [], 0.0, 0
+    for _, leg in legs.iterrows():
+        k = float(leg["strike"])
+        value = max(k - price, 0.0) if leg["option_type"] == "put" else max(price - k, 0.0)
+        values.append(value)
+        itm += value > 0
+        net += (1 if leg["side"] == "short" else -1) * int(leg["qty"] or 1) * value
+    return net, values, itm
+
+
 def close_position(position_id: int, status: str, exit_date: dt.date | None = None,
-                    exit_price: float | None = None, notes: str | None = None) -> None:
-    """Mark an outcome. `exit_price` is premium paid to close, 0 for expiry."""
-    if status not in STATUSES:
-        raise ValueError(f"status must be one of {STATUSES}")
+                   exit_price: float | None = None, notes: str | None = None,
+                   settlement_price: float | None = None) -> None:
+    """Mark an outcome.
+
+    `exit_price` is the NET debit per share paid to close (0 for expiry). For
+    a spread that finishes in the money use status `settled` with the
+    underlying's `settlement_price`: the debit and the exercise/assignment
+    fees follow from it. (A physically settled equity spread with only the
+    short leg in the money leaves you holding shares; the ledger books the
+    loss at the settlement price and says so in the notes.)
+    """
+    if status not in STATUSES or status == "open":
+        raise ValueError(f"status must be one of {STATUSES[1:]}")
     exit_date = exit_date or dt.date.today()
 
     con = _connect()
     try:
-        row = con.execute(
-            "SELECT cycle_id, ticker, contracts, strike, actual_fill, modelled_fill "
-            "FROM paper_positions WHERE id = ?", [position_id]).fetchone()
-        if row is None:
-            raise ValueError(f"no paper position {position_id}")
-        cycle_id, ticker, contracts, strike, actual, modelled = row
-        entry_fill = actual if actual is not None else modelled
+        row = _position(con, position_id)
+        if row["status"] != "open":
+            raise ValueError(f"position {position_id} is already {row['status']}")
+        strategy = row.get("strategy") or "csp"
+        cycle_id, ticker = row.get("cycle_id"), row["ticker"]
+        cycle_id = None if cycle_id is None or pd.isna(cycle_id) else int(cycle_id)
+        contracts, strike = int(row["contracts"]), float(row["strike"])
+        entry_fill = row["actual_fill"] if pd.notna(row["actual_fill"]) else row["modelled_fill"]
+        legs = _legs(con, position_id)
+        leg_exits: list[float | None] = [None] * len(legs)
+        extra_note = None
 
-        if status == "expired_otm":
-            exit_fees, exit_price = costs.option_expire(contracts).total, 0.0
-        elif status == "assigned":
-            exit_fees, exit_price = costs.assignment(contracts).total, 0.0
+        if strategy == "pcs":
+            if status == "assigned":
+                raise ValueError("a spread that finishes in the money is 'settled' "
+                                 "(give the settlement price), not 'assigned'")
+            if status == "expired_otm":
+                exit_fees, exit_price = 0.0, 0.0
+                leg_exits = [0.0] * len(legs)
+            elif status == "settled":
+                if settlement_price is None:
+                    raise ValueError("settling a spread needs the underlying's settlement price")
+                exit_price, leg_exits, itm = settlement_value(legs, float(settlement_price))
+                cash = str(row.get("settlement_type") or "") == "cash"
+                fees = costs.vertical_exit_fees(contracts, cash)
+                exit_fees = fees["max_loss"] if itm >= 2 else fees["short_itm"] if itm else 0.0
+                if itm == 1 and not cash:
+                    extra_note = ("short leg assigned: the account holds the shares; the "
+                                  "ledger books the loss at the settlement price")
+            else:
+                exit_fees = costs.legs_close(_fee_sides(
+                    legs.to_dict("records"), contracts, opening=False)).total
+                exit_price = float(exit_price or 0.0)
         else:
-            exit_fees = costs.option_close(contracts, "buy").total
-            exit_price = float(exit_price or 0.0)
+            if status == "settled":
+                raise ValueError("a cash-secured put that finishes in the money is 'assigned'")
+            if status == "expired_otm":
+                exit_fees, exit_price = costs.option_expire(contracts).total, 0.0
+                leg_exits = [0.0]
+            elif status == "assigned":
+                exit_fees, exit_price = costs.assignment(contracts).total, 0.0
+            else:
+                exit_fees = costs.option_close(contracts, "buy").total
+                exit_price = float(exit_price or 0.0)
+                leg_exits = [exit_price]
+
+        final_pct = ((float(entry_fill) - exit_price) / float(entry_fill)
+                     if entry_fill and status != "assigned" else None)
+        seen = row.get("max_profit_pct_seen")
+        seen = None if seen is None or pd.isna(seen) else float(seen)
+        if final_pct is not None:
+            seen = final_pct if seen is None else max(seen, final_pct)
+        note = "; ".join(x for x in (notes, extra_note) if x) or None
 
         con.execute(
             "UPDATE paper_positions SET status = ?, exit_date = ?, exit_price = ?, "
-            "exit_fees = ?, notes = COALESCE(?, notes) WHERE id = ?",
-            [status, exit_date, exit_price, exit_fees, notes, position_id])
+            "exit_fees = ?, notes = COALESCE(?, notes), settlement_price = ?, "
+            "max_profit_pct_seen = ? WHERE id = ?",
+            [status, exit_date, exit_price, exit_fees, note, settlement_price, seen,
+             position_id])
+        for (_, leg), value in zip(legs.iterrows(), leg_exits):
+            if value is not None:
+                con.execute("UPDATE paper_legs SET exit_price = ? WHERE leg_id = ?",
+                            [value, int(leg["leg_id"])])
 
+        if cycle_id is None:
+            return
         if status == "assigned":
             # Assignment is a capital event, not just a P&L event: cash becomes
             # shares whose basis is the strike less every premium collected
@@ -268,7 +576,7 @@ def close_position(position_id: int, status: str, exit_date: dt.date | None = No
                 [cycle_id, ticker, 100 * contracts, exit_date, float(strike),
                  basis, position_id])
             con.execute("UPDATE cycles SET state = 'shares_held' WHERE cycle_id = ?",
-                         [cycle_id])
+                        [cycle_id])
         elif status in ("expired_otm", "closed_early"):
             con.execute(
                 "UPDATE cycles SET state = 'closed', closed_date = ? WHERE cycle_id = ?",
@@ -280,29 +588,154 @@ def close_position(position_id: int, status: str, exit_date: dt.date | None = No
         con.close()
 
 
-def list_positions(status: str | None = None) -> pd.DataFrame:
+# Index roots whose options settle in cash (no shares change hands), for rows
+# that do not carry the registry's `settlement`.
+_CASH_SETTLED_HINT = {"SPX", "SPXW", "XSP", "NDX", "NDXP", "RUT", "RUTW", "VIX", "DJX"}
+
+
+def _settlement(rec: dict, ticker: str) -> str:
+    """'cash' or 'physical' -- decides the fees when a spread settles ITM."""
+    value = str(rec.get("settlement") or rec.get("settlement_type") or "").lower()
+    if value in ("cash", "physical"):
+        return value
+    root = str(rec.get("root_symbol") or ticker).upper().lstrip("^")
+    cash = root in _CASH_SETTLED_HINT or ticker.lstrip("^") in _CASH_SETTLED_HINT
+    return "cash" if cash else "physical"
+
+
+@dataclass
+class RollResult:
+    closed_id: int
+    opened: AcceptResult
+    close_debit: float
+    new_credit: float
+    net_per_share: float
+    message: str
+
+
+def roll_position(position_id: int, close_debit: float, new_expiration,
+                  new_strike: float, new_credit: float,
+                  new_long_strike: float | None = None, contracts: int | None = None,
+                  roll_date: dt.date | None = None, notes: str = "") -> RollResult:
+    """Roll: buy the position back for `close_debit` (net, per share) and open
+    the replacement at `new_credit`. Recorded as two positions -- the old one
+    `rolled`, the new one linked by `rolled_from` -- so each keeps its own
+    fill, fees and outcome. A CSP roll stays in the same wheel cycle.
+
+    Rolls are meant to be for a net credit (`management.*.require_net_credit_to_roll`);
+    a debit roll is recorded, because it happened, and the message says so.
+    """
     con = _connect()
     try:
-        query = "SELECT * FROM paper_positions"
-        params: list = []
-        if status:
-            query += " WHERE status = ?"
-            params.append(status)
-        query += " ORDER BY entry_date DESC, id DESC"
-        return con.execute(query, params).fetchdf()
+        old = _position(con, position_id)
     finally:
         con.close()
+    if old["status"] != "open":
+        raise ValueError(f"position {position_id} is already {old['status']}")
+    strategy = old.get("strategy") or "csp"
+    if strategy == "pcs" and new_long_strike is None:
+        width = float(old.get("width") or 0.0)
+        new_long_strike = float(new_strike) - width
+    roll_date = roll_date or dt.date.today()
+    close_position(position_id, "rolled", roll_date, close_debit,
+                   notes=f"rolled; {notes}".strip("; "))
+    cycle = old.get("cycle_id")
+    rec = {"ticker": old["ticker"], "strategy": strategy, "strike": float(new_strike),
+           "long_strike": new_long_strike, "expiration": new_expiration,
+           "modelled_fill": float(new_credit),
+           "contracts": int(contracts or old["contracts"]),
+           "settlement": old.get("settlement_type"),
+           "root_symbol": old.get("root_symbol")}
+    rolls = int(old.get("rolls_used") or 0) + 1 if pd.notna(old.get("rolls_used")) else 1
+    opened = accept(rec, actual_fill=float(new_credit), entry_date=roll_date,
+                    run_id=old.get("run_id"), notes=f"roll of #{position_id}",
+                    _cycle_id=None if cycle is None or pd.isna(cycle) else int(cycle),
+                    _rolled_from=position_id, _rolls_used=rolls)
+    net = float(new_credit) - float(close_debit)
+    message = (f"Rolled #{position_id} into #{opened.position_id}: paid ${close_debit:.2f}, "
+               f"took in ${new_credit:.2f}, net {'credit' if net > 0 else 'DEBIT'} "
+               f"${abs(net):.2f}/share (roll {rolls})")
+    return RollResult(position_id, opened, float(close_debit), float(new_credit), net, message)
+
+
+def record_mark(position_id: int, mark: float, spot: float | None = None,
+                mark_date: dt.date | None = None, source: str = "manual") -> float | None:
+    """Store a mark (net debit to close, per share) for an open position and
+    return its profit as a fraction of max profit. The best one seen is kept
+    on the position: it decides whether a P(reach X%) prediction came true."""
+    mark_date = mark_date or dt.date.today()
+    con = _connect()
+    try:
+        row = _position(con, position_id)
+        fill = row["actual_fill"] if pd.notna(row["actual_fill"]) else row["modelled_fill"]
+        pct = (float(fill) - float(mark)) / float(fill) if fill else None
+        con.execute("DELETE FROM paper_marks WHERE position_id = ? AND mark_date = ? "
+                    "AND source = ?", [position_id, mark_date, source])
+        con.execute("INSERT INTO paper_marks VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [position_id, mark_date, spot, float(mark), pct, source,
+                     dt.datetime.now()])
+        if pct is not None:
+            con.execute("UPDATE paper_positions SET max_profit_pct_seen = "
+                        "greatest(coalesce(max_profit_pct_seen, -1e9), ?) WHERE id = ?",
+                        [pct, position_id])
+        return pct
+    finally:
+        con.close()
+
+
+def _query(sql: str, params: list | None = None) -> pd.DataFrame:
+    con = _connect()
+    try:
+        return con.execute(sql, params or []).fetchdf()
+    finally:
+        con.close()
+
+
+def list_positions(status: str | None = None) -> pd.DataFrame:
+    query = "SELECT * FROM paper_positions"
+    params: list = []
+    if status:
+        query += " WHERE status = ?"
+        params.append(status)
+    return _query(query + " ORDER BY entry_date DESC, id DESC", params)
+
+
+def list_legs(position_ids: list[int] | None = None) -> pd.DataFrame:
+    if position_ids is not None and not len(position_ids):
+        return _query("SELECT * FROM paper_legs WHERE false")
+    query = "SELECT * FROM paper_legs"
+    if position_ids is not None:
+        query += f" WHERE position_id IN ({', '.join(str(int(i)) for i in position_ids)})"
+    return _query(query + " ORDER BY position_id, leg_index")
+
+
+def list_marks(position_id: int | None = None) -> pd.DataFrame:
+    if position_id is None:
+        return _query("SELECT * FROM paper_marks ORDER BY position_id, mark_date")
+    return _query("SELECT * FROM paper_marks WHERE position_id = ? ORDER BY mark_date",
+                  [position_id])
+
+
+def list_predictions(position_id: int | None = None) -> pd.DataFrame:
+    if position_id is None:
+        return _query("SELECT * FROM paper_predictions ORDER BY position_id, metric")
+    return _query("SELECT * FROM paper_predictions WHERE position_id = ? ORDER BY metric",
+                  [position_id])
 
 
 def list_share_lots(open_only: bool = True) -> pd.DataFrame:
-    con = _connect()
-    try:
-        query = "SELECT * FROM share_lots"
-        if open_only:
-            query += " WHERE disposed_date IS NULL"
-        return con.execute(query + " ORDER BY acquired_date DESC").fetchdf()
-    finally:
-        con.close()
+    query = "SELECT * FROM share_lots"
+    if open_only:
+        query += " WHERE disposed_date IS NULL"
+    return _query(query + " ORDER BY acquired_date DESC")
+
+
+def leg_text(position: dict | pd.Series, legs: pd.DataFrame | None = None) -> str:
+    """'$748/$738 put spread' or '$61p' for display."""
+    long = position.get("long_strike")
+    if position.get("strategy") == "pcs" and long is not None and pd.notna(long):
+        return f"${float(position['strike']):g}/${float(long):g} put spread"
+    return f"${float(position['strike']):g}p"
 
 
 # --- Calibration -----------------------------------------------------------
@@ -342,6 +775,15 @@ def slippage_report() -> dict:
     }
 
 
+def realized(frame: pd.DataFrame) -> pd.Series:
+    """Dollar P&L of closed positions, net of every fee. The exit price is the
+    net debit paid, so the same formula serves a put and a spread."""
+    fill = frame["actual_fill"].fillna(frame["modelled_fill"]).astype(float)
+    exit_price = frame["exit_price"].fillna(0.0).astype(float)
+    fees = (frame["entry_fees"].fillna(0.0) + frame["exit_fees"].fillna(0.0)).astype(float)
+    return (fill - exit_price) * 100 * frame["contracts"].astype(float) - fees
+
+
 def performance() -> dict:
     """Realised outcomes over closed positions, net of every fee."""
     frame = list_positions()
@@ -351,26 +793,33 @@ def performance() -> dict:
     if closed.empty:
         return {"n_closed": 0, "n_open": int(len(frame))}
 
-    fill = closed["actual_fill"].fillna(closed["modelled_fill"]).astype(float)
-    exit_price = closed["exit_price"].fillna(0.0).astype(float)
-    fees = (closed["entry_fees"].fillna(0.0) + closed["exit_fees"].fillna(0.0)).astype(float)
-    contracts = closed["contracts"].astype(float)
-    closed["realized"] = (fill - exit_price) * 100 * contracts - fees
-
+    closed["realized"] = realized(closed)
     days = (pd.to_datetime(closed["exit_date"]) - pd.to_datetime(closed["entry_date"])
             ).dt.days.clip(lower=1)
     collateral = closed["collateral"].astype(float).replace(0, float("nan"))
     closed["annualised"] = (closed["realized"] / collateral) * (365.0 / days)
+    closed["strategy"] = closed["strategy"].fillna("csp")
+
+    by_strategy = {}
+    for name, group in closed.groupby("strategy"):
+        by_strategy[name] = {
+            "n_closed": int(len(group)),
+            "profit_rate": float((group["realized"] > 0).mean()),
+            "total_realized": float(group["realized"].sum()),
+            "mean_annualised": float(group["annualised"].mean()),
+        }
 
     return {
         "n_closed": int(len(closed)),
         "n_open": int((frame["status"] == "open").sum()),
         "win_rate": float((closed["status"] == "expired_otm").mean()),
+        "profit_rate": float((closed["realized"] > 0).mean()),
         "assignment_rate": float((closed["status"] == "assigned").mean()),
         "total_realized": float(closed["realized"].sum()),
         "mean_annualised": float(closed["annualised"].mean()),
         "predicted_win_rate": float(closed["rec_prob_otm"].dropna().mean())
         if closed["rec_prob_otm"].notna().any() else float("nan"),
+        "by_strategy": by_strategy,
     }
 
 
@@ -384,7 +833,7 @@ def calibration() -> dict:
     stats = performance()
     if stats.get("n_closed", 0) < 10:
         return {**stats, "verdict": "not enough closed positions to judge "
-                                     "(need ~10, ideally 30+)"}
+                                    "(need ~10, ideally 30+)"}
     predicted = stats.get("predicted_win_rate")
     actual = stats.get("win_rate")
     if not (predicted == predicted):

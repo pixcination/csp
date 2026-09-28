@@ -168,7 +168,7 @@ def main() -> int:
 
     with reporter.stage("sweep", "Cross-sectional sweep", total=len(tickers) * cells):
         for ticker in tickers:
-            daily = load_daily(ticker, basis="total")
+            daily = load_daily(ticker, basis="price", with_dividends=True)
             if daily.empty:
                 skipped.append(ticker)
                 reporter.advance(cells, note=f"{ticker} no daily history")

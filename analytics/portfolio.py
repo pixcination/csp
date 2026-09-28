@@ -475,11 +475,13 @@ def recycling_schedule() -> pd.DataFrame:
     if not positions.empty:
         for _, row in positions.iterrows():
             rows.append({
-                "kind": "short_put", "ticker": row["ticker"],
+                "kind": "put_spread" if row.get("strategy") == "pcs" else "short_put",
+                "ticker": row["ticker"],
                 "frees_on": pd.Timestamp(row["expiration"]).date(),
                 "capital": float(row.get("collateral") or 0.0),
                 "certain": True,
-                "note": "returns at expiry unless assigned",
+                "note": ("returns at expiry, or earlier if closed" if row.get("strategy") == "pcs"
+                         else "returns at expiry unless assigned"),
             })
 
     lots = paper.list_share_lots(open_only=True)

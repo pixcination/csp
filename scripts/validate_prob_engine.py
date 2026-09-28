@@ -3,6 +3,7 @@ Walk-forward validation of the probability engine (Phase 13).
 
     python scripts/validate_prob_engine.py                  # SPY QQQ IWM AAPL KO, 30 DTE
     python scripts/validate_prob_engine.py --tickers SPY --dte 7 --years 5 --step 5
+    python scripts/validate_prob_engine.py --strategy pcs --width-pct 0.02   # spreads
 
 For entry dates every `--step` trading days over the last `--years`:
 
@@ -21,7 +22,8 @@ For entry dates every `--step` trading days over the last `--years`:
    happened.
 
 Output: calibration by probability bin (predicted vs observed frequency),
-Brier score per model and target, written to data/validation/:
+Brier score per model and target, written to data/validation/ (spreads: prob_engine_pcs_*, where the extra
+`max_loss` target scores P(max loss)):
     prob_engine_trades.parquet    one row per entry x model x target
     prob_engine_calibration.parquet
     prob_engine_summary.json
@@ -71,24 +73,33 @@ def strike_for_delta(spot: float, vol: float, days: float, rate: float, delta: f
     return float(spot * math.exp(-(d1 * vol * math.sqrt(t)) + (rate + 0.5 * vol * vol) * t))
 
 
-def observe(closes: np.ndarray, strike: float, credit: float, vol: float, dte_cal: int,
-            rate: float) -> dict:
-    """What actually happened to the synthetic put along the real path."""
+def observe(closes: np.ndarray, position: Position, dte_cal: int, rate: float) -> dict:
+    """What actually happened to the synthetic position along the real path:
+    every leg repriced daily at its own entry IV (the same assumption the
+    entry price used)."""
     steps = len(closes)
     cal = dte_cal * np.arange(1, steps + 1) / steps
     tau = np.maximum(dte_cal - cal, 0.0) / 365.0
     tau[-1] = 0.0
-    price, _ = pe.bs_price(closes, strike, tau, np.full(steps, vol), rate, "put")
-    pnl = credit - price
-    out = {"obs_hit_100": float(pnl[-1] >= credit - 1e-9),
-           "obs_touch": float((closes <= strike).any())}
+    value = np.zeros(steps)
+    for leg in position.legs:
+        price, _ = pe.bs_price(closes, leg.strike, tau, np.full(steps, leg.iv), rate,
+                               leg.option_type)
+        value += leg.sign * leg.qty * price
+    pnl = position.credit + value
+    max_profit = position.max_profit
+    short = max(l.strike for l in position.legs if l.side == "short")
+    out = {"obs_hit_100": float(pnl[-1] >= max_profit - 1e-9),
+           "obs_touch": float((closes <= short).any())}
     for x in (25, 50):
-        out[f"obs_hit_{x}"] = float((pnl >= x / 100.0 * credit).any())
+        out[f"obs_hit_{x}"] = float((pnl >= x / 100.0 * max_profit).any())
+    if len(position.legs) > 1:
+        out["obs_max_loss"] = float(pnl[-1] <= -position.max_loss + 1e-9)
     return out
 
 
 def run(tickers: list[str], dte: int, years: int, step: int, delta: float,
-        n_paths: int) -> dict:
+        n_paths: int, strategy: str = "csp", width_pct: float = 0.02) -> dict:
     from analytics import indicators
     from data_sources.yfinance_sync import load_daily
 
@@ -114,13 +125,27 @@ def run(tickers: list[str], dte: int, years: int, step: int, delta: float,
             strike = strike_for_delta(spot, vol, dte, cfg.rate, delta)
             credit = float(pe.bs_price(np.array(spot), strike, np.array(dte / 365.0),
                                        np.array(vol), cfg.rate, "put")[0])
-            position = Position("csp", ticker, [Leg("put", "short", strike, "x", iv=vol)],
-                                credit, collateral_per_contract=strike * 100)
-            spec = pe.TradeSpec(position, spot, dte, steps, 1, strike * 100)
+            legs = [Leg("put", "short", strike, "x", iv=vol)]
+            if strategy == "pcs":
+                # Same IV for both legs: the proxy has no skew, so the spread's
+                # credit is the flat-vol difference.
+                long_k = strike - max(round(width_pct * spot), 1.0)
+                long_px = float(pe.bs_price(np.array(spot), long_k, np.array(dte / 365.0),
+                                            np.array(vol), cfg.rate, "put")[0])
+                legs.append(Leg("put", "long", long_k, "x", iv=vol))
+                position = Position("pcs", ticker, legs, credit - long_px)
+                bpr = position.max_loss * 100
+            else:
+                position = Position("csp", ticker, legs, credit,
+                                    collateral_per_contract=strike * 100)
+                bpr = strike * 100
+            if position.credit <= 0.01:
+                continue
+            spec = pe.TradeSpec(position, spot, dte, steps, 1, bpr)
             history = daily.iloc[: i + 1]
             paths = pe.ticker_paths(history, steps, cfg, rng, tech.iloc[: i + 1], None)
             result = pe.run_trade(spec, paths, TARGETS, cfg)
-            observed = observe(closes[i + 1: i + 1 + steps], strike, credit, vol, dte, cfg.rate)
+            observed = observe(closes[i + 1: i + 1 + steps], position, dte, cfg.rate)
             for model, r in list(result["models"].items()) + [("blend", result["blend"])]:
                 for target in TARGETS:
                     rows.append({"ticker": ticker, "entry": daily["date"].iloc[i].date(),
@@ -131,14 +156,19 @@ def run(tickers: list[str], dte: int, years: int, step: int, delta: float,
                              "model": model, "target": "touch",
                              "predicted": r.get("p_touch_short"),
                              "observed": observed["obs_touch"]})
+                if "obs_max_loss" in observed:
+                    rows.append({"ticker": ticker, "entry": daily["date"].iloc[i].date(),
+                                 "model": model, "target": "max_loss",
+                                 "predicted": r.get("p_max_loss"),
+                                 "observed": observed["obs_max_loss"]})
     trades = pd.DataFrame(rows).dropna(subset=["predicted"])
     trades["target"] = trades["target"].astype(str)
     return summarise(trades, tickers, dte, years, step, delta, n_paths,
-                     time.perf_counter() - started)
+                     time.perf_counter() - started, strategy, width_pct)
 
 
 def summarise(trades: pd.DataFrame, tickers, dte, years, step, delta, n_paths,
-              seconds) -> dict:
+              seconds, strategy: str = "csp", width_pct: float = 0.02) -> dict:
     bins = np.linspace(0, 1, 11)
     trades["bin"] = pd.cut(trades["predicted"], bins, include_lowest=True)
     calibration = (trades.groupby(["model", "target", "bin"], observed=True)
@@ -151,16 +181,20 @@ def summarise(trades: pd.DataFrame, tickers, dte, years, step, delta, n_paths,
                    mean_observed=("observed", "mean")).reset_index())
     scores["gap"] = scores["mean_predicted"] - scores["mean_observed"]
     out_dir = validation_dir()
-    trades.drop(columns="bin").to_parquet(out_dir / "prob_engine_trades.parquet", index=False)
-    calibration.to_parquet(out_dir / "prob_engine_calibration.parquet", index=False)
+    # CSP output keeps the Phase 13 file names; spreads get their own.
+    tag = "prob_engine" if strategy == "csp" else f"prob_engine_{strategy}"
+    trades.drop(columns="bin").to_parquet(out_dir / f"{tag}_trades.parquet", index=False)
+    calibration.to_parquet(out_dir / f"{tag}_calibration.parquet", index=False)
     summary = {"run_at": dt.datetime.now().isoformat(timespec="seconds"),
+               "strategy": strategy,
+               "width_pct": width_pct if strategy == "pcs" else None,
                "tickers": tickers, "dte": dte, "years": years, "step": step, "delta": delta,
                "n_paths": n_paths, "seconds": round(seconds, 1),
                "entries": int(trades.drop_duplicates(["ticker", "entry"]).shape[0]),
                "effective_entries_approx": int(trades.drop_duplicates(["ticker", "entry"]).shape[0]
                                                * step / max(round(dte * 252 / 365), 1)),
                "scores": scores.to_dict("records"), "caveats": CAVEATS}
-    (out_dir / "prob_engine_summary.json").write_text(json.dumps(summary, indent=2, default=str),
+    (out_dir / f"{tag}_summary.json").write_text(json.dumps(summary, indent=2, default=str),
                                                       encoding="utf-8")
     return summary
 
@@ -173,9 +207,13 @@ def main() -> int:
     ap.add_argument("--step", type=int, default=10, help="trading days between entries")
     ap.add_argument("--delta", type=float, default=-0.25)
     ap.add_argument("--paths", type=int, default=4000)
+    ap.add_argument("--strategy", choices=["csp", "pcs"], default="csp",
+                    help="pcs: a put spread with the long leg --width-pct of spot below")
+    ap.add_argument("--width-pct", type=float, default=0.02)
     args = ap.parse_args()
     summary = run([t.strip().upper() for t in args.tickers.split(",") if t.strip()],
-                  args.dte, args.years, args.step, args.delta, args.paths)
+                  args.dte, args.years, args.step, args.delta, args.paths,
+                  args.strategy, args.width_pct)
     print(f"{summary['entries']} entries (~{summary['effective_entries_approx']} effective) "
           f"in {summary['seconds']}s")
     frame = pd.DataFrame(summary["scores"])
