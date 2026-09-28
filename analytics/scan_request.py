@@ -33,8 +33,13 @@ WHAT IS APPLIED WHERE (Phase 11)
 Ranking and chain capture read the whole request. CSP construction applies
 the DTE window/targets, the delta range, `min_pop` (a gate on the empirical
 P(finish OTM)), `max_pct_capital` and `max_loss_per_trade` (contract caps),
-the account profile and the event overrides. Spread widths, the strike rule
-and PCS construction arrive in Phase 12; profit-target odds in Phase 13.
+the account profile and the event overrides. PCS construction (Phase 12)
+also applies the spread widths and the strike rule: `delta` (put delta
+nearest the middle of delta_range), `em_multiple` (highest strike at or below
+spot - em_multiple x EM), `support` (below the strongest respected support
+minus its median pierce depth), or `conservative` (the default: all three,
+and the lowest short strike that passes is the default choice).
+Profit-target odds arrive in Phase 13.
 """
 from __future__ import annotations
 
@@ -47,7 +52,7 @@ from core.paths import load_config
 
 STRATEGIES = ("csp", "pcs")
 RISK_MODES = ("delta_range", "min_pop", "max_loss_per_trade", "max_pct_capital")
-STRIKE_RULES = ("delta", "em_multiple", "support")
+STRIKE_RULES = ("conservative", "delta", "em_multiple", "support")
 UNIVERSE_KEYWORDS = ("all", "csp", "stock", "etf", "index")
 
 
@@ -73,7 +78,7 @@ class ScanRequest:
     top_n_underlyings: int | str = 15
     ranking_weights: str | dict | None = None
     event_policy_overrides: dict = field(default_factory=dict)
-    strike_rule: str = "delta"
+    strike_rule: str = "conservative"
     em_multiple: float = 1.0
     name: str = ""
 

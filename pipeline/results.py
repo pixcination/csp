@@ -102,14 +102,24 @@ def annotate_sheet(full: pd.DataFrame, selected: pd.DataFrame,
         return full
     out = full.copy()
 
+    # Phase 12: PCS rows share (ticker, expiration, short strike) across
+    # widths, so rows are matched on `trade_id` when both frames carry it.
+    use_id = "trade_id" in out.columns and all(
+        f is None or f.empty or "trade_id" in f.columns for f in (selected, proposed))
+
     def keys(frame: pd.DataFrame) -> set:
-        if frame is None or frame.empty or not set(KEY) <= set(frame.columns):
+        if frame is None or frame.empty:
+            return set()
+        if use_id:
+            return set(frame["trade_id"])
+        if not set(KEY) <= set(frame.columns):
             return set()
         return {(str(t), str(pd.Timestamp(e).date()), float(k))
                 for t, e, k in frame[KEY].itertuples(index=False)}
 
-    row_keys = [(str(t), str(pd.Timestamp(e).date()), float(k))
-                for t, e, k in out[KEY].itertuples(index=False)]
+    row_keys = list(out["trade_id"]) if use_id else [
+        (str(t), str(pd.Timestamp(e).date()), float(k))
+        for t, e, k in out[KEY].itertuples(index=False)]
     chosen, final = keys(selected), keys(proposed)
     out["selected"] = [k in chosen for k in row_keys]
     out["best_per_ticker"] = out["selected"]

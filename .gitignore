@@ -18,6 +18,7 @@ output/*.csv
 *.duckdb
 *.duckdb.wal
 *.parquet
+!tests/fixtures/**/*.parquet
 
 # The wheel ledger is USER DATA, not a cache. If you ever want it versioned,
 # add an explicit exception -- but it contains your position history.

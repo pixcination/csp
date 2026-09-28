@@ -150,24 +150,48 @@ def max_contracts_for_strike(strike: float, account: AccountState | None = None,
 
     Returns 0 contracts with readable reasons rather than raising, so a
     high-scoring name that cannot be traded shows *why* instead of vanishing.
+    Since Phase 12 this is `max_contracts_for_position` with one leg and
+    collateral = strike x 100 (numbers pinned by tests/test_phase12.py).
+    """
+    if strike <= 0:
+        return SizingResult(0, 0.0, 0.0, False, ("invalid strike",))
+    return max_contracts_for_position(
+        strike * 100.0, account, ticker_committed,
+        legs=[(open_interest, option_volume, "")], adv_dollars=adv_dollars,
+        notional_per_contract=strike * 100.0, capital_label="collateral")
+
+
+def max_contracts_for_position(per_contract: float, account: AccountState | None = None,
+                               ticker_committed: float = 0.0,
+                               legs: list[tuple] | None = None,
+                               adv_dollars: float | None = None,
+                               notional_per_contract: float | None = None,
+                               capital_label: str = "buying power") -> SizingResult:
+    """Contracts for any position (Phase 12).
+
+    `per_contract` is the capital one contract ties up (CSP collateral, or a
+    spread's max loss = its buying-power reduction). `legs` holds each leg's
+    (open interest, option volume, label): the liquidity caps apply to EVERY
+    leg, so the least liquid one binds. `notional_per_contract` is the
+    underlying exposure the ADV cap is measured in (short strike x 100).
     """
     liq = load_config().get("liquidity_limits", {})
     acct = account or account_from_config()
     cfg = acct.config
     reasons: list[str] = []
     limits: dict[str, float] = {}
+    legs = legs or [(None, None, "")]
+    notional_per_contract = notional_per_contract or per_contract
 
-    if strike <= 0:
-        return SizingResult(0, 0.0, 0.0, False, ("invalid strike",))
-
-    per_contract = strike * 100.0
+    if per_contract <= 0:
+        return SizingResult(0, 0.0, 0.0, False, ("no capital at risk to size against",))
     nlv = acct.net_liquidating_value
 
     # --- Capital ----------------------------------------------------------
     by_cash = math.floor(acct.deployable / per_contract)
     limits["cash"] = by_cash
     if by_cash < 1:
-        reasons.append(f"needs ${per_contract:,.0f} collateral, "
+        reasons.append(f"needs ${per_contract:,.0f} {capital_label}, "
                        f"only ${acct.deployable:,.0f} deployable")
 
     pos_cap = nlv * cfg.get("max_collateral_per_position_pct", 0.15)
@@ -177,7 +201,8 @@ def max_contracts_for_strike(strike: float, account: AccountState | None = None,
         reasons.append(
             f"one contract is ${per_contract:,.0f} = {per_contract / nlv:.1%} of the "
             f"account, over the {cfg.get('max_collateral_per_position_pct', 0.15):.0%} "
-            f"per-position cap (max tradable strike ~${pos_cap / 100:,.0f})")
+            f"per-position cap" + (f" (max tradable strike ~${pos_cap / 100:,.0f})"
+                                      if capital_label == "collateral" else ""))
 
     ticker_cap = nlv * cfg.get("max_collateral_per_ticker_pct", 0.20)
     by_ticker = math.floor(max(ticker_cap - ticker_committed, 0.0) / per_contract)
@@ -194,38 +219,41 @@ def max_contracts_for_strike(strike: float, account: AccountState | None = None,
         reasons.append(f"already at the {max_positions}-position limit")
         limits["position_count"] = 0
 
-    # --- Liquidity --------------------------------------------------------
+    # --- Liquidity (every leg; the thinnest binds) ---------------------------
     # These are what actually bind at portfolio scale. A contract count you
     # cannot fill is not a smaller trade, it is a different trade.
     min_oi = liq.get("min_open_interest", 250)
-    if open_interest is not None:
-        if open_interest < min_oi:
-            reasons.append(
-                f"open interest {open_interest:,.0f} is below the {min_oi:,} floor -- "
-                f"exiting or rolling this strike would move the market against you")
-            limits["open_interest"] = 0
-        else:
-            limits["open_interest"] = math.floor(
-                open_interest * liq.get("max_pct_of_open_interest", 0.03))
+    min_volume = liq.get("min_option_volume", 25)
+    pct_oi = liq.get("max_pct_of_open_interest", 0.03)
+    for leg in legs:
+        open_interest, option_volume = leg[0], leg[1]
+        label = f"{leg[2]}: " if len(leg) > 2 and leg[2] else ""
+        if open_interest is not None:
+            if open_interest < min_oi:
+                reasons.append(
+                    f"{label}open interest {open_interest:,.0f} is below the {min_oi:,} floor -- "
+                    f"exiting or rolling this strike would move the market against you")
+                by_oi = 0
+            else:
+                by_oi = math.floor(open_interest * pct_oi)
+            limits["open_interest"] = min(limits.get("open_interest", by_oi), by_oi)
 
-    if option_volume is not None:
-        min_volume = liq.get("min_option_volume", 25)
-        # Off-hours snapshots report zero volume; that is a stale field, not a
-        # dead contract, so fall back to open interest rather than rejecting.
-        if option_volume <= 0 and open_interest:
-            limits["option_volume"] = math.floor(
-                open_interest * liq.get("max_pct_of_open_interest", 0.03))
-        elif option_volume < min_volume:
-            reasons.append(f"only {option_volume:,.0f} contracts traded today "
-                           f"(floor {min_volume})")
-            limits["option_volume"] = 0
-        else:
-            limits["option_volume"] = math.floor(
-                option_volume * liq.get("max_pct_of_option_volume", 0.10))
+        if option_volume is not None:
+            # Off-hours snapshots report zero volume; that is a stale field, not a
+            # dead contract, so fall back to open interest rather than rejecting.
+            if option_volume <= 0 and open_interest:
+                by_volume = math.floor(open_interest * pct_oi)
+            elif option_volume < min_volume:
+                reasons.append(f"{label}only {option_volume:,.0f} contracts traded today "
+                               f"(floor {min_volume})")
+                by_volume = 0
+            else:
+                by_volume = math.floor(option_volume * liq.get("max_pct_of_option_volume", 0.10))
+            limits["option_volume"] = min(limits.get("option_volume", by_volume), by_volume)
 
     if adv_dollars:
         notional_cap = adv_dollars * liq.get("max_pct_of_underlying_adv", 0.005)
-        limits["underlying_adv"] = math.floor(notional_cap / per_contract)
+        limits["underlying_adv"] = math.floor(notional_cap / notional_per_contract)
 
     usable = {k: v for k, v in limits.items() if v is not None}
     contracts = max(min(usable.values()), 0) if usable else 0

@@ -166,6 +166,17 @@ def snapshot_dte_window(ref: SnapshotRef) -> tuple[int, int]:
     return 0, int(default)
 
 
+def snapshot_dropped(ref: SnapshotRef) -> list[dt.date]:
+    """Expirations inside the recorded window that the subscription cap
+    dropped when this snapshot was taken (Phase 12)."""
+    try:
+        under = pd.read_parquet(ref.underlying_path, columns=["expirations_dropped"])
+        text = under["expirations_dropped"].iloc[0]
+        return [dt.date.fromisoformat(d) for d in str(text).split(",") if d.strip()]             if pd.notna(text) else []
+    except Exception:
+        return []
+
+
 def needs_capture(ticker: str, now: dt.datetime | None = None,
                   dte_window: tuple[int, int] | None = None) -> tuple[bool, str]:
     """Should this ticker be re-pulled right now? Returns (yes, reason).
@@ -188,6 +199,14 @@ def needs_capture(ticker: str, now: dt.datetime | None = None,
         if dte_window[0] < have[0] or dte_window[1] > have[1]:
             return True, (f"snapshot covers {have[0]}-{have[1]} DTE, "
                           f"{dte_window[0]}-{dte_window[1]} requested")
+        # The subscription cap may have dropped expirations inside the
+        # recorded window (Phase 12: a weekly pull keeps the near ones).
+        today = (now or dt.datetime.now()).date()
+        missing = [d for d in snapshot_dropped(snapshot)
+                   if dte_window[0] <= (d - today).days <= dte_window[1]]
+        if missing:
+            return True, (f"{len(missing)} requested expiration(s) were dropped by the "
+                          f"subscription cap in this block's snapshot")
 
     if info.state is SessionState.RTH:
         max_age = dt.timedelta(minutes=cfg.get("rth_refresh_minutes", 20))
@@ -478,6 +497,7 @@ def capture(ticker: str, dte_max: int | None = None, dte_min: int = 0,
             "session_state": info.state.value,
             "dte_min": int(dte_min),
             "dte_max": int(dte_max),
+            "expirations_dropped": ",".join(listing["expirations_dropped"]),
         }])
 
         chain_path, under_path = _paths(ticker, block)

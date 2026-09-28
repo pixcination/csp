@@ -167,6 +167,10 @@ def accept(recommendation: dict, contracts: int | None = None,
     if not cfg.get("allow_manual_fill_override", True) and actual_fill is not None:
         raise ValueError("manual fill override is disabled in config")
 
+    strategy = recommendation.get("strategy") or "csp"
+    if strategy != "csp":
+        raise ValueError(f"the paper book records single-leg CSPs only; {strategy.upper()} "
+                         f"needs the multi-leg schema that arrives in Phase 15")
     ticker = str(recommendation["ticker"]).upper()
     strike = float(recommendation["strike"])
     expiration = pd.Timestamp(recommendation["expiration"]).date()

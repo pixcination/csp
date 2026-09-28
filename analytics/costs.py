@@ -257,3 +257,101 @@ def minimum_viable_credit(contracts: int = 1, max_drag: float = 0.10) -> float:
     """
     entry = option_open(contracts, "sell").total
     return round(entry / (max_drag * 100.0 * max(contracts, 1)), 4)
+
+
+# --- Multi-leg (Phase 12) --------------------------------------------------
+
+def legs_open(legs: list[tuple[str, int]]) -> Fees:
+    """Open several legs: `legs` = [(side, contracts)], side 'sell' | 'buy'.
+    The commission cap applies PER LEG (tastytrade: $10 per leg), which
+    `option_open` already enforces for each call."""
+    total = Fees()
+    for side, contracts in legs:
+        total = total + option_open(contracts, side)
+    return total
+
+
+def legs_close(legs: list[tuple[str, int]]) -> Fees:
+    """Close several legs: a short leg is bought back ('buy'), a long leg sold."""
+    total = Fees()
+    for side, contracts in legs:
+        total = total + option_close(contracts, side)
+    return total
+
+
+@dataclass(frozen=True)
+class SpreadEconomics:
+    contracts: int
+    gross_credit: float          # dollars
+    entry_fees: float
+    exit_fees: dict              # outcome -> dollars
+    max_loss: float              # dollars, before fees
+    bpr: float                   # buying-power reduction, dollars
+    cost_drag_pct: float         # entry fees / gross credit
+    net_credit: float            # gross - entry fees (if it expires worthless)
+    net_return_on_risk: float
+    net_annualized: float
+
+
+def vertical_exit_fees(contracts: int, cash_settled: bool) -> dict:
+    """Exit cost of a two-leg vertical in each way it can end.
+
+        expire_otm  both legs worthless -- free
+        close       buy back the short, sell the long before expiry
+        short_itm   short assigned / cash-settled, long expires worthless
+        max_loss    both in the money: short assigned and long exercised
+
+    Physically settled: each assignment or exercise is a $5 event plus the
+    share trades it creates (bought on assignment, sold again or delivered by
+    the long). Cash-settled index options settle in cash; the assignment /
+    exercise fee is still charged here -- the conservative reading until the
+    executing broker's statement shows otherwise.
+    EARLY ASSIGNMENT (American equity options): a short put deep in the money
+    with little extrinsic value left can be assigned before expiry, most often
+    ahead of an ex-dividend date; the long put still caps the loss, but the
+    account holds the shares overnight.
+    """
+    n = max(int(contracts), 1)
+    event = assignment(n).total
+    close = legs_close([("buy", n), ("sell", n)]).total
+    if cash_settled:
+        return {"expire_otm": 0.0, "close": close, "short_itm": event, "max_loss": 2 * event}
+    shares = 100 * n
+    return {"expire_otm": 0.0, "close": close,
+            "short_itm": event + stock_buy(shares).total,
+            "max_loss": 2 * event + stock_buy(shares).total}
+
+
+def vertical_economics(short_strike: float, long_strike: float, net_credit: float,
+                       contracts: int, dte: int, cash_settled: bool = False) -> SpreadEconomics:
+    """Economics of a credit vertical (e.g. a put credit spread) at a modelled
+    net credit per share."""
+    n = max(int(contracts), 1)
+    width = abs(short_strike - long_strike)
+    gross = net_credit * 100.0 * n
+    entry = legs_open([("sell", n), ("buy", n)]).total
+    max_loss = max(width - net_credit, 0.0) * 100.0 * n
+    net = gross - entry
+    drag = entry / gross if gross > 0 else float("nan")
+    ror = net / max_loss if max_loss > 0 else float("nan")
+    return SpreadEconomics(n, gross, entry, vertical_exit_fees(n, cash_settled), max_loss,
+                           max_loss, drag, net, ror, ror * 365.0 / max(dte, 1))
+
+
+def package_fill(short_bid, short_ask, long_bid, long_ask,
+                 fraction: float | None = None) -> dict | None:
+    """Multi-leg fill model: net mid minus `slippage_fraction_of_half_spread`
+    of the SUMMED half-spreads, never better than the net mid nor worse than
+    the natural (short bid - long ask)."""
+    r = _rates()
+    frac = r["slippage_fraction_of_half_spread"] if fraction is None else fraction
+    values = [short_bid, short_ask, long_bid, long_ask]
+    if any(v is None for v in values) or short_ask < short_bid or long_ask < long_bid:
+        return None
+    short_mid, long_mid = (short_bid + short_ask) / 2.0, (long_bid + long_ask) / 2.0
+    net_mid = short_mid - long_mid
+    natural = short_bid - long_ask
+    half = (short_ask - short_bid) / 2.0 + (long_ask - long_bid) / 2.0
+    modelled = min(max(net_mid - frac * half, natural), net_mid)
+    return {"net_mid": round(net_mid, 4), "natural": round(natural, 4),
+            "modelled": round(modelled, 4), "summed_half_spread": round(half, 4)}

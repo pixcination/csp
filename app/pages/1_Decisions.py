@@ -75,7 +75,51 @@ else:
                f"collateral, after fees and after charging the full empirical loss "
                f"tail — so the ranking never assumes a favourable second leg.")
 
+    def pcs_card(rec: dict) -> None:
+        """A put credit spread proposal (Phase 12). Recording it needs the
+        multi-leg paper book (Phase 15), so there is no accept form yet."""
+        with st.container(border=True):
+            head = st.columns([3, 1])
+            head[0].markdown(
+                f"### {rec['ticker']} &nbsp; <span style='font-size:.7em;opacity:.7'>"
+                f"{rec['expiration']} &nbsp;${rec['strike']:g}/${rec['long_strike']:g} put "
+                f"spread · {rec['width']:g} wide · {rec.get('tier', '')}</span>",
+                unsafe_allow_html=True)
+            head[1].metric("EV annualised on risk", f"{rec['ev_annualised']:.1%}")
+            cols = st.columns(6)
+            cols[0].metric("Contracts", f"{rec['contracts']:,}")
+            cols[1].metric("Credit", f"${rec['modelled_fill']:.2f}",
+                           delta=f"natural ${rec['natural']:.2f}", delta_color="off")
+            cols[2].metric("Max loss", f"${rec['max_loss']:,.0f}")
+            cols[3].metric("POP (> breakeven)", f"{rec['prob_otm_empirical']:.0%}"
+                           if rec.get("prob_otm_empirical") is not None else "--")
+            cols[4].metric("P(max loss)", f"{rec['prob_max_loss']:.0%}"
+                           if rec.get("prob_max_loss") is not None else "--")
+            cols[5].metric("Credit / width", f"{rec['credit_width']:.0%}")
+            st.caption(rec.get("rationale", ""))
+            chips = [f"short strike: {rec.get('strike_rule_reason', '')}"]
+            if rec.get("short_distance_em") == rec.get("short_distance_em") and                     rec.get("short_distance_em") is not None:
+                chips.append(f"{rec['short_distance_em']:+.2f} EM ({rec.get('em_method')})")
+            if rec.get("strong_support_id"):
+                chips.append(f"strong support {rec['strong_support_id']} "
+                             f"${rec['strong_support_level']:,.2f}")
+            if rec.get("premium_flags"):
+                chips.append(f"premium: {rec['premium_flags']}")
+            if rec.get("fillability") is not None:
+                chips.append(f"fillability {rec['fillability']:.2f} (weakest: "
+                             f"{rec.get('weakest_leg', '')})")
+            st.markdown(" · ".join(f"`{c}`" for c in chips))
+            for warning in rec.get("warnings", []) or []:
+                st.warning(warning)
+            for note in rec.get("notes", []) or []:
+                st.caption(note)
+            st.info("Recording a spread needs the multi-leg paper book (Phase 15).",
+                    icon=":material/info:")
+
     for i, rec in enumerate(candidates):
+        if rec.get("strategy") == "pcs":
+            pcs_card(rec)
+            continue
         with st.container(border=True):
             head = st.columns([3, 1])
             head[0].markdown(
@@ -181,15 +225,21 @@ if not sheet.empty and run_results.has_full_sheet:
         if "rejections" in view:
             view["why_not"] = view["rejections"].map(
                 lambda r: "; ".join(r) if r is not None and len(r) else "")
-        columns = [c for c in ["ticker", "expiration", "strike", "dte_calendar",
-                               "modelled_fill", "delta", "prob_otm_empirical",
-                               "ev_annualised", "iv_rv_ratio", "ivr", "ivp", "open_interest",
-                               "accepted", "best_per_ticker", "proposed", "why_not"]
+        columns = [c for c in ["ticker", "strategy", "expiration", "strike", "long_strike",
+                               "width", "tier", "dte_calendar", "modelled_fill", "delta",
+                               "prob_otm_empirical", "prob_max_loss", "credit_width",
+                               "ev_annualised", "short_distance_em", "strike_rule",
+                               "iv_rv_ratio", "ivr", "ivp", "open_interest", "fillability",
+                               "premium_flags", "accepted", "best_per_ticker",
+                               "default_choice", "proposed", "why_not"]
                    if c in view.columns]
         st.dataframe(
             view[columns], hide_index=True, width="stretch",
             column_config={
-                "prob_otm_empirical": st.column_config.NumberColumn("P(OTM)", format="percent"),
+                "prob_otm_empirical": st.column_config.NumberColumn("P(OTM) / POP", format="percent"),
+                "prob_max_loss": st.column_config.NumberColumn("P(max loss)", format="percent"),
+                "credit_width": st.column_config.NumberColumn("Credit/width", format="percent"),
+                "short_distance_em": st.column_config.NumberColumn("Short (EM)", format="%.2f"),
                 "ev_annualised": st.column_config.NumberColumn("EV ann.", format="percent"),
                 "modelled_fill": st.column_config.NumberColumn("Fill", format="$%.2f"),
                 "why_not": st.column_config.TextColumn("Rejected because", width="large"),

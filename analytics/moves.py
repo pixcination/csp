@@ -249,20 +249,14 @@ class BreachProbabilities:
         return asdict(self)
 
 
-def breach_probabilities(daily: pd.DataFrame, ticker: str, spot: float,
-                          strike: float, horizon: int,
-                          lookback_years: int = 0,
-                          vol_conditioned: bool = True,
-                          current_rv: float | None = None,
-                          min_observations: int = 60) -> BreachProbabilities | None:
-    """Empirical assignment and touch probabilities for a specific strike.
-
-    This is the direct replacement for `options_math.probability_otm` in the
-    composite score. It makes no distributional assumption -- it counts how
-    often this stock has actually done this, at a comparable volatility.
-    """
-    if spot <= 0 or strike <= 0:
-        return None
+def select_windows(daily: pd.DataFrame, horizon: int, lookback_years: int = 0,
+                   vol_conditioned: bool = True, current_rv: float | None = None,
+                   min_observations: int = 60) -> tuple[pd.DataFrame, str] | None:
+    """The historical windows a probability is taken over, and their label:
+    optionally the last `lookback_years`, and -- when enough remain -- only
+    windows whose entry RV was within +/-25% of today's. None when fewer than
+    `min_observations` windows exist. Shared by `breach_probabilities` and
+    the multi-leg EV (Phase 12), so both read the same sample."""
     windows = build_windows(daily, horizon)
     if windows.empty:
         return None
@@ -286,6 +280,28 @@ def breach_probabilities(daily: pd.DataFrame, ticker: str, spot: float,
 
     if len(windows) < min_observations:
         return None
+    return windows, label
+
+
+def breach_probabilities(daily: pd.DataFrame, ticker: str, spot: float,
+                          strike: float, horizon: int,
+                          lookback_years: int = 0,
+                          vol_conditioned: bool = True,
+                          current_rv: float | None = None,
+                          min_observations: int = 60) -> BreachProbabilities | None:
+    """Empirical assignment and touch probabilities for a specific strike.
+
+    This is the direct replacement for `options_math.probability_otm` in the
+    composite score. It makes no distributional assumption -- it counts how
+    often this stock has actually done this, at a comparable volatility.
+    """
+    if spot <= 0 or strike <= 0:
+        return None
+    selected = select_windows(daily, horizon, lookback_years, vol_conditioned,
+                              current_rv, min_observations)
+    if selected is None:
+        return None
+    windows, label = selected
 
     moneyness = strike / spot - 1.0            # negative for an OTM put
     touched = windows["mae"] <= moneyness

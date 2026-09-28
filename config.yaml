@@ -412,14 +412,14 @@ scan_defaults:
   dte_target_tolerance_days: 3        # dte_targets: expirations within +/- this of a target
   risk_mode: delta_range              # delta_range | min_pop | max_loss_per_trade | max_pct_capital
   delta_range: null                   # null = management.entry.delta_band
-  spread_widths: [1, 2.5, 5, 10]      # dollars; PCS construction arrives in Phase 12
+  spread_widths: [1, 2.5, 5, 10]      # PCS long-leg widths in dollars, snapped to listed strikes
   profit_targets: [25, 30, 50, 100]   # % of max profit; probabilities arrive in Phase 13
   account_profile: default
   universe: all                       # all | csp | etf | index | stock | tag:<tag> | [list]
   top_n_underlyings: all             # all | N. 2026-09-27: every weight preset's top 15 held only
                                     # 2-4 of the 10 names with passing weekly CSP strikes, so the
                                     # default pulls every eligible name (~7 min); lower it per request
-  strike_rule: delta                  # delta | em_multiple | support (applied in Phase 12)
+  strike_rule: conservative           # conservative (lowest short strike any rule gives) | delta | em_multiple | support
   em_multiple: 1.0
 
 # Chain-free ranking of every registry symbol. Weights are a STARTING POINT,
@@ -458,3 +458,33 @@ account_profiles:
   default:
     allowed_strategies: [csp, pcs, covered_call]
     spread_approval: true
+
+# --- Options analytics and PCS construction (Phase 12) -----------------------
+# analytics/expected_move.py. tastytrade = what the tastytrade platform
+# displays (Help Center, verified 2026-09-27): 0.6 x ATM straddle + 0.3 x 1st
+# OTM strangle + 0.1 x 2nd OTM strangle. iv = S x ATM IV x sqrt(DTE/365).
+# straddle = 0.85 x ATM straddle. All three are reported on every row.
+expected_move:
+  default_method: tastytrade          # tastytrade | iv | straddle
+  containment_lookback_years: 10
+
+# analytics/liquidity.py fillability score (0-1) and OI walls
+liquidity_score:
+  spread_pct_good: 0.05               # spread / mid at or below -> 1
+  spread_pct_bad: 0.50                # at or above -> 0
+  spread_dollars_good: 0.05           # a market this tight scores >= 0.8 whatever its %
+  oi_log10: [1.0, 4.0]                # OI 10 -> 0, 10,000 -> 1
+  volume_log10: [0.0, 3.5]
+  wall_multiple: 3.0                  # OI >= 3x the side's median = a wall
+
+# analytics/strategies/pcs.py -- put credit spreads
+pcs:
+  min_credit: 0.10                    # per share, net of the modelled fill
+  credit_width_floor: 0.3333          # below: warned (not rejected); at/above: premium flag
+  apply_iv_rv_gate: true              # short leg IV/RV must clear management.entry.min_iv_rv_ratio
+  tiers: [Conservative, Moderate, Aggressive]   # by width, narrowest first
+
+# Premium-opportunity flags on every row (informational, never a gate)
+premium_flags:
+  min_ivp: 0.50                       # TastyTrade IV percentile
+  min_iv_rv: 1.20                     # short-leg IV / DTE-matched RV

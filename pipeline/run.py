@@ -32,7 +32,8 @@ DESIGN RULES
   `rank_underlyings` then scores every name without chains, and only the top
   N (plus anything with an open position) get a chain pulled and analysed.
   Roadmap stages construct -> probabilities -> rank_trades live inside
-  `analyse` for CSP until Phases 12-13 split them out.
+  `analyse` (CSP and, since Phase 12, PCS); Phase 13's probability engine
+  splits the probabilities out.
 """
 from __future__ import annotations
 
@@ -428,14 +429,11 @@ def _stage_analyse(reporter: BaseReporter, manifest: RunManifest,
     from analytics.candidates import evaluate_universe, select_sheet
     from analytics.scan_request import ScanRequest
     request = request or ScanRequest.default()
-    if "csp" in request.strategies:
-        full_sheet = evaluate_universe(tickers, reporter=reporter, request=request)
-    else:
-        full_sheet = pd.DataFrame()
-        reporter.log("request has no CSP; PCS construction arrives in Phase 12 -- "
-                     "ranking and chains only")
-    if "pcs" in request.strategies:
-        results["pcs"] = "not constructed: PCS arrives in Phase 12"
+    full_sheet = evaluate_universe(tickers, reporter=reporter, request=request)
+    if not full_sheet.empty and "strategy" in full_sheet:
+        results["by_strategy"] = {
+            k: {"rows": int(len(g)), "accepted": int(g["accepted"].sum())}
+            for k, g in full_sheet.groupby("strategy")}
     # Every accepted strike is kept (Phase 11); proposals come from the best
     # row per ticker, so two strikes on one name never both get proposed.
     sheet = select_sheet(full_sheet)
@@ -478,10 +476,13 @@ def _stage_analyse(reporter: BaseReporter, manifest: RunManifest,
             results["census"] = sheet.attrs["census"]
         reporter.log(f"{len(proposed)} trade(s) proposed from "
                      f"{len(sheet)} qualifying candidate(s)")
-        for row in proposed.itertuples():
-            reporter.log(f"  {row.ticker} {row.expiration} ${row.strike:g}p "
-                         f"x{row.contracts} @ ~${row.modelled_fill:.2f} -- "
-                         f"EV {row.ev_annualised:.1%} annualised")
+        for row in proposed.to_dict("records"):
+            long = row.get("long_strike")
+            legs = (f"${row['strike']:g}/${long:g} put spread"
+                    if long is not None and long == long else f"${row['strike']:g}p")
+            reporter.log(f"  {row['ticker']} {row['expiration']} {legs} "
+                         f"x{row['contracts']} @ ~${row['modelled_fill']:.2f} -- "
+                         f"EV {row['ev_annualised']:.1%} annualised")
 
         # Stress the resulting book, existing positions included.
         try:
@@ -507,7 +508,7 @@ def _stage_analyse(reporter: BaseReporter, manifest: RunManifest,
         if census:
             results["census"] = census
             manifest.warnings.append(f"no candidates: {census['headline']}")
-        elif "csp" in request.strategies:
+        else:
             reporter.log("no candidates passed the entry gates")
 
     # Persist the tables beside the manifest so pages survive a restart.
@@ -732,7 +733,9 @@ def run(tickers: list[str] | None = None, quick: bool = False,
             if not quick:
                 guarded("chains", _stage_chains, reporter, manifest, targets,
                         force_chains, request, holder["ranked"])
-            analysable = [t for t in targets if t in tradable or t not in registered]
+            # CSP needs a physically settled name; PCS runs on indices too.
+            analysable = [t for t in targets if "pcs" in request.strategies
+                          or t in tradable or t not in registered]
             guarded("analyse", _stage_analyse, reporter, manifest, analysable,
                     request, holder["ranked"])
 

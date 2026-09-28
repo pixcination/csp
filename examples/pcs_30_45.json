@@ -11,5 +11,5 @@
   "universe": "all",
   "top_n_underlyings": 15,
   "event_policy_overrides": {},
-  "strike_rule": "delta"
+  "strike_rule": "conservative"
 }
