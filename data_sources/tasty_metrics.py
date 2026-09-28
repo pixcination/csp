@@ -247,6 +247,24 @@ def latest(symbols: list[str] | None = None, max_age_days: int | None = None) ->
     return frame.reset_index(drop=True)
 
 
+def previous(symbols: list[str] | None = None) -> pd.DataFrame:
+    """Per symbol, the newest snapshot BEFORE its latest one (Phase 17: the
+    IV regime's hysteresis compares against it). Empty when only one exists."""
+    con = _connect(read_only=True)
+    try:
+        tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
+        if TABLE not in tables:
+            return pd.DataFrame(columns=["symbol", "snapshot_date"])
+        frame = con.execute(
+            f"SELECT * FROM {TABLE} QUALIFY row_number() OVER "
+            f"(PARTITION BY symbol ORDER BY snapshot_date DESC) = 2").fetchdf()
+    finally:
+        con.close()
+    if symbols is not None:
+        frame = frame[frame["symbol"].isin(symbols)]
+    return frame.reset_index(drop=True)
+
+
 def for_symbol(symbol: str) -> dict | None:
     frame = latest([symbol])
     return None if frame.empty else frame.iloc[0].to_dict()

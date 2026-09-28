@@ -45,6 +45,17 @@ RV; with none of them the chain is not filtered. If a symbol still exceeds
 max_subscriptions_per_symbol, the expirations furthest from the request's
 reference DTE are dropped first (recorded on the result).
 
+SPEC WIDENING (Phase 17, review decision 4)
+-------------------------------------------
+A PMCC's long call (~0.80 delta, ~90 DTE) sits below the call window. For a
+request that recommends specs (or names one), each spec in
+`chain_capture.widen_for_specs` adds, per ticker whose entry TREND holds
+(PMCC: uptrend), a call band covering its delta-selected legs' delta
++/- `widen_delta_pad`, only at expirations inside that leg's role window
+(target +/- tolerance). Strikes come from Black-Scholes at the window IV:
+K = S exp(sigma^2 t / 2 - N^-1(delta) sigma sqrt(t)). The extra
+subscriptions are counted per ticker in the manifest (`extra_subscriptions`).
+
 SYMBOLS
 -------
 The chain and the underlying quote are requested with the registry's
@@ -59,6 +70,7 @@ with the equity market-data kind.
 from __future__ import annotations
 
 import asyncio
+import json
 import datetime as dt
 import math
 import time
@@ -235,6 +247,7 @@ class CaptureResult:
     strikes_listed: int = 0
     filtered: bool = False
     expirations_dropped: list = field(default_factory=list)
+    extra_subscriptions: int = 0
 
 
 @dataclass
@@ -247,17 +260,21 @@ class StrikeWindow:
     min_pct: float = 0.03
     max_subscriptions: int | None = None
     reference_dte: float | None = None
+    # Phase 17: extra call bands [(dte_lo, dte_hi, delta_lo, delta_hi)] (spec widening)
+    extra_call_bands: tuple = ()
 
     @classmethod
     def from_config(cls, spot: float | None, iv: float | None,
-                    reference_dte: float | None = None) -> "StrikeWindow":
+                    reference_dte: float | None = None,
+                    extra_call_bands=()) -> "StrikeWindow":
         cfg = load_config().get("chain_capture", {})
         return cls(spot=spot, iv=iv,
                    put_em=tuple(cfg.get("put_window_em", [-3.0, 0.5])),
                    call_em=tuple(cfg.get("call_window_em", [-0.5, 1.5])),
                    min_pct=float(cfg.get("min_window_pct", 0.03)),
                    max_subscriptions=cfg.get("max_subscriptions_per_symbol", 6000),
-                   reference_dte=reference_dte)
+                   reference_dte=reference_dte,
+                   extra_call_bands=tuple(tuple(b) for b in (extra_call_bands or ())))
 
     @property
     def active(self) -> bool:
@@ -274,6 +291,23 @@ class StrikeWindow:
         hi = max(self.spot + hi_k * em, self.spot + floor)
         return lo, hi
 
+    def extra_bounds(self, side: str, dte: int) -> list[tuple[float, float]]:
+        """Phase 17: extra strike intervals for `side` at `dte` (spec widening:
+        call deltas -> strikes by Black-Scholes at the window IV)."""
+        if side != "call" or not self.active or not self.extra_call_bands:
+            return []
+        from scipy.stats import norm
+        t = max(dte, 1) / 365.0
+        sig = self.iv * math.sqrt(t)
+        out = []
+        for dte_lo, dte_hi, d_lo, d_hi in self.extra_call_bands:
+            if not dte_lo <= dte <= dte_hi:
+                continue
+            k = [self.spot * math.exp(0.5 * sig * sig - float(norm.ppf(d)) * sig)
+                 for d in (d_hi, d_lo)]          # higher delta = lower strike
+            out.append((min(k), max(k)))
+        return out
+
 
 def _rows_for_chain(ttc, chain: dict, tokens: str,
                     window: StrikeWindow | None = None,
@@ -289,7 +323,7 @@ def _rows_for_chain(ttc, chain: dict, tokens: str,
     for item in items:
         flat.extend(item.get("expirations", []))
     chosen = set(ttc.select_expirations(flat, tokens))
-    info = {"expirations_dropped": [], "strikes_listed": 0}
+    info = {"expirations_dropped": [], "strikes_listed": 0, "extra_subscriptions": 0}
     if not chosen:
         return [], [], {}, info
 
@@ -305,6 +339,7 @@ def _rows_for_chain(ttc, chain: dict, tokens: str,
             dte = (dt.date.fromisoformat(date_str) - today).days
             put_lo, put_hi = window.bounds("put", dte)
             call_lo, call_hi = window.bounds("call", dte)
+            extra_calls = window.extra_bounds("call", dte)
             for strike in exp.get("strikes", []):
                 info["strikes_listed"] += 1
                 k = float(strike.get("strike-price", 0) or 0)
@@ -313,6 +348,9 @@ def _rows_for_chain(ttc, chain: dict, tokens: str,
                     sides.append(("put", strike["put"]))
                 if strike.get("call") and call_lo <= k <= call_hi:
                     sides.append(("call", strike["call"]))
+                elif strike.get("call") and any(a <= k <= b for a, b in extra_calls):
+                    sides.append(("call", strike["call"]))
+                    info["extra_subscriptions"] += 1
                 if not sides:
                     continue
                 row = ttc.empty_strike_row(date_str, strike.get("strike-price", 0),
@@ -385,7 +423,8 @@ def capture(ticker: str, dte_max: int | None = None, dte_min: int = 0,
              now: dt.datetime | None = None,
              iv: float | None = None,
              reference_dte: float | None = None,
-             strike_filter: bool = True) -> CaptureResult:
+             strike_filter: bool = True,
+             extra_call_bands=()) -> CaptureResult:
     """Pull one ticker's chain and underlying, stamped with the session block.
 
     REST supplies bid/ask/mark/last; DXLink streaming supplies open interest,
@@ -396,10 +435,14 @@ def capture(ticker: str, dte_max: int | None = None, dte_min: int = 0,
     The underlying is quoted FIRST (Phase 11): its spot sets the strike
     window. `iv` sets the window's expected move (see `fallback_iv`);
     `strike_filter=False` pulls every strike, as before Phase 11.
+    `extra_call_bands`: Phase 17 spec widening (see the module docstring);
+    the DTE window is extended to cover them.
     """
     result = CaptureResult(ticker=ticker)
     cfg = load_config().get("chain_capture", {})
     dte_max = dte_max if dte_max is not None else cfg.get("dte_max_universe", 21)
+    if extra_call_bands:
+        dte_max = max(int(dte_max), max(int(b[1]) for b in extra_call_bands))
 
     if not force:
         wanted, reason = needs_capture(ticker, now, (dte_min, dte_max))
@@ -436,13 +479,15 @@ def capture(ticker: str, dte_max: int | None = None, dte_min: int = 0,
         spot = next((float(under_row[c]) for c in ("mark", "last", "bid")
                      if under_row.get(c) is not None and float(under_row[c]) > 0), None)
         window = StrikeWindow.from_config(
-            spot, (iv or fallback_iv(ticker)) if strike_filter else None, reference_dte)
+            spot, (iv or fallback_iv(ticker)) if strike_filter else None, reference_dte,
+            extra_call_bands)
 
         chain = ttc.fetch_equity_chain(tt_symbol)
         rows, symbols, index, listing = _rows_for_chain(
             ttc, chain, tt.dte_token(dte_min, dte_max), window,
             (now or dt.datetime.now()).date())
         result.strikes_listed = listing["strikes_listed"]
+        result.extra_subscriptions = listing.get("extra_subscriptions", 0)
         result.expirations_dropped = listing["expirations_dropped"]
         result.filtered = window.active
         if not rows:
@@ -498,6 +543,8 @@ def capture(ticker: str, dte_max: int | None = None, dte_min: int = 0,
             "dte_min": int(dte_min),
             "dte_max": int(dte_max),
             "expirations_dropped": ",".join(listing["expirations_dropped"]),
+            "extra_call_bands": json.dumps([list(b) for b in extra_call_bands])
+            if extra_call_bands else None,
         }])
 
         chain_path, under_path = _paths(ticker, block)
@@ -549,9 +596,42 @@ def _note(res: CaptureResult) -> str:
             f"{res.expirations} exp, {res.subscriptions} subs{extra}")
 
 
+def spec_widening(request, tickers: list[str], trends: dict[str, str] | None = None
+                  ) -> dict[str, list[tuple]]:
+    """Phase 17: ticker -> extra call bands for the request's specs listed in
+    `chain_capture.widen_for_specs`, only where the spec's entry trend holds
+    (`trends`: ticker -> trend state; unknown trend = no widening)."""
+    cfg = load_config().get("chain_capture", {}) or {}
+    wanted = list(cfg.get("widen_for_specs") or [])
+    if not wanted or not (request.recommend or request.specs):
+        return {}
+    from analytics import strategy_spec
+    specs = strategy_spec.load_all()
+    chosen = [specs[s] for s in wanted if s in specs
+              and (request.recommend or s in (request.specs or []))]
+    pad = float(cfg.get("widen_delta_pad", 0.12))
+    out: dict[str, list[tuple]] = {}
+    for spec in chosen:
+        bands = []
+        for leg in spec.legs:
+            if leg.type != "call" or leg.selector != "delta":
+                continue
+            d = abs(float(leg.select["delta"]))
+            exp = spec.expirations[leg.expiration]
+            t, tol = int(exp["dte_target"]), int(exp.get("tolerance", 14))
+            bands.append((max(t - tol, 0), t + tol, max(d - pad, 0.01), min(d + pad, 0.99)))
+        allowed = spec.entry.get("trend")
+        for ticker in tickers:
+            if allowed and (trends or {}).get(ticker) not in allowed:
+                continue
+            out.setdefault(ticker, []).extend(bands)
+    return out
+
+
 def capture_targets(tickers: list[str], request, with_positions: set[str] | None = None,
                     ivs: dict[str, float] | None = None, force: bool = False,
-                    reporter: BaseReporter | None = None) -> list[CaptureResult]:
+                    reporter: BaseReporter | None = None,
+                    widen: dict[str, list[tuple]] | None = None) -> list[CaptureResult]:
     """Phase 11: capture the ranked top N for a scan request.
 
     DTE window = the request's chain window (entry window + roll buffer);
@@ -574,7 +654,7 @@ def capture_targets(tickers: list[str], request, with_positions: set[str] | None
             window = (0, max(position_dte, hi)) if ticker in with_positions else (lo, hi)
             res = capture(ticker, dte_min=window[0], dte_max=window[1], limiter=limiter,
                           force=force, reporter=reporter, iv=ivs.get(ticker),
-                          reference_dte=ref)
+                          reference_dte=ref, extra_call_bands=(widen or {}).get(ticker, ()))
             results.append(res)
             reporter.advance(1, note=_note(res))
     return results

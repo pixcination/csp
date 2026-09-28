@@ -103,6 +103,7 @@ class ScanRequest:
         base = dict(cfg.get("scan_defaults") or {})
         base.pop("dte_target_tolerance_days", None)
         base.pop("pcs_dte_tolerance_days", None)
+        base.pop("prefer_monthly_from_dte", None)
         base.update({k: v for k, v in overrides.items() if v is not None})
         return cls.from_dict(base)
 
@@ -280,14 +281,24 @@ class ScanRequest:
             return max(targets[0] - tol, 0), targets[-1] + tol
         return int(self.dte_min), int(self.dte_max)
 
-    def nearest_pcs_dtes(self, dtes) -> set[int]:
+    def nearest_pcs_dtes(self, dtes, monthly_dtes=None) -> set[int]:
         """With `pcs_dte_targets`, the listed DTEs spreads are built at: for
-        each target, the one closest to it inside the tolerance. Without
-        them, every DTE the spread window accepts."""
+        each target, the one closest to it inside the tolerance -- and, from
+        `scan_defaults.prefer_monthly_from_dte` up, also the closest MONTHLY
+        (Phase 17: a newly listed weekly 5-6 weeks out carries almost no open
+        interest -- CVX 45 contracts against 8,240 at the monthly two weeks
+        later -- so both are built and the liquidity gates choose). Without
+        targets, every DTE the spread window accepts."""
         listed = sorted({int(d) for d in dtes if self.accepts_dte(int(d), "pcs")})
         if not self.pcs_dte_targets or not listed:
             return set(listed)
-        return {min(listed, key=lambda d: (abs(d - t), d)) for t in self.pcs_dte_targets}
+        out = {min(listed, key=lambda d: (abs(d - t), d)) for t in self.pcs_dte_targets}
+        from_dte = (load_config().get("scan_defaults") or {}).get("prefer_monthly_from_dte")
+        monthly = sorted({int(d) for d in (monthly_dtes or ()) if int(d) in listed})
+        if from_dte is not None and monthly:
+            out |= {min(monthly, key=lambda d: (abs(d - t), d))
+                    for t in self.pcs_dte_targets if t >= int(from_dte)}
+        return out
 
     def dte_window(self, strategy: str | None = None) -> tuple[int, int]:
         """The entry window for one strategy -- [dte_min, dte_max], or the span

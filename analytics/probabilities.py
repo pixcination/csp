@@ -20,7 +20,11 @@ every row, and returns:
                of max profit by day d), for charts
 
 RANKING: accepted rows sort by the blended `ev_per_day_bpr` of the headline
-policy (EV per calendar day held, per dollar of buying power). With the
+policy (EV per calendar day held, per dollar of buying power). Since Phase 17
+the headline of a put spread is the rule set actually run
+(`management.spread`: the target above the hold horizon, the loss stop, the
+time stop -- `shipped_rules`), with loss stops triggered on intraday
+extremes and H/T leg IVs moving with spot; CSP rows keep the auto policy. With the
 request's risk mode `min_pop`, a row whose BLENDED P(profit at expiry) is
 under `min_pop` is also rejected (the Phase 12 empirical gate still applies).
 Rejected rows sort last. `SORTS` lists the alternative orderings the UI offers.
@@ -91,6 +95,23 @@ def _technical_frame(ticker: str, daily: pd.DataFrame) -> tuple[pd.DataFrame | N
         return None, None
 
 
+def shipped_rules(row: dict) -> dict | None:
+    """The management rules a sheet row is actually run under, for the
+    engine's `managed` policy (Phase 17). Put spreads follow
+    `exit_rules.spread_config()`: the profit target only above the hold
+    horizon, the loss stop always, the time stop when entered above it. CSPs
+    are held and rolled, not stopped: None (the auto headline)."""
+    if row.get("strategy") != "pcs":
+        return None
+    from analytics.exit_rules import spread_config
+    cfg = spread_config()
+    dte = int(row.get("dte_calendar") or 0)
+    target = cfg.get("profit_target_pct")
+    return {"target": int(target) if target and dte > int(cfg["hold_max_dte"]) else None,
+            "stop": cfg.get("loss_stop_multiple"),
+            "time_stop": cfg.get("time_stop_dte")}
+
+
 def _next_earnings(ticker: str, today: dt.date, events_frame: pd.DataFrame) -> dt.date | None:
     if events_frame is None or events_frame.empty:
         return None
@@ -121,10 +142,12 @@ def run_sheet(sheet: pd.DataFrame, request=None, cfg: pe.EngineConfig | None = N
     policy_rows, metric_rows, curve_rows = [], [], []
 
     tickers = list(dict.fromkeys(r["ticker"] for r in rows))
+    spy = load_daily("SPY", basis="price") if cfg.spot_vol else None
     with reporter.stage("probabilities", "Probability engine", total=len(tickers)):
         for ticker in tickers:
             mine = [r for r in rows if r["ticker"] == ticker]
             daily = load_daily(ticker, basis="price")
+            beta = pe.name_spot_vol_beta(daily, cfg, spy)
             tech, support_column = _technical_frame(ticker, daily)
             earnings = _next_earnings(ticker, today, events_frame)
             rv = None
@@ -141,13 +164,16 @@ def run_sheet(sheet: pd.DataFrame, request=None, cfg: pe.EngineConfig | None = N
                                                    support_column)
                 exp_date = pd.Timestamp(row["expiration"]).date()
                 event_day = (earnings - today).days if earnings and earnings <= exp_date else None
+                rules = shipped_rules(row)
                 spec = pe.TradeSpec(
                     position=position_from_row(row), spot=float(row["spot"]),
                     dte_calendar=max(int(row["dte_calendar"]), 1), dte_trading=steps,
                     contracts=max(int(row.get("contracts") or 0), 1),
                     bpr=float(row["collateral"]),
                     cash_settled=row.get("settlement") == "cash",
-                    event_day=event_day, rv=rv)
+                    event_day=event_day, rv=rv,
+                    loss_stop_multiple=(rules or {}).get("stop"), managed=rules,
+                    spot_vol_beta=beta)
                 result = pe.run_trade(spec, cache[steps], targets, cfg)
                 blended_rows.append(_summarise(row, result, spec, cfg, targets, request))
                 _collect(row["trade_id"], result, policy_rows, metric_rows, curve_rows)
@@ -168,7 +194,7 @@ def _summarise(row: dict, result: dict, spec: pe.TradeSpec, cfg: pe.EngineConfig
     out = dict(row)
     blend = result["blend"]
     for key, value in blend.items():
-        if key in ("weights", "policies"):
+        if key in ("weights", "policies", "managed_policy"):
             continue
         name = {"p_touch_short": "p_touch", "p_roll_trigger": "p_roll",
                 "p_short_itm": "p_short_itm"}.get(key, key)
@@ -180,8 +206,11 @@ def _summarise(row: dict, result: dict, spec: pe.TradeSpec, cfg: pe.EngineConfig
     out["t_flag"] = result["meta"]["T"].get("flag", "")
     out["prob_labels"] = " | ".join(f"{m}: {meta['label']}" for m, meta in result["meta"].items())
     policies = blend.get("policies", {})
-    head = pe.headline_policy(policies, spec.dte_calendar, cfg)
+    head = pe.headline_policy(policies, spec.dte_calendar, cfg,
+                              pe.managed_policy_name(spec.managed, spec.dte_calendar))
     chosen = policies.get(head, {})
+    out["spot_vol_beta"] = spec.spot_vol_beta
+    out["headline_p_stopped"] = chosen.get("p_stopped")
     out.update({"headline_policy": head, "headline_ev": chosen.get("ev"),
                 "headline_p_profit": chosen.get("p_profit"),
                 "headline_days": chosen.get("days"),
@@ -207,9 +236,10 @@ def _collect(trade_id: str, result: dict, policy_rows, metric_rows, curve_rows) 
             policy_rows.append({"trade_id": trade_id, "model": model, "policy": name,
                                 **{k: policy.get(k) for k in (
                                     "ev", "p_profit", "days", "annualised", "ev_per_day_bpr",
-                                    "net_gain_when_hit", "below_min_gain")}})
+                                    "net_gain_when_hit", "below_min_gain", "p_stopped")}})
         for key, value in r.items():
-            if isinstance(value, (int, float)) and key != "n_paths":
+            if isinstance(value, (int, float)) and not isinstance(value, bool) \
+                    and key != "n_paths":
                 metric_rows.append({"trade_id": trade_id, "model": model, "metric": key,
                                     "value": float(value)})
         if model == "blend":

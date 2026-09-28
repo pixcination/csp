@@ -206,13 +206,29 @@ def short_strikes(puts: pd.DataFrame, spot: float, request, em: float | None,
     return out
 
 
-def snap_long(puts: pd.DataFrame, short: float, width: float) -> float | None:
-    """The listed put strike nearest short - width, strictly below the short."""
-    below = puts["strike_price"].astype(float)
-    below = below[below < short]
+def snap_long(puts: pd.DataFrame, short: float, width: float,
+              min_oi: float | None = None, band: float | None = None) -> float | None:
+    """The listed put strike nearest short - width, strictly below the short.
+
+    Phase 17: with `min_oi`, when that strike's open interest is under the
+    floor, the nearest strike within +/- `band` x width of the target that
+    clears it is taken instead (the nearest one stays if none does)."""
+    below = puts[puts["strike_price"].astype(float) < short]
     if below.empty:
         return None
-    return float(below.iloc[(below - (short - width)).abs().argmin()])
+    strikes = below["strike_price"].astype(float)
+    target = short - width
+    nearest = float(strikes.iloc[(strikes - target).abs().argmin()])
+    if not min_oi or not band or "put_open_interest" not in below:
+        return nearest
+    oi = below["put_open_interest"].astype(float).fillna(0.0)
+    if float(oi[strikes == nearest].max()) >= min_oi:
+        return nearest
+    ok = below[(oi >= min_oi) & ((strikes - target).abs() <= band * width)]
+    if ok.empty:
+        return nearest
+    ok_strikes = ok["strike_price"].astype(float)
+    return float(ok_strikes.iloc[(ok_strikes - target).abs().argmin()])
 
 
 # --- Construction ------------------------------------------------------------------
@@ -237,12 +253,16 @@ def build_candidates(ticker: str, ctx, daily: pd.DataFrame, adv_dollars: float |
     chain["dte_calendar"] = (chain["expiration"].dt.date - today).apply(lambda d: d.days)
     # With spread DTE targets (Phase 15 default 45), build at the listed
     # expiration nearest each target; otherwise at every one in the window.
-    keep = request.nearest_pcs_dtes(chain["dte_calendar"].unique())
+    from analytics.chain_utils import monthly_expirations
+    monthly = {(d - today).days for d in monthly_expirations(chain)}
+    keep = request.nearest_pcs_dtes(chain["dte_calendar"].unique(), monthly)
     chain = chain[chain["dte_calendar"].isin(keep)]
     if "root_symbol" not in chain:
         chain["root_symbol"] = None
     strongest = ctx.strongest_support()
     widths = request.pcs_widths(ctx.spot)
+    floors = sizing.spread_leg_floors()
+    snap_band = pcs_cfg.get("long_leg_oi_snap_band")
     out: list[SpreadRecommendation] = []
 
     for (expiration, root), group in chain.groupby(["expiration", "root_symbol"], dropna=False):
@@ -271,7 +291,8 @@ def build_candidates(ticker: str, ctx, daily: pd.DataFrame, adv_dollars: float |
             s_row = group[group["strike_price"].astype(float) == short].iloc[0]
             built: set[float] = set()
             for index, width in enumerate(widths):
-                long = snap_long(longs, short, width)
+                long = snap_long(longs, short, width,
+                                 floors.get("min_open_interest"), snap_band)
                 if long is None or long in built:
                     continue
                 built.add(long)
@@ -322,7 +343,8 @@ def _evaluate(ticker, ctx, s_row, l_row, rules, exp_date, root, settlement_type,
         per_contract_risk, account,
         legs=[(legs[0].open_interest, legs[0].volume, "short leg"),
               (legs[1].open_interest, legs[1].volume, "long leg")],
-        adv_dollars=adv, notional_per_contract=short * 100.0, capital_label="max loss")
+        adv_dollars=adv, notional_per_contract=short * 100.0, capital_label="max loss",
+        leg_floors=sizing.spread_leg_floors() or None)
     contracts = size.contracts
     contracts, _ = regime.apply_to_sizing(contracts, regime_reading) if contracts else (0, "")
     if request.max_loss_per_trade is not None:

@@ -31,7 +31,7 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from analytics import trade_detail as td  # noqa: E402
+from analytics import sizing, trade_detail as td  # noqa: E402
 from analytics.scan_request import (RISK_MODES, STRIKE_RULES, UNIVERSE_KEYWORDS,  # noqa: E402
                                     RequestError, ScanRequest)
 from app.components.run_state import active_run, run_caption  # noqa: E402
@@ -166,11 +166,18 @@ with st.container(border=True):
                                  default=[t for t in base.profit_targets
                                           if t in (10, 25, 30, 40, 50, 60, 75, 100)],
                                  key=k + "targets")
+    # Phase 17: no silent default. Sizing, caps and permissions all follow the
+    # profile, so the Screener preselects one only when the loaded request names
+    # a profile other than the shipped research `default` ($3M).
     profiles = user_settings.profile_names()
+    preselect = base.account_profile if base.account_profile in profiles         and base.account_profile != "default" else None
     profile = row[2].selectbox("Account profile", profiles,
-                               index=profiles.index(base.account_profile)
-                               if base.account_profile in profiles else 0, key=k + "profile",
-                               help="Profiles are defined on the Settings page.")
+                               index=profiles.index(preselect) if preselect else None,
+                               format_func=user_settings.profile_label,
+                               placeholder="Choose the account to size for",
+                               key=k + "profile",
+                               help="Required. Profiles are defined on the Settings page; "
+                                    "`default` is the $3M research account.")
     presets = list(user_settings.weight_presets())
     current_w = (base.ranking_weights if isinstance(base.ranking_weights, str)
                  else user_settings.default_weight_preset())
@@ -257,6 +264,9 @@ try:
     else:
         fields.update({"dte_targets": [int(t) for t in dte_targets_text.replace(" ", "")
                                        .split(",") if t], "dte_min": None, "dte_max": None})
+    if profile is None:
+        raise RequestError("choose an account profile -- contract counts, caps and "
+                           "permissions all follow it")
     scan = ScanRequest.from_dict(fields)
 except (RequestError, ValueError) as exc:
     problem = str(exc)
@@ -264,6 +274,9 @@ except (RequestError, ValueError) as exc:
 if problem:
     st.error(f"Scan request: {problem}")
 else:
+    if (sizing.account_config(scan.account_profile) or {}).get("placeholder"):
+        st.warning(f"Profile `{scan.account_profile}` still has placeholder values -- "
+                   f"enter the real account value and limits on the Settings page.")
     st.caption(f"Request: **{scan.label()}** · profile `{scan.account_profile}` · "
                f"universe `{scan.universe if isinstance(scan.universe, str) else len(scan.universe)}`")
 

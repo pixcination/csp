@@ -101,7 +101,10 @@ def test_conditions_and_iv_regime():
     spec = ss.load_all()["iron_condor"]
     assert ss.iv_regime(0.1) == "low" and ss.iv_regime(0.4) == "mid" and ss.iv_regime(0.8) == "high"
     assert ss.applies(spec, {"iv_regime": "mid", "trend": "range"})[0]
+    # Phase 17: the regime is soft (reported, not blocking) unless asked strictly.
     ok, why = ss.applies(spec, {"iv_regime": "low", "trend": "range"})
+    assert ok and "IV regime low" in why[0] and "soft" in why[0]
+    ok, why = ss.applies(spec, {"iv_regime": "low", "trend": "range"}, soft_regime=False)
     assert not ok and "IV regime low" in why[0]
     ok, why = ss.applies(spec, {"iv_regime": "high", "trend": "range",
                                 "earnings_in_window": True})
@@ -327,7 +330,8 @@ def test_recommender_ranks_real_spy_positions():
     assert list(sheet["rank_key"]) == sorted(sheet["rank_key"], reverse=True)
     cal = sheet[sheet["strategy"] == "call_calendar"]
     if not cal.empty:
-        assert cal.iloc[0]["headline_policy"] == "close_25"          # the spec's own target
+        # Phase 17: the spec's own exit block -- 25% target and a 0.5x-debit stop.
+        assert cal.iloc[0]["headline_policy"] == "close_25_stop_0.5x"
 
 
 # --- Paper book and management -------------------------------------------------------------

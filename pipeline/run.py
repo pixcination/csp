@@ -377,8 +377,19 @@ def _stage_chains(reporter: BaseReporter, manifest: RunManifest,
         if ranked is not None and not ranked.empty:
             ivs = {r.symbol: float(r.iv_used) for r in ranked.itertuples()
                    if r.iv_used is not None and r.iv_used == r.iv_used}
+        # Phase 17: targeted spec widening (PMCC's deep ITM long call), only
+        # for names whose entry trend holds.
+        trends = {}
+        try:
+            from analytics import technical_study
+            latest = technical_study.load_latest()
+            if latest is not None and not latest.empty and "trend_state" in latest:
+                trends = dict(zip(latest["symbol"], latest["trend_state"]))
+        except Exception:
+            trends = {}
+        widen = chains.spec_widening(request, tickers, trends)
         results = chains.capture_targets(tickers, request, with_positions=with_positions,
-                                         ivs=ivs, force=force, reporter=reporter)
+                                         ivs=ivs, force=force, reporter=reporter, widen=widen)
     failed = [r.ticker for r in results if r.error]
     skipped = [r.ticker for r in results if r.skipped]
     if failed:
@@ -394,6 +405,7 @@ def _stage_chains(reporter: BaseReporter, manifest: RunManifest,
                                       "subscriptions": r.subscriptions,
                                       "filtered": r.filtered,
                                       "expirations_dropped": r.expirations_dropped,
+                                      "extra_subscriptions": r.extra_subscriptions,
                                       "skipped": r.reason if r.skipped else None,
                                       "error": r.error}
                            for r in results}}

@@ -28,6 +28,18 @@ intraday components answers three questions daily data cannot:
      six overnight gaps. Their joint tail, not the daily vol, is the number
      that should size it.
 
+SOURCE (Phase 17)
+-----------------
+Daily bars by default (`signals.gap_source: daily`): yfinance's regular-session
+open, high, low and close on the price basis, current every run. An overnight
+gap needs only the prior close and today's open, which the daily bar already
+carries, so the 1-minute archive (which stopped updating on 2026-06-30) is
+optional -- `gap_source: 1m` reads it, `auto` prefers it while the cache is
+fresh (`freshness.cache_1m_days`). Daily bars are split-adjusted on one basis
+end to end, so the corporate-action seam filter below has nothing to remove
+on them; it stays for the 1-minute path. Today's bar is left out until the
+session has closed (its "close" is only the latest trade).
+
 CONVENTIONS
 -----------
 Gap is measured close-to-open on the REGULAR session: previous 16:00 close to
@@ -136,16 +148,49 @@ def _from_text_archive(ticker: str, months: int = 240) -> pd.DataFrame:
     return pd.concat(rows, ignore_index=True).sort_values("date").reset_index(drop=True)
 
 
-def session_frame(ticker: str, years: int = 20) -> pd.DataFrame:
-    """Regular-session OHLC per day, from whichever source is available."""
+def _from_daily(ticker: str, start: str) -> pd.DataFrame:
+    """Regular-session OHLC from the daily bars (price basis), completed
+    sessions only."""
+    from core.freshness import last_completed_session
+    from data_sources.yfinance_sync import load_daily
+
+    daily = load_daily(ticker, basis="price", start=dt.date.fromisoformat(start))
+    if daily is None or daily.empty:
+        return pd.DataFrame()
+    frame = pd.DataFrame({"date": pd.to_datetime(daily["date"]),
+                          "rth_open": daily["open"].astype(float),
+                          "rth_close": daily["close"].astype(float),
+                          "rth_low": daily["low"].astype(float),
+                          "rth_high": daily["high"].astype(float)})
+    frame = frame[frame["date"] <= pd.Timestamp(last_completed_session())]
+    return frame.dropna().reset_index(drop=True)
+
+
+def _cache_is_fresh() -> bool:
+    from core import freshness
+    try:
+        return freshness._cache_1m(freshness.thresholds()).status == freshness.OK
+    except Exception:
+        return False
+
+
+def session_frame(ticker: str, years: int = 20, source: str | None = None) -> pd.DataFrame:
+    """Regular-session OHLC per day. `source`: daily | 1m | auto (default:
+    `signals.gap_source`). The frame's `attrs["source"]` names what was used."""
     start = (dt.date.today() - dt.timedelta(days=int(years * 365.25))).isoformat()
-    frame = _from_cache(ticker, start)
+    source = source or (load_config().get("signals", {}) or {}).get("gap_source", "daily")
+    frame, used = pd.DataFrame(), source
+    if source == "1m" or (source == "auto" and _cache_is_fresh()):
+        frame, used = _from_cache(ticker, start), "1m"
+        if frame.empty:
+            frame = _from_text_archive(ticker)
     if frame.empty:
-        frame = _from_text_archive(ticker)
+        frame, used = _from_daily(ticker, start), "daily"
     if frame.empty:
         return frame
-    frame = frame[frame["date"] >= pd.Timestamp(start)]
-    return frame.reset_index(drop=True)
+    frame = frame[frame["date"] >= pd.Timestamp(start)].reset_index(drop=True)
+    frame.attrs["source"] = used
+    return frame
 
 
 def _corporate_action_mask(frame: pd.DataFrame, ticker: str,
@@ -207,6 +252,7 @@ def gap_series(ticker: str, years: int = 20,
     if frame.empty or len(frame) < 30:
         return pd.DataFrame()
 
+    source = frame.attrs.get("source", "1m")
     frame = frame.copy()
     previous_close = frame["rth_close"].shift(1)
     frame["overnight"] = frame["rth_open"] / previous_close - 1.0
@@ -217,7 +263,9 @@ def gap_series(ticker: str, years: int = 20,
     frame["overnight_low"] = frame["rth_low"] / previous_close - 1.0
     frame = frame.dropna(subset=["overnight", "intraday"]).reset_index(drop=True)
 
-    if exclude_corporate_actions and not frame.empty:
+    # Daily bars share one adjustment basis with the reference, so there is
+    # no seam to find; the check is for the 1-minute archive.
+    if exclude_corporate_actions and not frame.empty and source != "daily":
         contaminated = _corporate_action_mask(frame, ticker)
         frame["excluded"] = contaminated.to_numpy()
         removed = int(frame["excluded"].sum())
@@ -225,6 +273,7 @@ def gap_series(ticker: str, years: int = 20,
         frame.attrs["excluded_days"] = removed
     else:
         frame.attrs["excluded_days"] = 0
+    frame.attrs["source"] = source
     return frame
 
 
@@ -303,7 +352,7 @@ def profile(ticker: str, years: int = 20) -> GapProfile | None:
     excluded = int(frame.attrs.get("excluded_days", 0))
     if excluded > len(frame) * 0.02:
         note = (f"{excluded} day(s) excluded as corporate actions or archive seams -- "
-                f"more than 2% of the sample. The 1-minute history for this name has "
+                f"more than 2% of the sample. The intraday history for this name has "
                 f"adjustment problems; treat these figures as provisional.")
     elif share > 0.5:
         note = (f"Most of this name's daily variance ({share:.0%}) happens overnight. "
@@ -321,7 +370,8 @@ def profile(ticker: str, years: int = 20) -> GapProfile | None:
         ticker=ticker, observations=len(frame),
         start_date=str(frame["date"].iloc[0].date()),
         end_date=str(frame["date"].iloc[-1].date()),
-        source="1-minute regular session",
+        source=("daily bars (yfinance, regular session)"
+                if frame.attrs.get("source") == "daily" else "1-minute regular session"),
         overnight_vol=on_vol, intraday_vol=id_vol, total_vol=tot_vol,
         overnight_variance_share=share,
         overnight_p01=on_p01, overnight_p05=float(percentiles[1]),
@@ -433,7 +483,7 @@ def universe_profiles(tickers: list[str] | None = None, years: int = 20,
                     reporter.advance(1, note=f"{ticker} "
                                               f"{result.overnight_variance_share:.0%} overnight")
                 else:
-                    reporter.advance(1, note=f"{ticker} insufficient 1-minute data")
+                    reporter.advance(1, note=f"{ticker} insufficient history")
             except Exception as exc:
                 reporter.advance(1, note=f"{ticker} error")
                 reporter.log(f"{ticker}: {type(exc).__name__}: {exc}")

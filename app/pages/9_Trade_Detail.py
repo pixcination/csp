@@ -352,7 +352,10 @@ with tabs[5]:
 # --- Chain & liquidity ------------------------------------------------------------------------
 
 with tabs[6]:
-    block = ((results.manifest.stages or {}).get("chains", {}) or {}).get("block")
+    # The run's own snapshot: its chains stage, else (a --quick run) its session
+    # block -- the latest block may no longer hold this expiration (Phase 17).
+    block = (((results.manifest.stages or {}).get("chains", {}) or {}).get("block")
+             or getattr(results.manifest, "session_block", None))
     chain = td.load_chain_for(row, block)
     window = td.chain_window(chain, row["expiration"], [s[1] for s in strikes])
     if window.empty:
@@ -461,7 +464,7 @@ with tabs[8]:
                         f"≤ {gap.prob_any_gap_through:.1%}")
             st.caption(gap.verdict)
         else:
-            st.caption("No 1-minute history to measure overnight gaps.")
+            st.caption("Not enough daily history to measure overnight gaps.")
     with c[2]:
         st.markdown("**Fit with the current book**")
         try:

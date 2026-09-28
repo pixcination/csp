@@ -61,9 +61,15 @@ def metrics(daily: pd.DataFrame, as_of, drawdown_years: float | None = None) -> 
     }
 
 
-def classify(m: dict, thr: dict) -> tuple[str, list[str]]:
-    """(tier, hard_reasons) with scripts/02's exact rules."""
+def classify(m: dict, thr: dict, category: str | None = None) -> tuple[str, list[str]]:
+    """(tier, hard_reasons) with scripts/02's exact rules. A broad index ETF
+    (`category` broad_index_*) uses `min_rv_broad_index` as its RV floor
+    (Phase 17): calm by design, SPY and DIA failed 0.12 in quiet markets."""
     reasons = []
+    min_rv = thr["min_rv"]
+    if category and str(category).startswith("broad_index") \
+            and thr.get("min_rv_broad_index") is not None:
+        min_rv = float(thr["min_rv_broad_index"])
     if m["days_since_last"] > thr["max_staleness_days"]:
         reasons.append("stale_data")
     if pd.isna(m["adv_90d_dollars"]) or m["adv_90d_dollars"] < thr["min_adv_dollars"]:
@@ -71,7 +77,7 @@ def classify(m: dict, thr: dict) -> tuple[str, list[str]]:
     if not (thr["min_price"] <= m["last_price"] <= thr["max_price"]):
         reasons.append("price_out_of_range")
     rv = m["rv_20d_annualized"]
-    if pd.isna(rv) or not (thr["min_rv"] <= rv <= thr["max_rv"]):
+    if pd.isna(rv) or not (min_rv <= rv <= thr["max_rv"]):
         reasons.append("volatility_out_of_range")
     if (m["max_drawdown"] < thr["max_drawdown_floor"]
             and m["pct_off_peak_now"] < thr["max_drawdown_floor"] * 0.5):
@@ -105,7 +111,9 @@ def screen(symbols: list[str] | None = None, write: bool = True) -> pd.DataFrame
         if m is None:
             row.update(stage1_pass=False, tier="rejected", reasons="insufficient_data")
         else:
-            tier, reasons = classify(m, thr)
+            category = registry.loc[symbol, "category"] if symbol in registry.index \
+                and "category" in registry.columns else None
+            tier, reasons = classify(m, thr, category if isinstance(category, str) else None)
             row.update(m)
             row.update(stage1_pass=tier != "rejected", tier=tier, reasons=";".join(reasons))
         rows.append(row)

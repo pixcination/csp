@@ -3,7 +3,7 @@ Signals -- moving-average levels (Phase 10), overnight gap risk, put skew,
 and single-name term structure.
 
 Three reads that were computable from data already on disk and had never been
-taken. Gap risk comes from the 4.6 GB 1-minute archive; skew and term structure
+taken. Gap risk comes from daily bars (Phase 17; the 1-minute archive is optional); skew and term structure
 come from the chain snapshots. None of them need accumulated history.
 """
 from __future__ import annotations
@@ -162,9 +162,9 @@ with tab_gaps:
         "A short put is rarely destroyed by drift — it is destroyed by a gap. The "
         "stock closes at 52, an announcement lands at 06:40, it opens at 44, and "
         "there was no moment in between at which the position could be defended. "
-        "Daily bars record that as one bad day and imply, wrongly, that it was a "
+        "A close-to-close series records that as one bad day and implies, wrongly, that it was a "
         "path you could react to. Splitting each session into its overnight and "
-        "intraday halves is what the 1-minute archive is uniquely for.")
+        "intraday halves (prior close to open, open to close) shows which it was.")
 
     path = output_dir() / "gap_profiles.csv"
     controls = st.columns([1, 1, 3])
@@ -172,10 +172,10 @@ with tab_gaps:
         from core.progress import StreamlitReporter
         box = st.container()
         reporter = StreamlitReporter(box, [("gaps", "Overnight gap profiles")])
-        with st.spinner("Reading 1-minute history..."):
+        with st.spinner("Reading session history..."):
             frame = gaps.universe_profiles(universe, reporter=reporter)
         if frame.empty:
-            st.error("No usable 1-minute data. Check data/raw_1m/ and the cache.")
+            st.error("No usable session history. Check the daily bars (pipeline daily stage).")
         else:
             frame.to_csv(path, index=False)
             st.success(f"Profiled {len(frame)} tickers.")
@@ -185,7 +185,7 @@ with tab_gaps:
         with st.spinner(f"Reading {single}..."):
             result = gaps.profile(single)
         if result is None:
-            st.warning(f"Not enough 1-minute history for {single}.")
+            st.warning(f"Not enough session history for {single}.")
         else:
             cols = st.columns(5)
             cols[0].metric("Overnight vol", f"{result.overnight_vol:.1%}")

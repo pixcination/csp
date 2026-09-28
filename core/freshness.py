@@ -117,7 +117,7 @@ def _cache_1m(limits: dict) -> Freshness:
     status = WARN if days > limits["cache_1m_days"] else OK
     return Freshness("cache_1m", label, status, str(last.date()), f"{days}d old",
                      "" if status == OK else
-                     "used by gaps.py and intraday RV. Refresh: scripts/06_build_1m_cache.py")
+                     "optional since Phase 17 (gaps use daily bars). Refresh: scripts/06_build_1m_cache.py")
 
 
 def _file(key: str, label: str, path: Path, limit_days: float, hint: str) -> Freshness:

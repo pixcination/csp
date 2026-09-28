@@ -43,6 +43,8 @@ with tab_profiles:
                      "spreads": cfg.get("spread_approval", True),
                      "account type": cfg.get("account_type"),
                      "naked": cfg.get("naked_approval", False),
+                     "naked research-only": cfg.get("naked_research_only", False),
+                     "placeholder": cfg.get("placeholder", False),
                      "strategies": ", ".join(cfg.get("allowed_strategies") or [])})
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
                  column_config={
@@ -89,6 +91,13 @@ with tab_profiles:
                                  value=bool(base.get("naked_approval", False)),
                                  help="Phase 16: strangles and other naked specs. Needs a "
                                       "margin account; never allowed in an IRA.")
+        research_only = cols[2].checkbox(
+            "Naked strategies research-only", value=bool(base.get("naked_research_only", False)),
+            help="Phase 17: strangles appear for comparison but are never auto-tracked.")
+        placeholder = st.checkbox(
+            "These are placeholder values", value=bool(base.get("placeholder", False)),
+            help="Untick once the account value and limits are real; the Screener warns "
+                 "while it is set.")
         saved = st.form_submit_button("Save profile", type="primary")
     if saved:
         try:
@@ -100,7 +109,8 @@ with tab_profiles:
                 "cash_buffer_pct": buffer / 100, "max_open_positions": int(max_pos),
                 "allowed_strategies": strategies, "require_cash_secured": cash_secured,
                 "spread_approval": spreads, "account_type": account_type,
-                "naked_approval": naked})
+                "naked_approval": naked, "naked_research_only": research_only,
+                "placeholder": placeholder})
             st.success(f"Saved profile '{stored}'.")
             st.rerun()
         except us.SettingsError as exc:

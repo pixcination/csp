@@ -1,0 +1,9 @@
+{
+  "name": "PCS default (scan_defaults written out: 4% wide, nearest 45 DTE, all names)",
+  "strategies": ["pcs"],
+  "pcs_dte_targets": [45],
+  "spread_width_pct": [4],
+  "account_profile": "default",
+  "universe": "all",
+  "top_n_underlyings": "all"
+}

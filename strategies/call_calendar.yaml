@@ -3,6 +3,7 @@ label: Long call calendar
 family: neutral volatility
 description: Sell a 14-DTE ATM call, buy the same strike at 21 DTE. Profits if the stock pins near the strike and back-month IV holds.
 margin_class: defined_risk
+premium: debit
 event_policy_as: pcs
 expirations:
   front: {dte_target: 14, tolerance: 4}

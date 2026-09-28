@@ -43,6 +43,30 @@ OUTPUTS per trade and model (and blended)
   when hit is under `management.exit.min_net_gain_to_close_early` is marked
   `below_min_gain`: at 7 DTE the table shows why early targets do not pay.
 
+LOSS STOPS AND THE SHIPPED POLICY (Phase 17, review decision 3)
+---------------------------------------------------------------
+A trade given `loss_stop_multiple` k gets stop policies alongside the rest:
+`stop_{k}x` (hold, but close once the loss reaches k x the credit -- k x the
+debit for a debit trade), `close_{X}_stop_{k}x`, and with the time stop
+`..._or_{T}dte`. `TradeSpec.managed` names the rules actually run (for a put
+spread: management.spread -- target above the hold horizon, the 2x stop, the
+21-DTE time stop; for a spec position: its `exit` block), and with
+`headline_policy: shipped` that policy is the headline the sheet ranks on.
+Two model fixes keep stops from looking artificially cheap or dear:
+
+* **Stops trigger on marks, not closes.** Each step also carries the day's
+  low and high: H and T bootstrap the real daily low/high (relative to the
+  prior close) alongside the close; G draws them from the Brownian bridge
+  between consecutive closes. A stop fires when the position's value at the
+  day's worse extreme crosses the level, and fills AT the level -- or at the
+  close when the close is already beyond it (a gap through the stop).
+* **IV moves with spot** (H and T). Each leg's IV scales by
+  exp(beta x log return), clipped to `iv_clip` x entry IV. beta is the index
+  spot-vol beta (d ln VIX / d ln SPY, estimated from the reference data,
+  about -5) scaled to the name by rho x sigma_SPY / sigma_name -- the part of
+  the name's move the market explains. G stays sticky-strike: its marks must
+  remain a martingale for G to be the zero-edge baseline.
+
 The blend is a weighted mean of the models present (config weights, default
 equal). It is NOT claimed to be better than any single model until
 `scripts/validate_prob_engine.py` and paper-book calibration have scored it.
@@ -89,6 +113,13 @@ class EngineConfig:
     min_net_gain: float = 5.0
     rsi_buckets: tuple = (30.0, 50.0, 70.0)
     support_atr_buckets: tuple = (1.0, 3.0)
+    # Phase 17
+    intraday_stops: bool = True
+    spot_vol: bool = True
+    spot_vol_index_beta: float | None = None     # None = estimate from VIX vs SPY
+    spot_vol_lookback_years: int = 5
+    spot_vol_name_years: int = 1
+    iv_clip: tuple = (0.5, 3.0)
 
     @classmethod
     def from_config(cls) -> "EngineConfig":
@@ -98,7 +129,7 @@ class EngineConfig:
         for key, value in pe.items():
             if hasattr(out, key) and value is not None:
                 setattr(out, key, tuple(value) if isinstance(value, list)
-                        and key.endswith("buckets") else value)
+                        and (key.endswith("buckets") or key == "iv_clip") else value)
         out.rate = float((cfg.get("analytics", {}) or {}).get("risk_free_rate", out.rate))
         out.roll_delta = float(((cfg.get("management", {}) or {}).get("defense", {}) or {})
                                .get("roll_when_delta_beyond", out.roll_delta))
@@ -179,6 +210,8 @@ class PathSet:
     effective_n: int = 0
     flag: str = ""
     normals: np.ndarray | None = None   # G: cumulative standard normals (paths, n_steps)
+    log_low: np.ndarray | None = None   # Phase 17: day's low / high, cumulative log vs spot
+    log_high: np.ndarray | None = None
 
     @property
     def available(self) -> bool:
@@ -209,6 +242,9 @@ def _daily_log_returns(daily: pd.DataFrame, years: int) -> pd.DataFrame:
     frame["date"] = pd.to_datetime(frame["date"])
     close = frame["close"].astype(float)
     frame["ret"] = np.log(close / close.shift(1))
+    if {"low", "high"} <= set(frame.columns):
+        frame["lo"] = np.log(frame["low"].astype(float) / close.shift(1))
+        frame["hi"] = np.log(frame["high"].astype(float) / close.shift(1))
     frame["rv"] = frame["ret"].rolling(20).std() * math.sqrt(252)
     if years:
         frame = frame[frame["date"] >= frame["date"].max() - pd.DateOffset(years=years)]
@@ -216,14 +252,49 @@ def _daily_log_returns(daily: pd.DataFrame, years: int) -> pd.DataFrame:
 
 
 def bootstrap(returns: np.ndarray, starts: np.ndarray, n_paths: int, n_steps: int,
-              block: int, rng: np.random.Generator) -> np.ndarray:
+              block: int, rng: np.random.Generator,
+              extremes: tuple[np.ndarray, np.ndarray] | None = None):
     """Block bootstrap: each path strings together blocks of `block`
-    consecutive daily returns beginning at randomly chosen `starts`."""
+    consecutive daily returns beginning at randomly chosen `starts`.
+
+    With `extremes` = (low, high) per day as log moves from the prior close,
+    the same days' extremes are returned too: (closes, lows, highs), each
+    cumulative from spot. The random draws are identical either way."""
     n_blocks = -(-n_steps // block)
     picks = rng.choice(starts, size=(n_paths, n_blocks))
     index = picks[..., None] + np.arange(block)
-    sample = returns[index].reshape(n_paths, n_blocks * block)[:, :n_steps]
-    return np.cumsum(sample, axis=1)
+    index = index.reshape(n_paths, n_blocks * block)[:, :n_steps]
+    closes = np.cumsum(returns[index], axis=1)
+    if extremes is None:
+        return closes
+    prior = np.zeros_like(closes)
+    prior[:, 1:] = closes[:, :-1]
+    return closes, prior + extremes[0][index], prior + extremes[1][index]
+
+
+def _extremes(frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray] | None:
+    """Per day, the low and high as log moves from the prior close, bounded
+    so the close lies between them (bad prints happen)."""
+    if not {"lo", "hi"} <= set(frame.columns):
+        return None
+    ret = frame["ret"].to_numpy(float)
+    lo = np.minimum(np.nan_to_num(frame["lo"].to_numpy(float), nan=0.0), np.minimum(ret, 0.0))
+    hi = np.maximum(np.nan_to_num(frame["hi"].to_numpy(float), nan=0.0), np.maximum(ret, 0.0))
+    return lo, hi
+
+
+def bridge_extremes(log_closes: np.ndarray, step_vol: float, rng: np.random.Generator
+                    ) -> tuple[np.ndarray, np.ndarray]:
+    """G: the minimum and maximum of a Brownian bridge between consecutive
+    log closes (exact for GBM): m = (a + b - sqrt((b - a)^2 - 2 s^2 ln U)) / 2."""
+    prior = np.zeros_like(log_closes)
+    prior[:, 1:] = log_closes[:, :-1]
+    diff2 = (log_closes - prior) ** 2
+    var = step_vol * step_vol
+    u = rng.random((2,) + log_closes.shape)
+    low = (prior + log_closes - np.sqrt(diff2 - 2.0 * var * np.log(u[0]))) / 2.0
+    high = (prior + log_closes + np.sqrt(diff2 - 2.0 * var * np.log(u[1]))) / 2.0
+    return low, high
 
 
 def h_paths(daily: pd.DataFrame, n_steps: int, cfg: EngineConfig,
@@ -245,8 +316,11 @@ def h_paths(daily: pd.DataFrame, n_steps: int, cfg: EngineConfig,
     else:
         starts = candidates
         label += f" (RV~{rv_now:.0%} matched only {len(conditioned)} days; unconditioned)"
-    paths = bootstrap(returns, starts, cfg.n_paths, n_steps, cfg.block_days, rng)
-    return (PathSet("H", paths, label, len(starts), len(starts) // cfg.block_days),
+    ext = _extremes(frame) if cfg.intraday_stops else None
+    drawn = bootstrap(returns, starts, cfg.n_paths, n_steps, cfg.block_days, rng, ext)
+    paths, low, high = drawn if ext is not None else (drawn, None, None)
+    return (PathSet("H", paths, label, len(starts), len(starts) // cfg.block_days,
+                    log_low=low, log_high=high),
             frame, starts)
 
 
@@ -293,9 +367,12 @@ def t_paths(returns_frame: pd.DataFrame, h_starts: np.ndarray, state: pd.DataFra
                        flag="fell back to H")
     kept = ", ".join(f"{c}={v}" for c, v in checks)
     label = f"state {kept}" + (f" (relaxed: {', '.join(dropped)})" if dropped else "")
-    paths = bootstrap(returns, starts, cfg.n_paths, n_steps, cfg.block_days, rng)
+    ext = _extremes(returns_frame) if cfg.intraday_stops else None
+    drawn = bootstrap(returns, starts, cfg.n_paths, n_steps, cfg.block_days, rng, ext)
+    paths, low, high = drawn if ext is not None else (drawn, None, None)
     return PathSet("T", paths, label, int(len(starts)), int(len(starts)) // cfg.block_days,
-                   flag=f"relaxed {', '.join(dropped)}" if dropped else "")
+                   flag=f"relaxed {', '.join(dropped)}" if dropped else "",
+                   log_low=low, log_high=high)
 
 
 # --- Evaluation ------------------------------------------------------------------------
@@ -312,6 +389,27 @@ class TradeSpec:
     cash_settled: bool = False
     event_day: int | None = None        # calendar days to an earnings date inside the trade
     rv: float | None = None             # realised vol target for IV mean reversion
+    # Phase 17
+    loss_stop_multiple: float | None = None   # stop policies at k x the credit (or debit)
+    managed: dict | None = None         # the shipped rules: {target, stop, time_stop}
+    spot_vol_beta: float | None = None  # d ln IV / d ln S for this name (H and T)
+
+
+def managed_policy_name(managed: dict | None, dte_calendar: int) -> str | None:
+    """The policy key the shipped rules map to, or None without rules.
+    `managed` = {target: % of max profit or None, stop: k or None,
+    time_stop: calendar DTE or None}; a time stop only exists for a trade
+    entered above it."""
+    if not managed:
+        return None
+    target, stop, time_stop = managed.get("target"), managed.get("stop"), managed.get("time_stop")
+    time_stop = int(time_stop) if time_stop and dte_calendar > int(time_stop) else None
+    name = f"close_{int(target)}" if target else ""
+    if stop:
+        name += f"{'_' if name else ''}stop_{float(stop):g}x"
+    if time_stop:
+        name = f"{name}_or_{time_stop}dte" if name else f"time_stop_{time_stop}"
+    return name or "hold"
 
 
 def _fees(spec: TradeSpec) -> tuple[float, float, np.ndarray]:
@@ -332,18 +430,14 @@ def _fees(spec: TradeSpec) -> tuple[float, float, np.ndarray]:
     return entry, close, per_leg
 
 
-def evaluate(spec: TradeSpec, log_returns: np.ndarray, targets: list[int],
-             cfg: EngineConfig) -> dict:
-    """Every output for one trade under one set of paths."""
-    pos = spec.position
-    n_paths, n_steps = log_returns.shape
-    n = max(int(spec.contracts), 1)
-    cal_elapsed = spec.dte_calendar * np.arange(1, n_steps + 1) / n_steps
-    tau = np.maximum(spec.dte_calendar - cal_elapsed, 0.0) / 365.0
-    tau[-1] = 0.0
-    log_spot = math.log(spec.spot) + log_returns
+def _position_value(pos, spec: TradeSpec, cfg: EngineConfig, log_spot: np.ndarray,
+                    cal_elapsed: np.ndarray, tau: np.ndarray, iv_scale: np.ndarray | None,
+                    want_delta: bool = False):
+    """Signed value of every leg per share over a (paths, steps) grid of log
+    spot. `iv_scale` (paths, steps) multiplies each leg's IV path (spot-vol
+    dynamics); None = sticky strike. Returns (value, short put delta or None)."""
+    n_steps = log_spot.shape[1]
     spot_paths = np.exp(log_spot)
-
     value = np.zeros_like(spot_paths)
     short_delta = None
     offsets = pos.expiry_offsets() if hasattr(pos, "expiry_offsets") else [0] * len(pos.legs)
@@ -369,14 +463,49 @@ def evaluate(spec: TradeSpec, log_returns: np.ndarray, targets: list[int],
         if offset:
             iv = np.array(iv, dtype=float, copy=True)
             iv[-1] = pos.later_leg_vol(leg, offset, spec.dte_calendar) * (iv[-1] / iv0)
-        price, d1 = bs_price_grid(spot_paths, leg.strike, leg_tau, iv, cfg.rate,
-                                  leg.option_type, log_spot)
+        if iv_scale is None:
+            price, d1 = bs_price_grid(spot_paths, leg.strike, leg_tau, iv, cfg.rate,
+                                      leg.option_type, log_spot)
+        else:
+            price, d1 = bs_price(spot_paths, leg.strike, leg_tau[None, :],
+                                 iv[None, :] * iv_scale, cfg.rate, leg.option_type)
         value += leg.sign * leg.qty * price
-        if leg.side == "short" and short_delta is None and leg.option_type == "put":
+        if want_delta and leg.side == "short" and short_delta is None \
+                and leg.option_type == "put":
             short_delta = np.where(np.isfinite(d1), ndtr(d1) - 1.0,
                                    np.where(spot_paths < leg.strike, -1.0, 0.0))
+    return value, short_delta
 
+
+def _iv_scale(log_moves: np.ndarray, beta: float | None, cfg: EngineConfig):
+    if not beta:
+        return None
+    lo, hi = cfg.iv_clip
+    return np.clip(np.exp(beta * log_moves), lo, hi)
+
+
+def evaluate(spec: TradeSpec, log_returns: np.ndarray, targets: list[int],
+             cfg: EngineConfig, log_low: np.ndarray | None = None,
+             log_high: np.ndarray | None = None, spot_vol_beta: float | None = None) -> dict:
+    """Every output for one trade under one set of paths.
+
+    `log_low` / `log_high` (Phase 17): each day's extremes, cumulative log vs
+    spot -- stops then trigger on them; without them, on closes.
+    `spot_vol_beta`: leg IVs follow spot (None = sticky strike)."""
+    pos = spec.position
+    n_paths, n_steps = log_returns.shape
+    n = max(int(spec.contracts), 1)
+    cal_elapsed = spec.dte_calendar * np.arange(1, n_steps + 1) / n_steps
+    tau = np.maximum(spec.dte_calendar - cal_elapsed, 0.0) / 365.0
+    tau[-1] = 0.0
+    log_spot = math.log(spec.spot) + log_returns
+    spot_paths = np.exp(log_spot)
+
+    value, short_delta = _position_value(pos, spec, cfg, log_spot, cal_elapsed, tau,
+                                         _iv_scale(log_returns, spot_vol_beta, cfg),
+                                         want_delta=True)
     pnl = pos.credit + value                         # per share, (paths, steps)
+    offsets = pos.expiry_offsets() if hasattr(pos, "expiry_offsets") else [0] * len(pos.legs)
     max_profit = pos.max_profit
     s_t = spot_paths[:, -1]
     entry, close_fee, leg_fee = _fees(spec)
@@ -438,9 +567,11 @@ def evaluate(spec: TradeSpec, log_returns: np.ndarray, targets: list[int],
             if any_hit.any() else None
 
     # --- Policies (net of fees, all contracts) ---
-    def settle(exit_step: np.ndarray, closed_early: np.ndarray) -> dict:
+    def settle(exit_step: np.ndarray, closed_early: np.ndarray,
+               per_share: np.ndarray | None = None) -> dict:
         rows = np.arange(n_paths)
-        per_share = pnl[rows, exit_step]
+        if per_share is None:
+            per_share = pnl[rows, exit_step]
         dollars = per_share * 100.0 * n - entry
         dollars -= np.where(closed_early, close_fee, expiry_fees)
         days = cal_elapsed[exit_step]
@@ -451,41 +582,114 @@ def evaluate(spec: TradeSpec, log_returns: np.ndarray, targets: list[int],
                 "ev_per_day_bpr": ev / spec.bpr / max(mean_days, 1.0) if spec.bpr else None}
 
     last = n_steps - 1
-    policies: dict[str, dict] = {}
-    hold = settle(np.full(n_paths, last), np.zeros(n_paths, bool))
-    policies["hold"] = hold
-    stop_step = None
-    if spec.dte_calendar > cfg.time_stop_dte:
+    never = np.full(n_paths, n_steps)
+
+    def time_step(dte_stop: int | None):
+        if not dte_stop or spec.dte_calendar <= dte_stop:
+            return None
         remaining = spec.dte_calendar - cal_elapsed
-        stop_step = int(np.argmax(remaining <= cfg.time_stop_dte))
-        policies[f"time_stop_{cfg.time_stop_dte}"] = settle(np.full(n_paths, stop_step),
-                                                            np.ones(n_paths, bool))
+        return int(np.argmax(remaining <= dte_stop))
+
+    # Loss stop (Phase 17): first day the position's value at the day's worse
+    # extreme is k x the credit (debit) under water; filled at the level, or
+    # at the close when the close is already through it.
+    stop_ks = sorted({float(k) for k in [spec.loss_stop_multiple,
+                                        (spec.managed or {}).get("stop")] if k})
+    stops: dict[float, tuple[np.ndarray, np.ndarray]] = {}
+    if stop_ks:
+        basis = abs(float(pos.credit))
+        worst = pnl
+        if log_low is not None and log_high is not None and basis > 0:
+            puts_only = all(getattr(l, "is_stock", False) or l.option_type == "put"
+                            for l in pos.legs)
+            for extreme, needed in ((log_low, True), (log_high, not puts_only)):
+                if not needed:
+                    continue
+                ext_log = math.log(spec.spot) + extreme
+                v, _ = _position_value(pos, spec, cfg, ext_log, cal_elapsed, tau,
+                                       _iv_scale(extreme, spot_vol_beta, cfg))
+                worst = np.minimum(worst, pos.credit + v)
+        for k in stop_ks:
+            level = -k * basis
+            crossed = worst <= level + 1e-12 if basis > 0 else np.zeros_like(pnl, dtype=bool)
+            step = np.where(crossed.any(axis=1), crossed.argmax(axis=1), n_steps)
+            rows = np.arange(n_paths)
+            at = np.minimum(step, last)
+            fill = np.where(pnl[rows, at] <= level, pnl[rows, at], level)
+            stops[k] = (step, fill)
+
+    def policy(first_target: np.ndarray | None, stop: float | None,
+               t_step: int | None) -> dict:
+        target_step = first_target if first_target is not None else never
+        stop_step, stop_fill = stops[stop] if stop else (never, None)
+        timed = np.full(n_paths, t_step if t_step is not None else n_steps)
+        chosen = np.minimum(np.minimum(target_step, stop_step), timed)
+        exit_step = np.minimum(chosen, last)
+        via_stop = (stop_step <= np.minimum(target_step, timed)) & (stop_step < n_steps)
+        closed = (exit_step < last) | via_stop | ((timed < n_steps) & (exit_step == timed))
+        per_share = None
+        if stop:
+            rows = np.arange(n_paths)
+            per_share = np.where(via_stop, stop_fill, pnl[rows, exit_step])
+        result = settle(exit_step, closed, per_share)
+        if stop:
+            result["p_stopped"] = float(np.mean(via_stop))
+        return result
+
+    policies: dict[str, dict] = {}
+    policies["hold"] = policy(None, None, None)
+    stop_step_t = time_step(cfg.time_stop_dte)
+    if stop_step_t is not None:
+        policies[f"time_stop_{cfg.time_stop_dte}"] = policy(None, None, stop_step_t)
     for x, first in first_hit.items():
-        hit = first <= last
-        exit_step = np.where(hit, first, last)
-        closed = hit & (exit_step < last)
-        policy = settle(exit_step, closed)
         gain = (x / 100.0) * max_profit * 100.0 * n - entry - close_fee
-        policy["net_gain_when_hit"] = gain
-        policy["below_min_gain"] = bool(gain < cfg.min_net_gain)
-        policies[f"close_{x}"] = policy
-        if stop_step is not None:
-            exit_step = np.where(first <= stop_step, first, stop_step)
-            p2 = settle(exit_step, np.ones(n_paths, bool))
-            p2["net_gain_when_hit"] = gain
-            p2["below_min_gain"] = policy["below_min_gain"]
-            policies[f"close_{x}_or_{cfg.time_stop_dte}dte"] = p2
+        variants = [(f"close_{x}", None, None)]
+        if stop_step_t is not None:
+            variants.append((f"close_{x}_or_{cfg.time_stop_dte}dte", None, stop_step_t))
+        for k in stop_ks:
+            variants.append((f"close_{x}_stop_{k:g}x", k, None))
+            if stop_step_t is not None:
+                variants.append((f"close_{x}_stop_{k:g}x_or_{cfg.time_stop_dte}dte", k,
+                                 stop_step_t))
+        for name, k, t_step in variants:
+            result = policy(first, k, t_step)
+            result["net_gain_when_hit"] = gain
+            result["below_min_gain"] = bool(gain < cfg.min_net_gain)
+            policies[name] = result
+    for k in stop_ks:
+        policies[f"stop_{k:g}x"] = policy(None, k, None)
+        if stop_step_t is not None:
+            policies[f"stop_{k:g}x_or_{cfg.time_stop_dte}dte"] = policy(None, k, stop_step_t)
+    # The shipped rules, when they need a combination not generated above
+    # (e.g. a spec's own time stop).
+    managed = managed_policy_name(spec.managed, spec.dte_calendar)
+    if managed and managed not in policies:
+        m = spec.managed or {}
+        target = int(m["target"]) if m.get("target") else None
+        if target and target not in first_hit:
+            reached = pnl >= (target / 100.0) * max_profit
+            first_t = np.where(reached.any(axis=1), reached.argmax(axis=1), n_steps)
+        else:
+            first_t = first_hit.get(target) if target else None
+        policies[managed] = policy(first_t, float(m["stop"]) if m.get("stop") else None,
+                                   time_step(m.get("time_stop")))
+    if managed:
+        out["managed_policy"] = managed
     out["policies"] = policies
     out["curves"] = curves
     out["curve_days"] = cal_elapsed
     return out
 
 
-def headline_policy(policies: dict, dte_calendar: int, cfg: EngineConfig) -> str:
-    """`auto`: hold to expiry at or under auto_hold_max_dte (fees make early
-    closes uneconomic -- exit_rules.py), else close at 50% (or the nearest
-    target)."""
-    if cfg.headline_policy != "auto" and cfg.headline_policy in policies:
+def headline_policy(policies: dict, dte_calendar: int, cfg: EngineConfig,
+                    managed: str | None = None) -> str:
+    """`shipped` (Phase 17): the rules actually run -- `managed`, the trade's
+    own policy name -- when it has one, else `auto`. `auto`: hold to expiry
+    at or under auto_hold_max_dte (fees make early closes uneconomic --
+    exit_rules.py), else close at 50% (or the nearest target)."""
+    if cfg.headline_policy == "shipped" and managed and managed in policies:
+        return managed
+    if cfg.headline_policy not in ("auto", "shipped") and cfg.headline_policy in policies:
         return cfg.headline_policy
     if dte_calendar <= cfg.auto_hold_max_dte:
         return "hold"
@@ -497,6 +701,66 @@ def headline_policy(policies: dict, dte_calendar: int, cfg: EngineConfig) -> str
     # not the headline: measured 2026-09-27 on SPY/QQQ 30-45 DTE spreads it
     # lowered EV under H and T (it pays extrinsic still priced at IV > RV).
     return f"close_{min(targets, key=lambda t: abs(t - 50))}"
+
+
+# --- Spot-vol beta (Phase 17) -------------------------------------------------------------
+
+_INDEX_BETA: dict[int, float | None] = {}
+
+
+def index_spot_vol_beta(cfg: EngineConfig) -> float | None:
+    """d ln VIX / d ln SPY over `spot_vol_lookback_years` (reference data),
+    unless `spot_vol_index_beta` fixes it. Cached per lookback."""
+    if cfg.spot_vol_index_beta is not None:
+        return float(cfg.spot_vol_index_beta)
+    years = int(cfg.spot_vol_lookback_years)
+    if years in _INDEX_BETA:
+        return _INDEX_BETA[years]
+    beta = None
+    try:
+        from core.paths import reference_dir
+        from data_sources.yfinance_sync import load_daily
+        vix = pd.read_parquet(reference_dir() / "vol_indices.parquet", columns=["date", "VIX"])
+        spy = load_daily("SPY", basis="price")[["date", "close"]]
+        vix["date"], spy["date"] = pd.to_datetime(vix["date"]), pd.to_datetime(spy["date"])
+        m = vix.merge(spy, on="date").sort_values("date")
+        m = m[m["date"] >= m["date"].max() - pd.DateOffset(years=years)]
+        dv, r = np.log(m["VIX"]).diff(), np.log(m["close"]).diff()
+        ok = dv.notna() & r.notna()
+        if ok.sum() > 100:
+            beta = float(np.polyfit(r[ok], dv[ok], 1)[0])
+    except Exception:
+        beta = None
+    _INDEX_BETA[years] = beta
+    return beta
+
+
+def name_spot_vol_beta(daily: pd.DataFrame, cfg: EngineConfig,
+                       spy: pd.DataFrame | None = None) -> float | None:
+    """The index beta scaled to one name by the part of its move the market
+    explains: beta_index x rho(name, SPY) x sigma_SPY / sigma_name, over
+    `spot_vol_name_years`. None when disabled or not estimable."""
+    if not cfg.spot_vol:
+        return None
+    index_beta = index_spot_vol_beta(cfg)
+    if index_beta is None or daily is None or len(daily) < 60:
+        return None
+    try:
+        if spy is None:
+            from data_sources.yfinance_sync import load_daily
+            spy = load_daily("SPY", basis="price")
+        a = daily[["date", "close"]].copy()
+        b = spy[["date", "close"]].rename(columns={"close": "spy"})
+        a["date"], b["date"] = pd.to_datetime(a["date"]), pd.to_datetime(b["date"])
+        m = a.merge(b, on="date").sort_values("date")
+        m = m[m["date"] >= m["date"].max() - pd.DateOffset(years=int(cfg.spot_vol_name_years))]
+        r_name, r_spy = np.log(m["close"]).diff().dropna(), np.log(m["spy"]).diff().dropna()
+        if len(r_name) < 60 or r_name.std() <= 0:
+            return None
+        rho = float(np.corrcoef(r_name, r_spy)[0, 1])
+        return float(index_beta * rho * r_spy.std() / r_name.std())
+    except Exception:
+        return None
 
 
 # --- Per-ticker driver ----------------------------------------------------------------
@@ -538,7 +802,13 @@ def run_trade(spec: TradeSpec, paths: TickerPaths, targets: list[int],
     results: dict[str, dict] = {}
     meta: dict[str, dict] = {}
     g = g_log_returns(paths.normals, vol, cfg.rate, years)
-    results["G"] = evaluate(spec, g, targets, cfg)
+    wants_stops = bool(spec.loss_stop_multiple or (spec.managed or {}).get("stop"))
+    g_low = g_high = None
+    if wants_stops and cfg.intraday_stops:
+        rng = np.random.default_rng(cfg.seed + g.shape[1])
+        g_low, g_high = bridge_extremes(g, vol * math.sqrt(years / g.shape[1]), rng)
+    # G stays sticky strike: its marks must remain a martingale (zero edge).
+    results["G"] = evaluate(spec, g, targets, cfg, g_low, g_high)
     meta["G"] = {"label": f"GBM at the short leg's IV {vol:.0%}", "effective_n": cfg.n_paths,
                  "flag": ""}
     for name in ("H", "T"):
@@ -546,8 +816,19 @@ def run_trade(spec: TradeSpec, paths: TickerPaths, targets: list[int],
         meta[name] = {"label": ps.label, "effective_n": ps.effective_n, "flag": ps.flag,
                       "n_starts": ps.n_starts}
         if ps.log_returns is not None:
-            results[name] = evaluate(spec, ps.log_returns, targets, cfg)
-    return {"models": results, "meta": meta, "blend": blend(results, cfg)}
+            beta = spec.spot_vol_beta if cfg.spot_vol else None
+            results[name] = evaluate(spec, ps.log_returns, targets, cfg,
+                                     ps.log_low if wants_stops else None,
+                                     ps.log_high if wants_stops else None, beta)
+    if beta_note := (spec.spot_vol_beta if cfg.spot_vol else None):
+        for name in ("H", "T"):
+            if name in meta and name in results:
+                meta[name]["label"] += f"; IV beta {beta_note:+.1f}"
+    out = {"models": results, "meta": meta, "blend": blend(results, cfg)}
+    managed = managed_policy_name(spec.managed, spec.dte_calendar)
+    if managed:
+        out["blend"]["managed_policy"] = managed
+    return out
 
 
 SCALARS = ("pop", "p_touch_short", "p_short_itm", "p_max_loss", "p_assign", "p_roll_trigger")
@@ -572,7 +853,7 @@ def blend(results: dict[str, dict], cfg: EngineConfig) -> dict:
     policies = {}
     for name in next(iter(results.values()))["policies"]:
         policy = {}
-        for key in ("ev", "p_profit", "days", "annualised", "ev_per_day_bpr"):
+        for key in ("ev", "p_profit", "days", "annualised", "ev_per_day_bpr", "p_stopped"):
             values = [(w[m], r["policies"][name].get(key)) for m, r in results.items()
                       if r["policies"].get(name, {}).get(key) is not None]
             if values:

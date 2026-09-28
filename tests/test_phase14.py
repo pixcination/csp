@@ -326,10 +326,11 @@ def test_symbol_panel_is_point_in_time_on_real_bars():
             assert row["outcome"].item() == pytest.approx(panel["outcome"].iloc[0])
 
 
-def test_calibrated_preset_ships_and_default_is_unchanged():
+def test_calibrated_preset_ships_and_is_the_default():
+    # Phase 17 (review B.2, Tom 2026-09-28): `calibrated` became the default.
     from core import user_settings as us
     presets = us.weight_presets()
-    assert "calibrated" in presets and us.default_weight_preset() == "balanced"
+    assert "calibrated" in presets and us.default_weight_preset() == "calibrated"
     assert presets["calibrated"]["trend"] == 0.0 and presets["calibrated"]["support"] == 0.0
     assert sum(presets["calibrated"].values()) == pytest.approx(1.0)
 
@@ -361,6 +362,11 @@ def test_screener_page_runs_and_lists_the_run():
     assert not at.exception, [e.message for e in at.exception]
     assert at.title[0].value == "Screener"
     at.radio(key=[w.key for w in at.radio if w.key and w.key.endswith("strat")][0]).set_value("Both").run()
+    assert not at.exception
+    # Phase 17: no request until an account profile is chosen explicitly.
+    assert any("choose an account profile" in e.value for e in at.error)
+    at.selectbox(key=[w.key for w in at.selectbox
+                      if w.key and w.key.endswith("profile")][0]).set_value("default").run()
     assert not at.exception
     assert any("CSP + PCS" in c.value or "csp" in c.value.lower() for c in at.caption)
 

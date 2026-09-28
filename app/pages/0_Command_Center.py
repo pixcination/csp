@@ -108,10 +108,13 @@ with left:
         lo, hi = base.dte_window()
         dte = st.slider("DTE window", 0, 90, (lo, hi))
         profiles = user_settings.profile_names()
+        # Phase 17: an explicit choice, never a silent $3M default.
+        preselect = base.account_profile if base.account_profile in profiles             and base.account_profile != "default" else None
         profile = st.selectbox("Account profile", profiles,
-                               index=profiles.index(base.account_profile)
-                               if base.account_profile in profiles else 0,
-                               help="Define profiles on the Settings page.")
+                               index=profiles.index(preselect) if preselect else None,
+                               format_func=user_settings.profile_label,
+                               placeholder="Choose the account to size for",
+                               help="Required. Define profiles on the Settings page.")
         presets = list(user_settings.weight_presets())
         current = base.ranking_weights if isinstance(base.ranking_weights, str) else presets[0]
         weights = st.selectbox("Ranking weights", presets,
@@ -124,6 +127,8 @@ with left:
         top_n = None if all_names else st.number_input(
             "Top N underlyings", 1, 200, value=base.top_n or 15)
     try:
+        if profile is None:
+            raise RequestError("choose an account profile")
         overrides = {"strategies": strategies, "account_profile": profile,
                      "ranking_weights": weights,
                      "top_n_underlyings": "all" if all_names else int(top_n)}

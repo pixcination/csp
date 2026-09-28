@@ -1,6 +1,6 @@
 # Architecture
 
-How the CSP / wheel screener is built **as of Phase 14** (2026-09-27). This
+How the CSP / wheel screener is built **as of Phase 17** (2026-09-28). This
 file describes the code as it is. Where the system is going is in
 [SCREENER_ROADMAP.md](SCREENER_ROADMAP.md); what each phase changed is in
 `docs/PHASE{N}_SUMMARY.md` (Phase 1: [PHASE1_NOTES.md](PHASE1_NOTES.md)). The
@@ -75,7 +75,7 @@ D:\csp\
 ├── examples/              saved ScanRequest JSON files (Phase 11)
 ├── config/                versioned hand-maintained inputs (Phase 9)
 │   ├── macro_calendar.yaml  FOMC / CPI / NFP dates, sourced
-│   ├── user_settings.yaml   account profiles, weight presets (Settings page) and saved scan requests (Screener)
+│   ├── user_settings.yaml   account profiles (roth_ira / traditional_ira / taxable since Phase 17, placeholder values until entered), weight presets (Settings page) and saved scan requests (Screener)
 │   └── universe.csv         snapshot of the registry, rewritten on every change
 ├── core/                  cross-cutting infrastructure
 │   ├── paths.py           every path; no module builds one from a literal
@@ -103,7 +103,7 @@ D:\csp\
 │   ├── components/        charts.py, formatting.py, run_state.py, status.py
 │   └── pages/             8_Screener (landing), 9_Trade_Detail, 0_Command_Center … 7_Settings
 ├── scripts/               CLI entry points (section 8)
-├── tests/                 test_foundation, test_phase3 … test_phase14 (+ fixtures/csp_golden)
+├── tests/                 test_foundation, test_phase3 … test_phase17 (+ fixtures/csp_golden)
 ├── vendor/tastytrade/     vendored client (tastytrade_common, snapshot_loop)
 ├── legacy/                the retired Phase-2 stack; not imported (Phase 8)
 ├── weekly_move_analysis/  the original move study, kept as a script
@@ -121,13 +121,13 @@ D:\csp\
 | Store | Written by | Contents |
 |---|---|---|
 | `data/universe.duckdb` → `universe` | `data_sources/universe.py`, Universe page | The registry: symbol, `yf_symbol`, `tt_symbol`, `price_scale`, `asset_class` (stock/etf/index), category/sector/industry, optionable, weeklies, leverage flag, settlement (physical/cash), exercise (american/european), AM/PM settlement times, active, tags, notes, Stage 1 verdict. Mirrored to `config/universe.csv`. |
-| same → `market_metrics` | `data_sources/tasty_metrics.py` | One row per symbol per day: IV index, IVR (tos and tw), IVP, 30-day IV/HV, liquidity rating, beta, expected earnings, per-expiration IV with settlement type. |
+| same → `market_metrics` | `data_sources/tasty_metrics.py` | One row per symbol per day: IV index, IVR (tos and tw), IVP, 30-day IV/HV, liquidity rating, beta, expected earnings, per-expiration IV with settlement type. Stored raw (the tos IVR is unbounded, e.g. 1.11); consumers clamp to [0, 1] (Phase 17). `previous()` gives each symbol's prior snapshot (regime hysteresis). |
 | same → `events` | `data_sources/events.py` | Derived each run: earnings (merged sources), ex-dividend (history + projection), splits, FOMC/CPI/NFP, OPEX, quad witching. |
 | `data/universe_daily.duckdb` → `daily_bars_raw` | `yfinance_sync.sync_daily` | Raw daily OHLCV from yfinance `auto_adjust=False` (Close is split-adjusted, not dividend-adjusted), Yahoo `adj_close`, dividends, splits. One row per ticker/date, under the canonical symbol (XSP is stored as ^SPX × 0.1). |
 | same → `daily_bars`, `ticker_meta` | `scripts/01` | Legacy daily bars resampled from the 1-minute archive (split-adjusted). Fallback only. |
 | `data/technicals.duckdb` → `indicator_latest`, `level_stats`, `oscillator_stats`, `support_latest` | `analytics/technical_study.py` (pipeline `technicals` stage) | Derived nightly: the last row of every daily and weekly indicator plus trend state (long format); the level-respect event study per symbol × level × horizon × slope regime; RSI-extreme forward returns; the support map at study time (Phase 11, read by the underlying ranking). Safe to delete. |
-| `data/raw_1m_cache.duckdb` → `bars_1m` | `scripts/06` | Normalised 1-minute bars for the universe; used by `gaps.py` and intraday RV. |
-| `data/chains/<session_block>/` | `data_sources/chains.py` | Chain snapshots: `<T>_chain.parquet` + `<T>_underlying.parquet`, keyed by session block (`2026-09-25_rth_14`, `_pre`, `_post`, `_closed`; a whole weekend shares one `_closed` block). Since Phase 11 rows carry `root_symbol`, `settlement_type`, `expiration_type` (SPX has SPXW PM and SPX AM roots), only strikes inside the strike window, and the underlying file records the `dte_min`/`dte_max` captured, the IV that set the window, and the expirations the subscription cap dropped (a later request needing one re-pulls). |
+| `data/raw_1m_cache.duckdb` → `bars_1m` | `scripts/06` | Normalised 1-minute bars for the universe; intraday RV, and `gaps.py` only with `signals.gap_source: 1m`/`auto` (Phase 17: gaps default to daily bars; the archive ends 2026-06-30). |
+| `data/chains/<session_block>/` | `data_sources/chains.py` | Chain snapshots: `<T>_chain.parquet` + `<T>_underlying.parquet`, keyed by session block (`2026-09-25_rth_14`, `_pre`, `_post`, `_closed`; a whole weekend shares one `_closed` block). Since Phase 11 rows carry `root_symbol`, `settlement_type`, `expiration_type` (SPX has SPXW PM and SPX AM roots; `Regular` = the monthly, read by `chain_utils.monthly_expirations`), only strikes inside the strike window, and the underlying file records the `dte_min`/`dte_max` captured, the IV that set the window, the expirations the subscription cap dropped (a later request needing one re-pulls) and, since Phase 17, any `extra_call_bands` of the spec widening. |
 | `data/stage3_chains/<date>/` | `scripts/04` | Legacy chain snapshots; still read by `iv_history.py`. |
 | `data/iv_history.duckdb` | `analytics/iv_history.py` | IV observations per ticker/block, rolled up from snapshots. |
 | `data/reference/*.parquet` | `reference.py`, `yfinance_sync.py` | `treasury_rates`, `vol_indices`, `earnings`, `dividends`. |
@@ -226,7 +226,7 @@ stages and the request's universe.
 | technicals | indicators, trend state, level-respect and RSI studies, support map → `data/technicals.duckdb` (~2.4 s per symbol) | symbol already studied through its latest bar |
 | probabilities (inside analyse) | `probabilities.run_sheet`: models G/H/T on every candidate row, blend, per-policy EV net of fees; re-ranks the sheet by blended EV per day on BPR (~20 s for 100-330 trades) | — |
 | rank_underlyings | `underlying_rank.rank`: every symbol in the request's universe scored without chains; top N + held names become the chain targets (~3 s) | — (runs in `--quick` too) |
-| chains | TastyTrade capture for the chain targets only: DTE [request min, request max + roll buffer] (held names [0, ≥60]), strikes inside the EM window, index chains included | snapshot current for this session block AND covering the requested DTE window |
+| chains | TastyTrade capture for the chain targets only: DTE [request min, request max + roll buffer] (held names [0, ≥60]), strikes inside the EM window, index chains included; Phase 17: for a request with specs/recommend, `chain_capture.widen_for_specs` (PMCC) adds a deep-ITM call band at the back-leg expirations for names whose entry trend holds (`extra_subscriptions` per ticker in the manifest) | snapshot current for this session block AND covering the requested DTE window |
 | analyse | regime, capacity, open-position management, `evaluate_universe(request=…)` over the analysable targets (CSP rows for physically settled names; PCS rows, indices included, when the request asks for PCS) (events check with request overrides, IVR/IVP on every row) → `select_sheet` (every accepted strike, `best_per_ticker`) → `portfolio.select` over the best rows, stress, wheel (covered calls, rolls). Roadmap stages construct → probabilities → rank_trades live here for CSP until Phases 12–13. A request without CSP skips trade construction. | — |
 
 `--data-only` runs up to and including technicals, then stops. It is meant to be
@@ -260,15 +260,15 @@ Pure Python, config-driven, no Streamlit imports. Grouped by job:
 
 | Job | Modules |
 |---|---|
-| Probability engine (Phase 13) | `prob_engine.py` (G: GBM at the short leg's IV; H: vol-conditioned 5-day block bootstrap; T: H from days in a similar trend/RSI/support state, relaxed then flagged; daily Black-Scholes repricing, sticky strike, optional IV reversion, earnings crush; P(reach X% by day d) curves, touch / assignment / max loss / roll trigger, per-policy EV, days and annualised return net of fees; blend), `probabilities.py` (runs it over a sheet, headline policy, ranking, `SORTS`) |
+| Probability engine (Phase 13) | `prob_engine.py` (G: GBM at the short leg's IV; H: vol-conditioned 5-day block bootstrap; T: H from days in a similar trend/RSI/support state, relaxed then flagged; daily Black-Scholes repricing, sticky strike, optional IV reversion, earnings crush; P(reach X% by day d) curves, touch / assignment / max loss / roll trigger, per-policy EV, days and annualised return net of fees; blend. Phase 17: loss-stop policies (`stop_kx`, `close_X_stop_kx[_or_21dte]`, `p_stopped`) triggered on each day's low/high -- bootstrapped real extremes for H/T, a Brownian bridge for G -- filled at the stop level or at a close already through it; H/T leg IVs follow spot by the spot-vol beta (index d ln VIX / d ln SPY scaled by rho x vol ratio); `managed_policy_name` + `headline_policy: shipped`), `probabilities.py` (runs it over a sheet, `shipped_rules` per row, headline policy, ranking, `SORTS`) |
 | Probability of outcome | `moves.py` (empirical P(breach)/P(touch), vol-conditioned, effective n), `options_math.py` (Black-Scholes, Greeks, IV solve), `volatility.py` (close-to-close, Parkinson, Garman-Klass, intraday RV) |
 | Market pricing | `vrp.py` (IV/RV), `skew.py` (put skew, term structure), `surface.py` (per-snapshot vol surface, forward), `iv_history.py` (own IV rank, needs 10+ captures) |
-| Risk context | `regime.py` (VIX term-structure gate), `gaps.py` (overnight gap risk, corporate-action seam filter), `technicals.py` (SMA/RSI/52-week), `earnings_history.py` (past report reactions: gap, close-to-close, two-session, ATR multiple; implied move once snapshots exist) |
+| Risk context | `regime.py` (VIX term-structure gate), `gaps.py` (overnight gap risk from daily bars since Phase 17, `signals.gap_source`; corporate-action seam filter for the 1-minute path), `technicals.py` (SMA/RSI/52-week), `earnings_history.py` (past report reactions: gap, close-to-close, two-session, ATR multiple; implied move once snapshots exist) |
 | Universe | `universe_screen.py` (Stage 1 on yfinance; drawdown over `drawdown_lookback_years`), `bars.py` (weekly resample, no-lookahead alignment via `weekly_positions`) |
 | Scan (Phase 11) | `scan_request.py` (`ScanRequest`: validation, JSON, DTE window/targets, chain window, `resolve_universe`), `underlying_rank.py` (chain-free score: IV rank, IV/RV at the request DTE, liquidity, trend, strong support in EM units, drawdown; event and capital gates), `rank_calibration.py` (Phase 14: point-in-time IC of each testable component vs the share of premium a 1-EM put kept; `scripts/calibrate_rank_weights.py`) |
 | Technicals (Phase 10) | `indicators.py` (SMA/EMA 9–200, RSI, ATR, Bollinger, MACD, ADX, 52-week, volume ratio; daily and weekly as `w_*`), `trend_state.py` (uptrend/range/downtrend per day), `level_respect.py` (MA test events → held/bounced/broke, pierce depth, Wilson CIs, **block-bootstrap placebo**, slope split, `support_map`), `oscillator_study.py` (RSI-extreme episodes vs baseline), `technical_study.py` (cache and pipeline stage) |
-| Trade construction | `candidates.py` (the sheet: `evaluate_universe(request=…)` builds CSP and PCS rows per ticker, `trade_id`, `select_sheet`, census), `strategies/` package (Phase 12: `base.py` Leg/Position -- payoff, value, max profit/loss, breakevens, BPR, net Greeks; `csp.py` the CSP evaluation moved verbatim from candidates, numbers pinned by a golden test; `pcs.py` put credit spreads -- strike rules, width ladder, tiers, empirical POP/P(max loss)/EV; `context.py` EM, support, liquidity and premium flags on every row), `costs.py` (tastytrade fees, single- and multi-leg fill models, vertical exit fees per outcome), `sizing.py` (capital and liquidity caps; `max_contracts_for_position` caps every leg; account profiles) |
-| Multi-strategy (Phase 16) | `strategy_spec.py` (YAML specs: validation, `applies`, `condition_matrix`, IV regime), `strategies/resolver.py` (spec + chain -> priced, margined, sized positions with empirical POP/EV and gates; model IVs implied from each leg's mid), `strategies/base.py` (stock legs; several expirations, later legs at the forward vol), `margin.py` (BPR per class: cash-secured, defined risk, covered, naked broker formula; profile permissions), `recommender.py` (conditions -> applicable specs -> resolve -> probability engine -> rank by blended EV/day/BPR), `costs.multi_leg_fill`, `exit_rules.evaluate_spec_position` |
+| Trade construction | `candidates.py` (the sheet: `evaluate_universe(request=…)` builds CSP and PCS rows per ticker, `trade_id`, `select_sheet`, census), `strategies/` package (Phase 12: `base.py` Leg/Position -- payoff, value, max profit/loss, breakevens, BPR, net Greeks; `csp.py` the CSP evaluation moved verbatim from candidates, numbers pinned by a golden test; `pcs.py` put credit spreads -- strike rules, width ladder, tiers, empirical POP/P(max loss)/EV; Phase 17: also built at the nearest monthly for targets from `prefer_monthly_from_dte`, long leg snapped to open interest within `long_leg_oi_snap_band`; `context.py` EM, support, liquidity and premium flags on every row), `costs.py` (tastytrade fees, single- and multi-leg fill models, vertical exit fees per outcome), `sizing.py` (capital and liquidity caps; `max_contracts_for_position` caps every leg, with `liquidity_limits.spread_legs` floors for multi-leg positions since Phase 17; account profiles) |
+| Multi-strategy (Phase 16) | `strategy_spec.py` (YAML specs: validation, `premium` credit/debit, `applies`, `condition_matrix`; Phase 17 IV regime on the clamped IV percentile with hysteresis, soft except at the extremes, `regime_fit`), `strategies/resolver.py` (spec + chain -> priced, margined, sized positions with empirical POP/EV and gates; model IVs implied from each leg's mid; Phase 17: roles from 30 DTE take the nearest monthly, spread-leg liquidity floors), `strategies/base.py` (stock legs; several expirations, later legs at the forward vol), `margin.py` (BPR per class: cash-secured, defined risk, covered, naked broker formula; profile permissions), `recommender.py` (conditions -> applicable specs -> resolve -> probability engine -> rank by blended EV/day/BPR of each spec's own exit rules; in-regime rows first; `research_only` for naked specs on a `naked_research_only` profile), `costs.multi_leg_fill`, `exit_rules.evaluate_spec_position` |
 | Options analytics (Phase 12) | `expected_move.py` (tastytrade platform formula 0.6 straddle + 0.3 / 0.1 strangles, IV method, 0.85 x straddle; bands; EM distance; historical containment), `liquidity.py` (per-leg OI / volume / spread, fillability 0-1, weakest leg, OI walls) |
 | Book | `portfolio.py` (correlation clusters, marginal risk, simultaneous-assignment stress), `paper.py` (multi-leg paper book: accept CSP/PCS with net or leg fills, close / settle / roll, marks, stored predictions, slippage, performance by strategy), `book.py` (Phase 15: the open book marked on the latest chains -- mark, natural, unrealised, Greeks from the chain or Black-Scholes, 1-year beta on SPY, beta-weighted delta, theta/day, vega, BPR utilisation, event calendar) |
 | Management | `exit_rules.py` (CSP: hold/close/roll/accept, net of fees; Phase 15 PCS: value floor, loss stop at k x credit, breach/delta roll trigger, profit target above the hold horizon net of fees, optional time stop, the empirical expected-value test; `spread_roll_candidates` for net-credit rolls), `roll_engine.py`, `covered_call.py` |
@@ -287,7 +287,7 @@ sample size.
 
 | Page | Shows | Run data from |
 |---|---|---|
-| **Screener** (default, Phase 14) | session banner + credentials, regime and a data-freshness line; the full scan-request form (strategy, DTE range or targets, risk mode + value, widths, profit targets, profile, universe, top N, ranking weights, event overrides, strike rule) with **saved requests** (`scan_presets`) and the example files; **Run** with stage progress; the **results grid** (every candidate, blended probabilities as progress bars, filters, best-per-ticker and group-by-ticker toggles, CSV/Excel); selecting a row opens Trade Detail with `?run=&trade=` | `active_run()` + `candidates.parquet` |
+| **Screener** (default, Phase 14) | session banner + credentials, regime and a data-freshness line; the full scan-request form (Phase 17: the account profile must be chosen explicitly -- no silent $3M default; placeholder profiles warn) (strategy, DTE range or targets, risk mode + value, widths, profit targets, profile, universe, top N, ranking weights, event overrides, strike rule) with **saved requests** (`scan_presets`) and the example files; **Run** with stage progress; the **results grid** (every candidate, blended probabilities as progress bars, filters, best-per-ticker and group-by-ticker toggles, CSV/Excel); selecting a row opens Trade Detail with `?run=&trade=` | `active_run()` + `candidates.parquet` |
 | **Trade Detail** (Phase 14) | one trade from a persisted run, by query parameters (else the Screener's selection, else the top row): Summary (thesis, verdict, why this strike, risk flags) · Chart (daily/weekly candles, MAs, respected levels, strike lines, IV and straddle EM cones, events) · Expected move (three EM methods, containment, empirical vs lognormal terminal distribution, P(below) table) · Payoff (expiry + T+n, any legs) · Probabilities (target × model, curves, policy comparison under any model) · Greeks (now, over time, price × IV heatmap) · Chain & liquidity · Management plan (+ CSP roll and covered-call previews) · Context (IV, regime, earnings reactions, gap risk, correlation with the book) · Accept (CSP or PCS → paper book, net credit or leg fills; "Send to Decisions") | `load_run(run)` + prob tables + chains, bars, levels |
 | Command Center | session banner, **Run** button with a scan-request form (strategies, DTE, profile, ranking weights, top N or all) and stage progress, open-position decisions (CSPs and spreads; spread roll candidates for a net credit), capacity | `active_run()` |
 | Decisions | the **Screener selection first** (Phase 14); the run's scan request; proposed trades with a **probability panel** (G/H/T/blend table, management policies net of fees, P(reach X% by day) curves) and a **sort selector** on the full sheet (CSP and PCS cards with legs, max loss, POP, P(max loss), credit/width, each with an accept form), accept with actual fill → paper book; the book by strategy with forms to mark an outcome (expired / closed / assigned / settled at a price), roll (two linked positions) and record a mark; expander with **every evaluated strike** and why each was rejected, with a **best per ticker** toggle; the **underlying ranking** with component scores and exclusions | `active_run()` + `candidates.parquet` + `underlyings.parquet` |
@@ -296,7 +296,7 @@ sample size.
 | Portfolio | **open book** (Phase 15: marks, P&L, beta-weighted delta, theta/day, vega, BPR utilisation, event calendar), exposure, clusters, stress, correlation, capital recycling | `paper` + chains, `active_run()` |
 | Signals | **Levels** (universe chance check, support map with %/ATR/EM distances, every level ranked by edge CI, chart of tests, RSI extremes), gap risk, skew, term structure | technicals cache, disk |
 | **Strategies** (Phase 16) | Recommend (latest run's recommender tables or a scan of stored chains: grid, payoff, legs, probabilities, record to the book), Library (specs and profile permissions), Condition matrix | `strategies.parquet`, chains |
-| Settings | user account profiles (capital, caps, permissions incl. account type and naked approval) and ranking-weight presets; saved to `config/user_settings.yaml` | disk |
+| Settings | user account profiles (capital, caps, permissions incl. account type, naked approval, naked research-only, placeholder flag) and ranking-weight presets; saved to `config/user_settings.yaml` | disk |
 | Universe | registry editor (add / deactivate / tag), IVR/IVP, next earnings and disagreements, Stage 1 verdicts, per-symbol weekly bars and earnings reactions, 45-day market-event calendar with policy | registry, metrics, events |
 
 `app/components/run_state.py`: `active_run()` prefers the run made in this
@@ -320,14 +320,14 @@ Headless check: `python scripts/check_pages.py` runs every page through
 | `analytics` | risk-free fallback, RV windows, RSI/SMA | `technicals.py`, several |
 | `scoring`, `backtest`, `scanner_presets` | legacy stack only | `legacy/` |
 | `account` | capital, cash-secured, per-position/ticker/sector caps, max positions | `sizing.py` |
-| `liquidity_limits` | % of OI / volume / ADV, OI and volume floors | `sizing.py`, `candidates.py` |
+| `liquidity_limits` | % of OI / volume / ADV, OI and volume floors; `spread_legs` floors (Phase 17) | `sizing.py`, `candidates.py`, `pcs.py`, `resolver.py` |
 | `execution` | signal_only mode, manual fill override | Decisions, `paper.py` |
 | `costs` | tastytrade fee schedule, slippage fraction | `costs.py` |
-| `chain_capture` | DTE windows, RTH refresh interval; roll buffer, put/call strike windows in EM, minimum window %, per-symbol subscription cap (Phase 11) | `chains.py`, `scan_request.py` |
+| `chain_capture` | DTE windows, RTH refresh interval; roll buffer, put/call strike windows in EM, minimum window %, per-symbol subscription cap (Phase 11); `widen_for_specs`, `widen_delta_pad` (Phase 17) | `chains.py`, `scan_request.py` |
 | `massive` | archive pacing | `massive_sync.py` |
 | `management.entry/exit/defense/covered_call` | entry gates and DTE band, exit test, roll limits, call rules | `candidates.py`, `exit_rules.py`, `roll_engine.py`, `covered_call.py` |
 | `management.spread` | Phase 15 PCS rules: profit target, loss-stop multiple, 21-DTE time stop, roll triggers, max rolls, roll-out window, value floor | `exit_rules.py`, `trade_detail.management_plan` |
-| `signals` | skew / gap / backwardation gates | `candidates.py` |
+| `signals` | skew / gap / backwardation gates; `gap_source` (Phase 17: daily / 1m / auto) | `candidates.py`, `gaps.py` |
 | `portfolio` | cluster and correlation limits, stress horizon | `portfolio.py` |
 | `regime` | VIX term-structure thresholds and size multiplier | `regime.py` |
 | `move_analysis` | horizons, lookbacks, min observations | `moves.py`, `weekly_move_analysis` |
@@ -342,13 +342,14 @@ Headless check: `python scripts/check_pages.py` runs every page through
 | `market_metrics` | request batch size | `data_sources/tasty_metrics.py` |
 | `expected_move` | default EM method (tastytrade / iv / straddle), containment lookback | `analytics/expected_move.py` |
 | `liquidity_score` | fillability scale (spread %, $ floor, OI and volume log scales), OI-wall multiple | `analytics/liquidity.py` |
-| `pcs` | minimum credit, credit/width floor (a warning), short-leg IV/RV gate, tier labels | `analytics/strategies/pcs.py` |
-| `prob_engine` | paths, seed, block length, lookback, vol band, minimum matching days, blend weights, IV reversion, earnings crush, time stop, headline policy, T buckets | `analytics/prob_engine.py` |
+| `pcs` | minimum credit, credit/width floor (a warning), short-leg IV/RV gate, tier labels, `long_leg_oi_snap_band` (Phase 17) | `analytics/strategies/pcs.py` |
+| `prob_engine` | paths, seed, block length, lookback, vol band, minimum matching days, blend weights, IV reversion, earnings crush, time stop, headline policy (`shipped` since Phase 17), T buckets; Phase 17 `intraday_stops`, `spot_vol`, `spot_vol_index_beta`, lookbacks, `iv_clip` | `analytics/prob_engine.py` |
 | `premium_flags` | IVP and IV/RV thresholds for the premium-opportunity flag | `analytics/strategies/context.py` |
-| `scan_defaults` | the default `ScanRequest` (null DTE/delta = `management.entry`), DTE-target tolerance; Phase 15: spreads 4% of spot wide (`spread_width_pct`) at the expiration nearest 45 DTE (`pcs_dte_targets`, `pcs_dte_tolerance_days`) | `analytics/scan_request.py` |
-| `underlying_rank` | weight presets and the default preset (unvalidated; users add more on Settings), trend scores, IV/RV scale, liquidity-value log scale, support EM band, drawdown floor, metrics age | `analytics/underlying_rank.py` |
+| `scan_defaults` | the default `ScanRequest` (null DTE/delta = `management.entry`), DTE-target tolerance; Phase 15: spreads 4% of spot wide (`spread_width_pct`) at the expiration nearest 45 DTE (`pcs_dte_targets`, `pcs_dte_tolerance_days`); Phase 17 `prefer_monthly_from_dte`. Only `ScanRequest.default()` reads these -- a JSON request's missing fields take the dataclass defaults | `analytics/scan_request.py` |
+| `underlying_rank` | weight presets and the default preset (`calibrated` since Phase 17; users add more on Settings), trend scores, IV/RV scale, liquidity-value log scale, support EM band, drawdown floor, metrics age | `analytics/underlying_rank.py` |
 | `account_profiles` | shipped profiles (`default`; `naked_approval` since Phase 16); user profiles live in `config/user_settings.yaml` | `core/user_settings.py`, `analytics/sizing.py` |
-| `recommender` | IV-regime thresholds on the TastyTrade IV rank, engine paths per trade | `analytics/recommender.py`, `strategy_spec.py` |
+| `recommender` | IV regime (Phase 17: measure `ivp`, thresholds, hysteresis, soft, credit_min / debit_max extremes), engine paths per trade | `analytics/recommender.py`, `strategy_spec.py` |
+| `stage1_thresholds.min_rv_broad_index` | RV floor for `broad_index_*` ETFs (Phase 17: 0.08) | `analytics/universe_screen.py` |
 | `margin` | naked requirement percentages | `analytics/margin.py` |
 
 ---
@@ -437,9 +438,17 @@ re-pulls `daily_bars_raw`, runs the adjustment check, drops
 - **Underlying-ranking weights are only partly validated** (Phase 14). Only
   trend, drawdown and proxies for iv_rank and support can be rebuilt
   point-in-time; iv_rv and liquidity cannot. Only the iv_rank proxy (and
-  weakly drawdown) predicted outcomes; the `calibrated` preset follows that,
-  and `balanced` stays the default until Tom decides (PHASE14_SUMMARY.md §3).
-  The default request still pulls chains for every eligible name.
+  weakly drawdown) predicted outcomes; the `calibrated` preset follows that
+  and is the default since Phase 17. The default request still pulls chains
+  for every eligible name.
+- **The default CSP window (5-10 DTE) holds no Friday on a Monday** (Phase 17
+  live run): Oct 2 is 4 DTE, Oct 9 is 11, so only names with Monday/Wednesday
+  expirations (SPY, QQQ, IWM, a few mega-caps) produce rows. Open decision
+  (PHASE17_SUMMARY.md).
+- **Stops in the engine are approximations.** Intraday extremes are daily
+  highs/lows (H/T) or a Brownian bridge (G); a stop fills at its level unless
+  the close is through it (no open-gap fill); the spot-vol beta scales the
+  whole leg IV (no skew dynamics) and applies to H/T only.
 - **Moving-average "support" is mostly chance in this universe** (Phase 10:
   median edge over the bootstrap placebo +0.4 pts; 32 strong levels vs ~26
   expected by chance). Treat a strong level as a hypothesis; the Levels tab
@@ -450,6 +459,8 @@ re-pulls `daily_bars_raw`, runs the adjustment check, drops
   sampled (one per pipeline run plus manual marks), so a target touched
   between marks is missed; positions closed early without reaching a target
   are censored, not misses.
+- **Account profiles are placeholders** until Tom enters the real values
+  (Settings; the Screener warns while `placeholder: true`).
 - **Probabilities are model outputs, not guarantees.** The engine's blend
   was within ~2 points of observed frequencies in a synthetic-price
   walk-forward (PHASE13_SUMMARY.md §3); G is a zero-edge baseline by

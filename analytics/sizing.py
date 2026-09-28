@@ -161,12 +161,21 @@ def max_contracts_for_strike(strike: float, account: AccountState | None = None,
         notional_per_contract=strike * 100.0, capital_label="collateral")
 
 
+def spread_leg_floors() -> dict:
+    """`liquidity_limits.spread_legs` (Phase 17): the absolute floors for the
+    legs of a multi-leg position, where the percent-of-OI cap already scales
+    the requirement with the contract count."""
+    liq = load_config().get("liquidity_limits", {}) or {}
+    return dict(liq.get("spread_legs") or {})
+
+
 def max_contracts_for_position(per_contract: float, account: AccountState | None = None,
                                ticker_committed: float = 0.0,
                                legs: list[tuple] | None = None,
                                adv_dollars: float | None = None,
                                notional_per_contract: float | None = None,
-                               capital_label: str = "buying power") -> SizingResult:
+                               capital_label: str = "buying power",
+                               leg_floors: dict | None = None) -> SizingResult:
     """Contracts for any position (Phase 12).
 
     `per_contract` is the capital one contract ties up (CSP collateral, or a
@@ -174,6 +183,13 @@ def max_contracts_for_position(per_contract: float, account: AccountState | None
     (open interest, option volume, label): the liquidity caps apply to EVERY
     leg, so the least liquid one binds. `notional_per_contract` is the
     underlying exposure the ADV cap is measured in (short strike x 100).
+
+    `leg_floors` ({min_open_interest, min_option_volume}) replaces the
+    single-leg floors (Phase 17, spread legs). The percent-of-OI and
+    percent-of-volume caps still apply, so n contracts need OI >= n / 3% --
+    the floor scales with the size, and the absolute floor is a minimum.
+    A volume floor of 0 turns volume off as a cap and a gate: a 30-60 DTE
+    leg often trades nothing by mid-morning and is still fillable.
     """
     liq = load_config().get("liquidity_limits", {})
     acct = account or account_from_config()
@@ -222,8 +238,9 @@ def max_contracts_for_position(per_contract: float, account: AccountState | None
     # --- Liquidity (every leg; the thinnest binds) ---------------------------
     # These are what actually bind at portfolio scale. A contract count you
     # cannot fill is not a smaller trade, it is a different trade.
-    min_oi = liq.get("min_open_interest", 250)
-    min_volume = liq.get("min_option_volume", 25)
+    floors = leg_floors or {}
+    min_oi = floors.get("min_open_interest", liq.get("min_open_interest", 250))
+    min_volume = floors.get("min_option_volume", liq.get("min_option_volume", 25))
     pct_oi = liq.get("max_pct_of_open_interest", 0.03)
     for leg in legs:
         open_interest, option_volume = leg[0], leg[1]
@@ -238,7 +255,7 @@ def max_contracts_for_position(per_contract: float, account: AccountState | None
                 by_oi = math.floor(open_interest * pct_oi)
             limits["open_interest"] = min(limits.get("open_interest", by_oi), by_oi)
 
-        if option_volume is not None:
+        if option_volume is not None and min_volume:
             # Off-hours snapshots report zero volume; that is a stale field, not a
             # dead contract, so fall back to open interest rather than rejecting.
             if option_volume <= 0 and open_interest:

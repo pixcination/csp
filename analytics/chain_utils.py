@@ -37,3 +37,26 @@ def nearest_target_delta_put(chain: pd.DataFrame, snapshot_date: str,
         "put_ask": float(row["put_ask"]) if pd.notna(row.get("put_ask")) else None,
         "put_open_interest": row.get("put_open_interest"),
     }
+
+
+def monthly_expirations(chain) -> set:
+    """Dates (datetime.date) of the standard monthly expirations in a chain
+    (Phase 17). TastyTrade labels them `Regular` in `expiration_type`; without
+    that column, the third Friday of the month (or the Thursday before it,
+    when a holiday moves it) counts as monthly."""
+    import datetime as _dt
+
+    import pandas as _pd
+    if chain is None or len(chain) == 0 or "expiration" not in chain:
+        return set()
+    dates = _pd.to_datetime(chain["expiration"]).dt.date
+    if "expiration_type" in chain and chain["expiration_type"].notna().any():
+        kinds = chain["expiration_type"].astype(str).str.lower()
+        return set(dates[kinds == "regular"])
+    out = set()
+    for d in set(dates):
+        first = _dt.date(d.year, d.month, 1)
+        third_friday = first + _dt.timedelta(days=(4 - first.weekday()) % 7 + 14)
+        if d in (third_friday, third_friday - _dt.timedelta(days=1)):
+            out.add(d)
+    return out

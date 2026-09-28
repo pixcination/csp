@@ -78,7 +78,9 @@ def _clip01(x: float) -> float:
 
 
 def score_iv_rank(ivr: float | None, ivp: float | None) -> float | None:
-    values = [v for v in (ivr, ivp) if v is not None and np.isfinite(v)]
+    # Phase 17: the headline tos rank is unbounded (EWZ 1.11, BIDU -0.007).
+    values = [min(max(float(v), 0.0), 1.0) for v in (ivr, ivp)
+              if v is not None and np.isfinite(v)]
     return _clip01(sum(values) / len(values)) if values else None
 
 

@@ -45,6 +45,10 @@ PROFILE_FIELDS: dict[str, tuple] = {
     "naked_approval": (bool, None, None, "Naked options approved (margin accounts)"),
     "allowed_strategies": (list, None, None, "Allowed strategies"),
     "account_type": (str, None, None, "Account type"),
+    # Phase 17: values not yet entered by Tom (the UI warns until cleared), and
+    # naked specs shown for comparison only -- never auto-tracked (Phase 19).
+    "placeholder": (bool, None, None, "Placeholder values (not yet entered)"),
+    "naked_research_only": (bool, None, None, "Naked strategies research-only"),
 }
 STRATEGY_CHOICES = ("csp", "pcs", "covered_call")
 COMPONENTS = ("iv_rank", "iv_rv", "liquidity", "trend", "support", "drawdown")
@@ -127,6 +131,17 @@ def account_profiles() -> dict[str, dict]:
 def profile_names() -> list[str]:
     names = list(account_profiles())
     return ["default"] + sorted(n for n in names if n != "default")
+
+
+def profile_label(name: str) -> str:
+    """'roth_ira -- $100,000, roth_ira (PLACEHOLDER)' for pickers: the account
+    value and type are what make a profile choice deliberate."""
+    from analytics import sizing
+    cfg = sizing.account_config(name)
+    nlv = float(cfg.get("net_liquidating_value") or 0.0)
+    kind = cfg.get("account_type") or "research"
+    tag = " (PLACEHOLDER)" if cfg.get("placeholder") else ""
+    return f"{name} -- ${nlv:,.0f}, {kind}{tag}"
 
 
 def save_account_profile(name: str, fields: dict) -> str:

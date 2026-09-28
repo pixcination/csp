@@ -5,6 +5,7 @@ label: Poor man's covered call (diagonal)
 family: bullish income
 description: Buy a deep ITM ~90-DTE call, sell a ~30-DTE OTM call against it. A covered call for a fraction of the capital.
 margin_class: defined_risk
+premium: debit
 event_policy_as: covered_call
 expirations:
   front: {dte_target: 30, tolerance: 10}

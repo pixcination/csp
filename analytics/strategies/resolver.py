@@ -56,11 +56,16 @@ def _f(value) -> float | None:
 
 
 def pick_expirations(dates: list[dt.date], spec, today: dt.date,
-                     quoted: dict[str, set] | None = None) -> dict[str, dt.date] | None:
+                     quoted: dict[str, set] | None = None,
+                     monthly: set | None = None) -> dict[str, dt.date] | None:
     """Role -> expiration, in the spec's order, each later than the last.
     `quoted` maps option type -> expirations that type is quoted at; a role
     only takes an expiration where every leg type it needs is quoted (a
-    listed but unquoted expiry, e.g. a holiday weekly, is skipped)."""
+    listed but unquoted expiry, e.g. a holiday weekly, is skipped).
+    Phase 17: a role targeting `scan_defaults.prefer_monthly_from_dte` or
+    more takes the nearest MONTHLY inside its tolerance when there is one --
+    new weeklies that far out have almost no open interest."""
+    from_dte = (load_config().get("scan_defaults") or {}).get("prefer_monthly_from_dte")
     chosen: dict[str, dt.date] = {}
     floor = None
     for role, exp in spec.expirations.items():
@@ -71,7 +76,10 @@ def pick_expirations(dates: list[dt.date], spec, today: dt.date,
                    and (quoted is None or all(d in quoted.get(k, set()) for k in kinds))]
         if not options:
             return None
-        best = min(options, key=lambda d: (abs((d - today).days - target), d))
+        pool = options
+        if monthly and from_dte is not None and target >= int(from_dte):
+            pool = [d for d in options if d in monthly] or options
+        best = min(pool, key=lambda d: (abs((d - today).days - target), d))
         chosen[role] = best
         floor = best
     return chosen
@@ -212,7 +220,9 @@ def resolve(spec, ctx, request, account, cfg: dict | None = None, today: dt.date
         root = None if pd.isna(root) else root
         quoted = {k: set(group.loc[group[f"{k}_ask"].fillna(0) > 0, "expiration"])
                   for k in ("put", "call") if f"{k}_ask" in group}
-        exps = pick_expirations(sorted(group["expiration"].unique()), spec, today, quoted)
+        from analytics.chain_utils import monthly_expirations
+        exps = pick_expirations(sorted(group["expiration"].unique()), spec, today, quoted,
+                                monthly_expirations(group))
         if exps is None:
             reasons.append(f"no listed expiration fits {spec.expirations}")
             continue
@@ -298,7 +308,8 @@ def _evaluate(spec, ctx, request, account, cfg, today, daily, adv, events_frame,
         bpr_one, account=account,
         legs=[(l.open_interest, l.volume, f"{l.side} {l.strike:g}{l.option_type[0].upper()}")
               for l in options],
-        adv_dollars=adv, notional_per_contract=float(ctx.spot) * 100.0)
+        adv_dollars=adv, notional_per_contract=float(ctx.spot) * 100.0,
+        leg_floors=(sizing.spread_leg_floors() or None) if len(options) > 1 else None)
     contracts = max(int(sized.contracts), 0)
     if sized.rejected:
         rejections.extend(sized.reasons or ("sizing: no contracts",))

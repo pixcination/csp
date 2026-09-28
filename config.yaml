@@ -42,6 +42,8 @@ stage1_thresholds:
   min_price: 15
   max_price: 1000
   min_rv: 0.12
+  min_rv_broad_index: 0.08         # Phase 17 (review B.2): broad index ETFs (category broad_index_*)
+                                   # are calm by design; 0.12 failed SPY/DIA in quiet markets
   max_rv: 0.75
   max_drawdown_floor: -0.65
   drawdown_lookback_years: 10     # Phase 9 yfinance screen: drawdown window (null = all history)
@@ -174,6 +176,12 @@ liquidity_limits:
   min_open_interest: 250              # below this, do not trade the strike at all
   min_option_volume: 25
   assume_volume_when_missing: 0       # off-hours volume is 0; fall back to OI
+  # Phase 17: legs of multi-leg positions (PCS, specs). The live RTH run of
+  # 2026-09-28 accepted 0 of 47 default spreads, 45 short legs under OI 250. The
+  # 3%-of-OI cap above still scales the need with size (n contracts need OI >= n/0.03);
+  # this is only the absolute minimum. Volume 0 = not a gate: a 30-60 DTE leg often
+  # trades nothing by mid-morning (the fillability score still shows it).
+  spread_legs: {min_open_interest: 100, min_option_volume: 0}
 
 # === Execution ===
 # Signals are generated here and executed elsewhere. The tool models TastyTrade
@@ -216,6 +224,11 @@ chain_capture:
   call_window_em: [-0.5, 1.5]         # calls near the money: skew, forward, covered calls
   min_window_pct: 0.03                # never narrower than +/- 3% of spot
   max_subscriptions_per_symbol: 6000  # drop expirations furthest from the request DTE beyond this
+  # Phase 17 (review decision 4): specs whose delta-selected call legs sit outside the call
+  # window get an extra band -- only at that role's expirations, only for names whose entry
+  # trend holds. Counted per ticker in the manifest (extra_subscriptions).
+  widen_for_specs: [pmcc]
+  widen_delta_pad: 0.12               # PMCC long call 0.80 -> calls 0.68-0.92 delta at 60-120 DTE
 
 # === Massive.com historical archive (free tier) ===
 # Free tier = 5 requests/minute, end-of-day only. This is a background
@@ -290,6 +303,7 @@ management:
 # skew and term structure, the 1-minute archive for gaps -- and neither needs
 # accumulated history the way IV rank does.
 signals:
+  gap_source: daily                 # Phase 17 (Tom): daily | 1m | auto (1m when the cache is fresh)
   block_inverted_skew: true         # calls priced above puts = wrong tail to sell
   flat_skew_warns: true
   max_prob_undefendable_gap: 0.05   # warn above a 5% chance of a gap through the strike
@@ -439,6 +453,9 @@ scan_defaults:
                                       # the CSP window; null = spreads share the CSP DTE window
   pcs_dte_tolerance_days: 14          # spreads are built at the listed expiration NEAREST each
                                       # pcs target within +/- this (many names list only monthlies)
+  prefer_monthly_from_dte: 30         # Phase 17: targets from here up ALSO build at the nearest monthly
+                                      # (specs take the monthly outright): new weeklies ~6 weeks out
+                                      # have almost no OI (CVX Nov-6 45 vs Nov-20 8,240, 2026-09-28)
   profit_targets: [25, 30, 50, 100]   # % of max profit; probabilities arrive in Phase 13
   account_profile: default
   universe: all                       # all | csp | etf | index | stock | tag:<tag> | [list]
@@ -450,7 +467,7 @@ scan_defaults:
 
 # Chain-free ranking of every registry symbol. Weights are a STARTING POINT;
 # Phase 14 calibrated the testable components (docs/PHASE14_SUMMARY.md §3, the
-# `calibrated` preset) -- the default stays `balanced` until Tom decides. Missing
+# `calibrated` preset); Phase 17 made it the default (Tom, 2026-09-28). Missing
 # components are dropped and the remaining weights renormalised per row
 # (`coverage` reports the share of weight that had data).
 # A scan request picks a preset by name (`ranking_weights: premium`) or gives
@@ -463,7 +480,7 @@ scan_defaults:
 #   support    strong level 0.5-2.0 EM below spot (Phase 10: mostly chance)
 #   drawdown   max drawdown over stage1 drawdown_lookback_years
 underlying_rank:
-  default_weight_preset: balanced
+  default_weight_preset: calibrated    # Phase 17 (review B.2, Tom 2026-09-28): the only measured preset
   weight_presets:
     balanced:   {iv_rank: 0.25, iv_rv: 0.20, liquidity: 0.20, trend: 0.15, support: 0.10, drawdown: 0.10}
     premium:    {iv_rank: 0.35, iv_rv: 0.35, liquidity: 0.15, trend: 0.05, support: 0.05, drawdown: 0.05}
@@ -474,7 +491,7 @@ underlying_rank:
     # 21- and 5-day suggestions. Point-in-time over 8y x 67 names, only the RV-percentile
     # proxy for iv_rank (IC 0.14 / 0.12) and, weakly, drawdown (5d t 3.2) predicted the
     # share of premium kept; trend and support ICs were ~0. iv_rv and liquidity cannot be
-    # tested point-in-time and keep balanced's weights. Offered, NOT the default.
+    # tested point-in-time and keep balanced's weights. The default since Phase 17.
     calibrated: {iv_rank: 0.54, iv_rv: 0.20, liquidity: 0.20, trend: 0.0, support: 0.0, drawdown: 0.06}
   trend_scores: {uptrend: 1.0, range: 0.6, downtrend: 0.1}
   iv_rv_floor: 0.8                    # ratio scoring 0 ...
@@ -494,11 +511,18 @@ account_profiles:
     naked_approval: false             # Phase 16: naked specs (strangles) need this AND account_type: margin
 
 # --- Multi-strategy recommender (Phase 16, analytics/recommender.py) -----------
-# Specs live in strategies/*.yaml. A ticker's conditions: IV regime from the
-# TastyTrade IV rank (below low_below = low, above high_above = high), the
-# technicals cache's trend state, and earnings inside the trade.
+# Specs live in strategies/*.yaml. A ticker's conditions: IV regime (below
+# low_below = low, above high_above = high), the technicals cache's trend
+# state, and earnings inside the trade.
+# Phase 17 (review decision 1, Tom 2026-09-28): the regime is measured on the IV
+# PERCENTILE, clamped to [0, 1] (the tos rank is unbounded: EWZ 1.11); a name
+# changes regime only after clearing a boundary by `hysteresis` vs its previous
+# snapshot; the regime is SOFT (out-of-regime specs rank after in-regime ones)
+# except at the extremes: credit specs are excluded below credit_min, debit
+# specs (calendars, PMCC) above debit_max. Revisit with ~3 months of tracking.
 recommender:
-  iv_regime: {low_below: 0.25, high_above: 0.50}
+  iv_regime: {measure: ivp, low_below: 0.25, high_above: 0.50, hysteresis: 0.03,
+              soft: true, credit_min: 0.10, debit_max: 0.90}
   n_paths: 10000                      # probability-engine paths per trade (the Screener uses prob_engine.n_paths)
 
 # --- Buying power per strategy class (Phase 16, analytics/margin.py) -----------
@@ -533,6 +557,8 @@ pcs:
   credit_width_floor: 0.3333          # below: warned (not rejected); at/above: premium flag
   apply_iv_rv_gate: true              # short leg IV/RV must clear management.entry.min_iv_rv_ratio
   tiers: [Conservative, Moderate, Aggressive]   # by width, narrowest first
+  long_leg_oi_snap_band: 0.25         # Phase 17: a long leg under the spread-leg OI floor moves to the
+                                      # nearest strike within +/-25% of the width that clears it
 
 # Premium-opportunity flags on every row (informational, never a gate)
 premium_flags:
@@ -554,7 +580,22 @@ prob_engine:
   iv_reversion_half_life_days: null   # null = sticky strike, no mean reversion toward RV
   earnings_crush: 0.30                # IV x (1 - 0.30) from an earnings date inside the trade
   time_stop_dte: 21                   # policies with a time stop exist only above this DTE
-  headline_policy: auto               # auto = hold at <= 14 DTE, else close at the target nearest 50%
+  # Phase 17 (review decision 3, Tom 2026-09-28): the headline -- and so the ranking -- is the
+  # rule set actually run: spreads = management.spread (target above the hold horizon, the
+  # loss stop, the 21-DTE time stop), spec positions = their exit block. CSPs keep auto.
+  # auto = hold at <= 14 DTE, else close at the target nearest 50%.
+  headline_policy: shipped
   auto_hold_max_dte: 14
   rsi_buckets: [30, 50, 70]           # T: RSI state
   support_atr_buckets: [1.0, 3.0]     # T: distance to the strongest support, ATR
+  # Phase 17: stops trigger on the day's low/high (H/T: bootstrapped real extremes;
+  # G: Brownian bridge), fill at the stop level (or the close when it is through).
+  intraday_stops: true
+  # Phase 17: H and T leg IVs scale by exp(beta x log return), beta = the index spot-vol
+  # beta (d ln VIX / d ln SPY; -5.3 over 2021-2026) x rho(name, SPY) x vol(SPY) / vol(name).
+  # G stays sticky strike (its marks must stay a martingale: the zero-edge baseline).
+  spot_vol: true
+  spot_vol_index_beta: null           # null = estimate from data/reference/vol_indices.parquet
+  spot_vol_lookback_years: 5
+  spot_vol_name_years: 1
+  iv_clip: [0.5, 3.0]                 # IV stays within these multiples of its entry value
