@@ -120,7 +120,7 @@ with tabs[0]:
             grid = grid[grid["accepted"]]
         event = st.dataframe(
             grid[[c for c in GRID if c in grid.columns]], hide_index=True, width="stretch",
-            on_select="rerun", selection_mode="single-row", key="strat_grid",
+            on_select="rerun", selection_mode="multi-row", key="strat_grid",
             column_config={
                 "modelled_fill": st.column_config.NumberColumn("Credit", format="$%.2f",
                                                                help="Net per share; negative = debit"),
@@ -134,6 +134,21 @@ with tabs[0]:
                 "ev_per_day_bpr": st.column_config.NumberColumn("EV/day/BPR", format="%.4f"),
             })
         picked = event.selection.rows if event and event.selection else []
+        # Phase 18: several rows can be logged as tracked forward tests; the
+        # detail below shows the first selected.
+        if picked:
+            from analytics import tracking
+            if st.button(f"Log {len(picked)} selected as tracked", key="strat_log",
+                         help="Tracking page. Research-only (naked) rows are logged but "
+                              "never auto-tracked (Phase 19)."):
+                run_id = results.run_id if source == "Latest run" and results is not None                     else None
+                outcome = tracking.log(grid.iloc[picked], run_id=run_id, preset="strategies")
+                opened = sum(o["action"] == "opened" for o in outcome)
+                st.success(f"{opened} new tracked position(s); "
+                           f"{sum(o['action'] == 'observed' for o in outcome)} already tracked.")
+                for o in outcome:
+                    if o["action"] == "skipped":
+                        st.warning(o["message"])
         row = grid.iloc[picked[0]].to_dict() if picked else grid.iloc[0].to_dict()
         spec = SPECS.get(row["strategy"])
 

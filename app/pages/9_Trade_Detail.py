@@ -469,7 +469,7 @@ with tabs[8]:
         st.markdown("**Fit with the current book**")
         try:
             from analytics import paper, portfolio
-            book = paper.list_positions("open")
+            book = paper.list_positions("open", book="taken")
             held = sorted(set(book["ticker"])) if not book.empty else []
             if held:
                 risk = portfolio.marginal_risk(row["ticker"], held)

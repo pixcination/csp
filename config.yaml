@@ -599,3 +599,26 @@ prob_engine:
   spot_vol_lookback_years: 5
   spot_vol_name_years: 1
   iv_clip: [0.5, 3.0]                 # IV stays within these multiples of its entry value
+
+# --- Trade tracking (Phase 18, analytics/tracking.py) ---------------------------
+# Review Part C. "Log all" logs the top K passing rows of a sheet and a control
+# sample (M random passing rows below them + M near-miss rejects) as TRACKED
+# forward tests; Update re-marks open positions with probabilities from now.
+tracking:
+  top_k: 5
+  control_m: 3
+  n_paths: 4000                       # engine paths per position per update (probabilities from now)
+
+# --- Daily chain archive (Phase 18, scripts/archive_chains.py) ------------------
+# Review C.6: a full-universe, strike-filtered snapshot once a day (15:45 ET),
+# kept forever as our own option-price history (~3 MB/day).
+archive:
+  dte_min: 0
+  dte_max: 60
+  time_et: "15:45"
+
+# --- Run and chain retention (Phase 18, pipeline/retention.py) ------------------
+# Manifests are kept forever; so is any run a logged position references.
+retention:
+  prob_tables_days: 60                # prob_curves / prob_metrics / prob_policies of older runs
+  chain_blocks_days: 90               # older data/chains blocks thinned to one per day

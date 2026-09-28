@@ -51,7 +51,7 @@ held_back = analyse.get("portfolio_rejected", [])
 def current_book() -> list[dict]:
     """Open positions plus anything the latest run proposed."""
     book = []
-    positions = paper.list_positions(status="open")
+    positions = paper.list_positions(status="open", book="taken")
     for _, row in positions.iterrows():
         book.append({"ticker": str(row["ticker"]).upper(),
                       "strike": float(row["strike"]),

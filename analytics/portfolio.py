@@ -471,7 +471,7 @@ def recycling_schedule() -> pd.DataFrame:
     from analytics import paper
 
     rows = []
-    positions = paper.list_positions(status="open")
+    positions = paper.list_positions(status="open", book="taken")
     if not positions.empty:
         for _, row in positions.iterrows():
             rows.append({

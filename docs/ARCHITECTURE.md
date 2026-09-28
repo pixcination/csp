@@ -1,6 +1,6 @@
 # Architecture
 
-How the CSP / wheel screener is built **as of Phase 17** (2026-09-28). This
+How the CSP / wheel screener is built **as of Phase 18** (2026-09-28). This
 file describes the code as it is. Where the system is going is in
 [SCREENER_ROADMAP.md](SCREENER_ROADMAP.md); what each phase changed is in
 `docs/PHASE{N}_SUMMARY.md` (Phase 1: [PHASE1_NOTES.md](PHASE1_NOTES.md)). The
@@ -55,8 +55,8 @@ and is not repeated here. Read the docstring before changing a module.
  data/runs/<id>/  manifest.json · candidates.parquet · positions.parquet
           │
           ▼
- app/  (Streamlit): Screener · Trade Detail · Strategies · Command Center · Decisions
-                    Wheel · Validation · Portfolio · Signals · Universe · Settings
+ app/  (Streamlit): Screener · Trade Detail · Strategies · Tracking · Command Center
+                    Decisions · Wheel · Validation · Portfolio · Signals · Universe · Settings
 ```
 
 Research and analysis only. **No order placement** anywhere; the paper book
@@ -91,19 +91,21 @@ D:\csp\
 │   ├── events.py          events table + event policy check (Phase 9)
 │   ├── reference.py       Treasury rates, VIX complex
 │   ├── chains.py          TastyTrade chain capture
+│   ├── chain_archive.py   daily full-universe snapshot into data/chain_archive (Phase 18)
 │   ├── tastytrade_client.py  the one entry into vendor/tastytrade
 │   └── massive_sync.py    1-minute archive sync (nightly only)
 ├── analytics/             pure analysis (section 5)
 ├── pipeline/
 │   ├── run.py             the activation button
-│   └── results.py         persisted run tables; latest_run() (Phase 8)
+│   ├── results.py         persisted run tables; latest_run() (Phase 8)
+│   └── retention.py       run / chain-block pruning plan (Phase 18; scripts/prune.py)
 ├── app/
 │   ├── main.py            navigation (st.navigation)
 │   ├── theme.py           palette shared by CSS and Plotly
 │   ├── components/        charts.py, formatting.py, run_state.py, status.py
 │   └── pages/             8_Screener (landing), 9_Trade_Detail, 0_Command_Center … 7_Settings
 ├── scripts/               CLI entry points (section 8)
-├── tests/                 test_foundation, test_phase3 … test_phase17 (+ fixtures/csp_golden)
+├── tests/                 test_foundation, test_phase3 … test_phase18 (+ fixtures/csp_golden)
 ├── vendor/tastytrade/     vendored client (tastytrade_common, snapshot_loop)
 ├── legacy/                the retired Phase-2 stack; not imported (Phase 8)
 ├── weekly_move_analysis/  the original move study, kept as a script
@@ -131,7 +133,9 @@ D:\csp\
 | `data/stage3_chains/<date>/` | `scripts/04` | Legacy chain snapshots; still read by `iv_history.py`. |
 | `data/iv_history.duckdb` | `analytics/iv_history.py` | IV observations per ticker/block, rolled up from snapshots. |
 | `data/reference/*.parquet` | `reference.py`, `yfinance_sync.py` | `treasury_rates`, `vol_indices`, `earnings`, `dividends`. |
-| `data/trade_log.duckdb` | `analytics/paper.py` | The paper book: `cycles`, `paper_positions` (one row per position/package: short `strike`, `long_strike`/`width` for a spread, `collateral` = BPR, package quote, `rolled_from`/`rolls_used`, best profit seen), `paper_legs` (Phase 15: one row per leg; pre-Phase-15 rows migrated to one short-put leg on connect), `paper_marks` (marks while open: pipeline and manual), `paper_predictions` (what the engine claimed at entry, per metric and model), `share_lots`. (The legacy `positions` table is left in place, unused.) |
+| `data/trade_log.duckdb` → `tracking_observations`, `position_marks` | `analytics/tracking.py` (Phase 18) | Every re-sighting of a logged trade (run, rank, price, probabilities); every tracking mark (time, session block, spot, per-leg quotes/IV/IV-from-mid/Greeks as JSON, mark/natural, P&L, % of max, best/worst, DTE, probabilities from now, verdict + reason, IV rank/pct, VIX ratio, trend, RSI, P&L change split into delta/gamma/theta/vega/residual). |
+| `data/chain_archive/<date>/` | `data_sources/chain_archive.py` (Phase 18) | The daily full-universe chain + underlying snapshot (0–60 DTE, strike-filtered) and a `manifest.json`; kept forever -- our own option-price history. |
+| `data/trade_log.duckdb` | `analytics/paper.py` | The paper book: `cycles`, `paper_positions` (one row per position/package: short `strike`, `long_strike`/`width` for a spread, `collateral` = BPR, package quote, `rolled_from`/`rolls_used`, best profit seen), `paper_legs` (Phase 15: one row per leg; pre-Phase-15 rows migrated to one short-put leg on connect), `paper_marks` (marks while open: pipeline and manual), `paper_predictions` (what the engine claimed at entry, per metric and model), `share_lots`. Phase 18 columns on `paper_positions`: `book` (`taken` = a real trade, counted by capacity/exposure/correlation; `tracked` = a forward test at the modelled fill, never counted, no wheel cycle or share lot), `sample` (top / control / manual), `dedupe_key`, `trade_id`, `rank_at_log`, `preset`, `entry_spot`, `entry_context` (JSON), `source_row` (JSON, for promote), `promoted_from`, `logged_at`, and the outcomes `hold_status` / `hold_pnl` / `managed_pnl` / `managed_exit_date` / `managed_rule`. (The legacy `positions` table is left in place, unused.) |
 | `data/runs/<id>/` | `pipeline/run.py`, `pipeline/results.py` | `manifest.json` (with the scan request), `candidates.parquet`, `positions.parquet`, `underlyings.parquet` (the ranking, Phase 11), `prob_policies` / `prob_metrics` / `prob_curves.parquet` (the probability engine per trade_id and model, Phase 13), `strategies.parquet` / `strategy_conditions.parquet` (the Phase 16 recommender, when the request has `specs` or `recommend`). |
 | `strategies/*.yaml` | hand-written, versioned | Phase 16 strategy specs (legs, selectors, expirations, entry conditions, exit policy, margin class); format in `analytics/strategy_spec.py`. |
 | `data/validation/` | `scripts/validate_prob_engine.py`, `scripts/backtest_pcs.py` | Walk-forward calibration of the probability engine: trades, calibration bins, summary JSON (per DTE; spreads as `prob_engine_pcs_*`, Phase 15). The PCS rule backtest: `pcs_backtest_sweep` / `_folds.parquet`, `pcs_backtest_summary.json` (Phase 15). |
@@ -156,6 +160,8 @@ The basis delivered is always on `frame.attrs["price_basis"]`. If a ticker
 has no raw rows, the loader falls back to the legacy tables and labels the
 result `split_adjusted_legacy` / `total_return_legacy`.
 `tests/test_phase8.py` pins which modules use which basis.
+
+**Completed sessions only** (Phase 18 fix): the sync's watermark is the last completed session (16:15 ET cutoff) and later bars are never stored -- an RTH run used to store today's partial bar and skip the ticker afterwards.
 
 **Incremental sync.** Each run pulls from the last stored date minus 7 days
 and compares that overlap with what is stored. A new dividend, a new split, a
@@ -270,6 +276,7 @@ Pure Python, config-driven, no Streamlit imports. Grouped by job:
 | Trade construction | `candidates.py` (the sheet: `evaluate_universe(request=…)` builds CSP and PCS rows per ticker, `trade_id`, `select_sheet`, census), `strategies/` package (Phase 12: `base.py` Leg/Position -- payoff, value, max profit/loss, breakevens, BPR, net Greeks; `csp.py` the CSP evaluation moved verbatim from candidates, numbers pinned by a golden test; `pcs.py` put credit spreads -- strike rules, width ladder, tiers, empirical POP/P(max loss)/EV; Phase 17: also built at the nearest monthly for targets from `prefer_monthly_from_dte`, long leg snapped to open interest within `long_leg_oi_snap_band`; `context.py` EM, support, liquidity and premium flags on every row), `costs.py` (tastytrade fees, single- and multi-leg fill models, vertical exit fees per outcome), `sizing.py` (capital and liquidity caps; `max_contracts_for_position` caps every leg, with `liquidity_limits.spread_legs` floors for multi-leg positions since Phase 17; account profiles) |
 | Multi-strategy (Phase 16) | `strategy_spec.py` (YAML specs: validation, `premium` credit/debit, `applies`, `condition_matrix`; Phase 17 IV regime on the clamped IV percentile with hysteresis, soft except at the extremes, `regime_fit`), `strategies/resolver.py` (spec + chain -> priced, margined, sized positions with empirical POP/EV and gates; model IVs implied from each leg's mid; Phase 17: roles from 30 DTE take the nearest monthly, spread-leg liquidity floors), `strategies/base.py` (stock legs; several expirations, later legs at the forward vol), `margin.py` (BPR per class: cash-secured, defined risk, covered, naked broker formula; profile permissions), `recommender.py` (conditions -> applicable specs -> resolve -> probability engine -> rank by blended EV/day/BPR of each spec's own exit rules; in-regime rows first; `research_only` for naked specs on a `naked_research_only` profile), `costs.multi_leg_fill`, `exit_rules.evaluate_spec_position` |
 | Options analytics (Phase 12) | `expected_move.py` (tastytrade platform formula 0.6 straddle + 0.3 / 0.1 strangles, IV method, 0.85 x straddle; bands; EM distance; historical containment), `liquidity.py` (per-leg OI / volume / spread, fillability 0-1, weakest leg, OI walls) |
+| Tracking (Phase 18) | `tracking.py` (log rows as tracked with dedupe + observations; the C.3 sample -- top K passing, M random passing below, M near-miss rejects; promote; `update`: targeted chain refresh of the positions' expirations, marks, probabilities from now, `verdict` (the one management decision function, also used by the pipeline), Greeks attribution between marks with IV implied from each leg's mid; `expire_due`: settle from the expiry close, hold and managed outcomes; `entry_vs_now`) |
 | Book | `portfolio.py` (correlation clusters, marginal risk, simultaneous-assignment stress), `paper.py` (multi-leg paper book: accept CSP/PCS with net or leg fills, close / settle / roll, marks, stored predictions, slippage, performance by strategy), `book.py` (Phase 15: the open book marked on the latest chains -- mark, natural, unrealised, Greeks from the chain or Black-Scholes, 1-year beta on SPY, beta-weighted delta, theta/day, vega, BPR utilisation, event calendar) |
 | Management | `exit_rules.py` (CSP: hold/close/roll/accept, net of fees; Phase 15 PCS: value floor, loss stop at k x credit, breach/delta roll trigger, profit target above the hold horizon net of fees, optional time stop, the empirical expected-value test; `spread_roll_candidates` for net-credit rolls), `roll_engine.py`, `covered_call.py` |
 | Trade Detail (Phase 14) | `trade_detail.py` (no Streamlit: the persisted row as plain python, plain-English thesis/verdict/risk flags, payoff at expiry and T+n, net Greeks over time, price × IV scenario grid, empirical vs lognormal terminal distributions, EM cones, chain window around the legs, management plan, the Screener grid, filters and Excel export) |
@@ -296,6 +303,7 @@ sample size.
 | Portfolio | **open book** (Phase 15: marks, P&L, beta-weighted delta, theta/day, vega, BPR utilisation, event calendar), exposure, clusters, stress, correlation, capital recycling | `paper` + chains, `active_run()` |
 | Signals | **Levels** (universe chance check, support map with %/ATR/EM distances, every level ranked by edge CI, chart of tests, RSI extremes), gap risk, skew, term structure | technicals cache, disk |
 | **Strategies** (Phase 16) | Recommend (latest run's recommender tables or a scan of stored chains: grid, payoff, legs, probabilities, record to the book), Library (specs and profile permissions), Condition matrix | `strategies.parquet`, chains |
+| **Tracking** (Phase 18) | book filter (tracked / taken / both); **Update now** (targeted chain pull + a mark per open position), **Expire due**, **Archive chains**; open positions with mark, P&L, % of max, best/worst, P(target) at entry vs now, POP now, verdict; per position: entry vs now, marks and probabilities over time, P&L attribution, observations, **Promote** to taken; closed positions with hold-to-expiry vs managed P&L; the archive list. The Screener's **Log mode** (multi-row: Log selected / every passing row shown / Log all = top K + control) and the Strategies grid (multi-row, Log selected) feed it | `trade_log.duckdb`, chains |
 | Settings | user account profiles (capital, caps, permissions incl. account type, naked approval, naked research-only, placeholder flag) and ranking-weight presets; saved to `config/user_settings.yaml` | disk |
 | Universe | registry editor (add / deactivate / tag), IVR/IVP, next earnings and disagreements, Stage 1 verdicts, per-symbol weekly bars and earnings reactions, 45-day market-event calendar with policy | registry, metrics, events |
 
@@ -351,6 +359,9 @@ Headless check: `python scripts/check_pages.py` runs every page through
 | `recommender` | IV regime (Phase 17: measure `ivp`, thresholds, hysteresis, soft, credit_min / debit_max extremes), engine paths per trade | `analytics/recommender.py`, `strategy_spec.py` |
 | `stage1_thresholds.min_rv_broad_index` | RV floor for `broad_index_*` ETFs (Phase 17: 0.08) | `analytics/universe_screen.py` |
 | `margin` | naked requirement percentages | `analytics/margin.py` |
+| `tracking` | top K, control M, engine paths per update (Phase 18) | `analytics/tracking.py` |
+| `archive` | DTE window and time of the daily chain archive (Phase 18) | `data_sources/chain_archive.py` |
+| `retention` | days before run prob tables go and chain blocks thin (Phase 18) | `pipeline/retention.py` |
 
 ---
 
@@ -390,6 +401,8 @@ the meeting before it.
 | `python scripts/check_pages.py` | headless run of every page |
 | `python scripts/validate.py` | engine validation (calibration, IV coverage, walk-forward, signals) |
 | `python scripts/validate_prob_engine.py [--strategy pcs]` | probability engine walk-forward, puts or spreads |
+| `python scripts/archive_chains.py` | the daily chain archive (Phase 18; 15:45 ET) |
+| `python scripts/prune.py [--apply]` | run / chain retention plan (Phase 18) |
 | `python scripts/backtest_pcs.py` | PCS rule backtest and walk-forward (~6 min for 4 ETFs x 768 rule sets) |
 
 ### 8.4 Universe rebuild from the 1-minute archive (scripts 01–06)
@@ -459,6 +472,13 @@ re-pulls `daily_bars_raw`, runs the adjustment check, drops
   sampled (one per pipeline run plus manual marks), so a target touched
   between marks is missed; positions closed early without reaching a target
   are censored, not misses.
+- **Tracking marks are sampled.** A rule that would have fired between two
+  marks is caught at the next one, so managed outcomes and P(reach X%)
+  scoring are approximate until the Phase 19 scheduler marks hourly.
+  dxFeed's Greeks events refresh less often than quotes (vega attribution
+  therefore uses IV implied from each leg's mid). Auto-expiry settles on the
+  daily close (an AM-settled index expiry's real settlement differs), and a
+  calendar or diagonal whose front leg expired is left for a manual close.
 - **Account profiles are placeholders** until Tom enters the real values
   (Settings; the Screener warns while `placeholder: true`).
 - **Probabilities are model outputs, not guarantees.** The engine's blend

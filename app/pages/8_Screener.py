@@ -358,15 +358,20 @@ from analytics.probabilities import SORTS  # noqa: E402
 sorts = {key: label for key, label in SORTS.items() if key in grid.columns}
 sort_key = f[4].selectbox("Sort", list(sorts), format_func=sorts.get)
 
-t = st.columns(4)
+t = st.columns(5)
 accepted_only = t[0].toggle("Only rows that passed every gate", value=True)
+log_mode = t[4].toggle("Log mode", value=False, key="screener_log_mode",
+                       help="Phase 18: select several rows and log them as tracked forward "
+                            "tests (Tracking page). Off: selecting a row opens Trade Detail.")
 best_only = t[1].toggle("Best per ticker", value=False)
 group = t[2].toggle("Group by ticker", value=False)
 proposed_only = t[3].toggle("Only proposed", value=False)
 
 view = td.filter_grid(grid, pick_strat, pick_tickers, accepted_only, proposed_only,
                       best_only, min_pop_f or None, max_dte_f or None, sort_key, group)
-st.caption(f"{len(view):,} of {len(grid):,} rows · select a row to open its Trade Detail.")
+st.caption(f"{len(view):,} of {len(grid):,} rows · "
+           + ("select rows to log them." if log_mode else
+              "select a row to open its Trade Detail."))
 
 pct = "percent"
 config = {
@@ -410,8 +415,9 @@ config = {
     "why_not": st.column_config.TextColumn("Rejected because", width="large"),
 }
 event = st.dataframe(view, hide_index=True, width="stretch", height=520,
-                     column_config=config, on_select="rerun", selection_mode="single-row",
-                     key=f"grid|{results.run_id}")
+                     column_config=config, on_select="rerun",
+                     selection_mode="multi-row" if log_mode else "single-row",
+                     key=f"grid|{results.run_id}|{'log' if log_mode else 'open'}")
 
 exp = st.columns([1, 1, 4])
 exp[0].download_button("CSV", view.drop(columns="trade_id").to_csv(index=False).encode(),
@@ -421,7 +427,35 @@ exp[1].download_button("Excel", td.export_excel(view.drop(columns="trade_id")),
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 rows = getattr(getattr(event, "selection", None), "rows", None) or []
-if not rows:
+if log_mode:
+    # Phase 18: log rows as tracked forward tests (analytics/tracking.py).
+    from analytics import tracking
+    full = results.candidates.set_index("trade_id", drop=False)
+    preset = request.get("name") or None
+    lc = st.columns(3)
+    chosen_ids = [str(view.iloc[i]["trade_id"]) for i in rows]
+    outcome = None
+    if lc[0].button(f"Log selected ({len(chosen_ids)})", disabled=not chosen_ids,
+                    type="primary"):
+        outcome = tracking.log(full.loc[chosen_ids], run_id=results.run_id, preset=preset)
+    passing = [t for t in view.loc[view["accepted"].astype(bool), "trade_id"]]
+    if lc[1].button(f"Log every passing row shown ({len(passing)})", disabled=not passing):
+        outcome = tracking.log(full.loc[passing], run_id=results.run_id, preset=preset)
+    cfg_t = load_config().get("tracking", {}) or {}
+    if lc[2].button(f"Log all: top {cfg_t.get('top_k', 5)} + control sample",
+                    help="Review C.3: the top K passing rows of the whole run, M random "
+                         "passing rows below them and M near-miss rejects, so the accuracy "
+                         "log measures the model and not only the favourites."):
+        outcome = tracking.log_all(results.candidates, run_id=results.run_id, preset=preset)
+    if outcome is not None:
+        opened = sum(o["action"] == "opened" for o in outcome)
+        seen = sum(o["action"] == "observed" for o in outcome)
+        st.success(f"{opened} new tracked position(s), {seen} already tracked (observation "
+                   f"added). See the Tracking page.")
+        for o in outcome:
+            if o["action"] == "skipped":
+                st.warning(o["message"])
+elif not rows:
     st.session_state.pop("screener_opened", None)
 else:
     trade_id = str(view.iloc[rows[0]]["trade_id"])

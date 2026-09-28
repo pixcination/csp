@@ -88,6 +88,11 @@ def chains_dir() -> Path:
     return _ensure(data_dir() / "chains")
 
 
+def chain_archive_dir() -> Path:
+    """Phase 18: the daily full-universe chain snapshot, kept forever."""
+    return _ensure(data_dir() / "chain_archive")
+
+
 def reference_dir() -> Path:
     """FRED rates, VIX complex, earnings calendar, dividend ex-dates."""
     return _ensure(data_dir() / "reference")

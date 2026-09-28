@@ -154,7 +154,7 @@ def open_book(today: dt.date | None = None, chain_loader=None, daily_loader=None
     """One row per open position with marks, Greeks and buying power."""
     today = today or dt.date.today()
     if positions is None:
-        positions = paper.list_positions(status="open")
+        positions = paper.list_positions(status="open", book="taken")
     if positions.empty:
         return pd.DataFrame()
     if legs is None:

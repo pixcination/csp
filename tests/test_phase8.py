@@ -253,7 +253,7 @@ def test_quiet_incremental_sync_does_not_repull(daily_db, monkeypatch):
 
 PRICE_BASIS = ["analytics/candidates.py", "analytics/covered_call.py",
                "analytics/roll_engine.py", "analytics/gaps.py",
-               "analytics/portfolio.py", "pipeline/run.py"]
+               "analytics/portfolio.py", "analytics/tracking.py"]  # Phase 18: position review moved from pipeline/run.py
 TOTAL_BASIS = ["analytics/regimes.py", "analytics/walkforward.py",
                "app/pages/2_Wheel.py", "scripts/sweep_universe.py"]
 
@@ -508,3 +508,24 @@ def test_dividend_file_is_derived_from_raw_bars(daily_db, tmp_path, monkeypatch)
     assert (tmp_path / ys.DIVIDENDS_FILE).exists()
     assert list(frame["symbol"].unique()) == ["DIVCO"]
     assert frame["ex_date"].max() == raw["date"].iloc[240]
+
+
+def test_sync_never_stores_an_in_progress_session(daily_db, monkeypatch):
+    """Phase 18 fix: an RTH sync stored today's partial bar, and every later
+    sync skipped the ticker as current (SPY 2026-09-28 kept its 10:00 price).
+    Bars after the last COMPLETED session are never stored."""
+    from core import freshness
+    history = _raw_frame(n=260, ex_index=100, dividend=1.0)
+    _insert(daily_db, history.iloc[:250])
+    fake = _FakeYF(history)
+    monkeypatch.setattr(ys, "_yf", lambda: fake)
+    done = history["date"].iloc[254]
+    monkeypatch.setattr(freshness, "last_completed_session", lambda now=None: done)
+    [result] = ys.sync_daily(["DIVCO"])
+    assert result.error is None
+    assert ys.load_daily("DIVCO")["date"].max().date() == done
+    # The session completes: the next sync picks the bars up.
+    later = history["date"].iloc[-1]
+    monkeypatch.setattr(freshness, "last_completed_session", lambda now=None: later)
+    ys.sync_daily(["DIVCO"])
+    assert ys.load_daily("DIVCO")["date"].max().date() == later

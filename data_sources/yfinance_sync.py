@@ -246,7 +246,13 @@ def sync_daily(tickers: list[str], reporter: BaseReporter | None = None,
     reporter = reporter or NullReporter()
     results = {t: DailySyncResult(ticker=t) for t in tickers}
     mapping = _vendor_map(tickers)
-    watermark = previous_trading_day(dt.datetime.now(ET).date() + dt.timedelta(days=1))
+    # Phase 18 fix: the last COMPLETED session, never today's while it trades.
+    # The old watermark (today) stored an in-progress bar on any RTH run, and
+    # every later sync then skipped the ticker as current: 2026-09-28's SPY
+    # "close" stayed the 10:00 price (767.75 on 4.6M shares; the real close was
+    # 765.61 on 40.8M) and settled a tracked 0-DTE put at it.
+    from core.freshness import last_completed_session
+    watermark = last_completed_session()
 
     con = duckdb.connect(str(db_universe_daily()))
     con.execute(RAW_SCHEMA)
@@ -277,7 +283,7 @@ def sync_daily(tickers: list[str], reporter: BaseReporter | None = None,
                         continue
                     own_start = last[ticker] - dt.timedelta(days=7)
                     frame = _scale(_normalise(pulled[yf_symbol], ticker), scale)
-                    frame = frame[frame["date"] >= own_start]
+                    frame = frame[(frame["date"] >= own_start) & (frame["date"] <= watermark)]
                     stored = con.execute(
                         f"SELECT date, close, dividends, splits FROM {RAW_TABLE} "
                         f"WHERE ticker = ? AND date >= ?", [ticker, own_start]).fetchdf()
@@ -300,6 +306,7 @@ def sync_daily(tickers: list[str], reporter: BaseReporter | None = None,
                         reporter.advance(1, note=f"{ticker} empty")
                         continue
                     frame = _scale(_normalise(pulled[yf_symbol], ticker), scale)
+                    frame = frame[frame["date"] <= watermark]
                     _store(con, ticker, frame, res, whole_ticker=True)
                     note = f"{ticker} +{res.rows_added}"
                     if res.full_repull not in ("initial", "forced"):

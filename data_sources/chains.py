@@ -311,7 +311,8 @@ class StrikeWindow:
 
 def _rows_for_chain(ttc, chain: dict, tokens: str,
                     window: StrikeWindow | None = None,
-                    today: dt.date | None = None) -> tuple[list[dict], list[str], dict, dict]:
+                    today: dt.date | None = None,
+                    only: set | None = None) -> tuple[list[dict], list[str], dict, dict]:
     """Chain rows inside the DTE token and the strike window.
 
     Returns (rows, option symbols to subscribe, symbol -> (side, row),
@@ -323,6 +324,8 @@ def _rows_for_chain(ttc, chain: dict, tokens: str,
     for item in items:
         flat.extend(item.get("expirations", []))
     chosen = set(ttc.select_expirations(flat, tokens))
+    if only is not None:
+        chosen &= {str(d) for d in only}
     info = {"expirations_dropped": [], "strikes_listed": 0, "extra_subscriptions": 0}
     if not chosen:
         return [], [], {}, info
@@ -424,7 +427,8 @@ def capture(ticker: str, dte_max: int | None = None, dte_min: int = 0,
              iv: float | None = None,
              reference_dte: float | None = None,
              strike_filter: bool = True,
-             extra_call_bands=()) -> CaptureResult:
+             extra_call_bands=(),
+             expirations: set | None = None) -> CaptureResult:
     """Pull one ticker's chain and underlying, stamped with the session block.
 
     REST supplies bid/ask/mark/last; DXLink streaming supplies open interest,
@@ -437,6 +441,11 @@ def capture(ticker: str, dte_max: int | None = None, dte_min: int = 0,
     `strike_filter=False` pulls every strike, as before Phase 11.
     `extra_call_bands`: Phase 17 spec widening (see the module docstring);
     the DTE window is extended to cover them.
+    `expirations` (Phase 18, the tracking update): refresh ONLY these
+    expirations (dates) and merge them into this block's existing snapshot,
+    whose other expirations and recorded window are kept. A 0-54 DTE pull
+    of SPX exceeds the subscription cap, which drops the far expirations --
+    exactly the ones a 45-DTE position lives in.
     """
     result = CaptureResult(ticker=ticker)
     cfg = load_config().get("chain_capture", {})
@@ -444,7 +453,7 @@ def capture(ticker: str, dte_max: int | None = None, dte_min: int = 0,
     if extra_call_bands:
         dte_max = max(int(dte_max), max(int(b[1]) for b in extra_call_bands))
 
-    if not force:
+    if not force and expirations is None:
         wanted, reason = needs_capture(ticker, now, (dte_min, dte_max))
         if not wanted:
             result.skipped, result.reason = True, reason
@@ -462,9 +471,16 @@ def capture(ticker: str, dte_max: int | None = None, dte_min: int = 0,
     # symbol captured 0-21 earlier in the same block pulls 0-59, not 30-59,
     # or a later --quick CSP run would find its weekly strikes gone.
     existing = existing_snapshot(ticker, block)
+    recorded = (int(dte_min), int(dte_max))
     if existing is not None:
         have = snapshot_dte_window(existing)
-        dte_min, dte_max = min(dte_min, have[0]), max(dte_max, have[1])
+        recorded = (min(dte_min, have[0]), max(dte_max, have[1]))
+        if expirations is None:
+            dte_min, dte_max = recorded
+    if expirations is not None:
+        today_ = (now or dt.datetime.now()).date()
+        days = [(pd.Timestamp(d).date() - today_).days for d in expirations]
+        dte_min, dte_max = max(min(days), 0), max(max(days), 0)
     result.dte_window = (int(dte_min), int(dte_max))
 
     try:
@@ -485,7 +501,8 @@ def capture(ticker: str, dte_max: int | None = None, dte_min: int = 0,
         chain = ttc.fetch_equity_chain(tt_symbol)
         rows, symbols, index, listing = _rows_for_chain(
             ttc, chain, tt.dte_token(dte_min, dte_max), window,
-            (now or dt.datetime.now()).date())
+            (now or dt.datetime.now()).date(),
+            {str(pd.Timestamp(d).date()) for d in expirations} if expirations else None)
         result.strikes_listed = listing["strikes_listed"]
         result.extra_subscriptions = listing.get("extra_subscriptions", 0)
         result.expirations_dropped = listing["expirations_dropped"]
@@ -549,6 +566,16 @@ def capture(ticker: str, dte_max: int | None = None, dte_min: int = 0,
 
         chain_path, under_path = _paths(ticker, block)
         chain_path.parent.mkdir(parents=True, exist_ok=True)
+        if expirations is not None:
+            # Targeted refresh: replace these expirations, keep the rest of
+            # the block's snapshot and its recorded DTE window.
+            if existing is not None:
+                old = pd.read_parquet(existing.chain_path)
+                fresh = set(frame["expiration"].astype(str))
+                old = old[~old["expiration"].astype(str).isin(fresh)]
+                frame = pd.concat([old, frame], ignore_index=True)
+            under_frame["dte_min"], under_frame["dte_max"] = recorded
+            result.dte_window = recorded
         frame.to_parquet(chain_path, index=False)
         under_frame.to_parquet(under_path, index=False)
 

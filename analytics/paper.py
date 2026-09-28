@@ -41,6 +41,18 @@ Two more tables feed calibration:
                         records one per run; you can add your own), so
                         "did it reach 50% of max profit?" has an answer
 
+TRACKED AND TAKEN (Phase 18)
+----------------------------
+`book` separates a real trade (`taken`: your fill, counted by capacity,
+exposure and correlation limits) from a forward test of a recommendation
+(`tracked`: logged at the modelled fill, never counted against the account,
+never opening a wheel cycle or a share lot). `sample` says why a tracked row
+was logged (`top` of a ranking, a random `control`, or `manual`), which is
+what lets the accuracy log measure the model rather than the choices.
+`promoted_from` links a taken trade to the tracked row it started as.
+Tracking itself (observations, hourly marks, attribution, outcomes) lives in
+`analytics/tracking.py`.
+
 The schema stays wheel-shaped: CSPs link to cycles, and cycles own share lots.
 A spread does not open a cycle at entry; one that is physically assigned
 (short leg in the money, long leg not) starts one and becomes a share lot,
@@ -61,6 +73,8 @@ import pandas as pd
 from analytics import costs
 from core.paths import db_trade_log, load_config
 
+BOOKS = ("taken", "tracked")
+SAMPLES = ("top", "control", "manual")
 STATUSES = ["open", "expired_otm", "closed_early", "rolled", "assigned", "settled"]
 CYCLE_STATES = ["put_open", "shares_held", "call_open", "closed"]
 STRATEGIES = ("csp", "pcs")
@@ -143,12 +157,22 @@ POSITION_COLUMNS = {
     # Phase 16: positions from strategy specs (condors, calendars, ...)
     "max_profit_share": "DOUBLE", "legs_label": "VARCHAR",
     "max_profit_pct_seen": "DOUBLE", "settlement_price": "DOUBLE",
+    # Phase 18: tracked vs taken, the sample, the entry context and outcomes
+    "book": "VARCHAR", "sample": "VARCHAR", "promoted_from": "INTEGER",
+    "dedupe_key": "VARCHAR", "preset": "VARCHAR", "rank_at_log": "INTEGER",
+    "trade_id": "VARCHAR", "entry_spot": "DOUBLE", "entry_context": "VARCHAR",
+    "source_row": "VARCHAR", "logged_at": "TIMESTAMP",
+    "hold_status": "VARCHAR", "hold_pnl": "DOUBLE",
+    "managed_pnl": "DOUBLE", "managed_exit_date": "DATE", "managed_rule": "VARCHAR",
 }
 
 
 def _migrate(con) -> None:
     for column, kind in POSITION_COLUMNS.items():
         con.execute(f"ALTER TABLE paper_positions ADD COLUMN IF NOT EXISTS {column} {kind}")
+    # Phase 18: everything recorded before tracking existed was a real trade.
+    con.execute("UPDATE paper_positions SET book = 'taken' WHERE book IS NULL")
+    con.execute("UPDATE paper_positions SET sample = 'manual' WHERE sample IS NULL")
     # Single-leg rows from before Phase 15 get their one leg. Idempotent: only
     # positions without any leg are touched.
     con.execute("""
@@ -173,6 +197,12 @@ def _connect(read_only: bool = False):
         for statement in SCHEMA:
             con.execute(statement)
         _migrate(con)
+        try:
+            from analytics import tracking
+            for statement in tracking.SCHEMA:
+                con.execute(statement)
+        except ImportError:
+            pass
     return con
 
 
@@ -347,7 +377,8 @@ def accept(recommendation: dict, contracts: int | None = None,
            run_id: str | None = None, notes: str = "",
            leg_fills: list[float] | None = None,
            _cycle_id: int | None = None, _rolled_from: int | None = None,
-           _rolls_used: int = 0) -> AcceptResult:
+           _rolls_used: int = 0, book: str = "taken", sample: str = "manual",
+           tracking: dict | None = None) -> AcceptResult:
     """Record an accepted trade -- a cash-secured put or a put credit spread.
 
     `actual_fill` is the NET credit you really got in the executing account
@@ -359,7 +390,16 @@ def accept(recommendation: dict, contracts: int | None = None,
     `contracts` overrides the recommended size; you may have taken less because
     the fill dried up, or more because you disagreed with the cap. Either way,
     what is recorded is what happened.
+
+    `book` (Phase 18): `taken` (a real trade) or `tracked` (a forward test at
+    the modelled fill: no wheel cycle, not counted against the account).
+    `tracking` holds the extra Phase 18 columns (dedupe_key, trade_id,
+    entry_spot, entry_context, source_row, preset, rank_at_log, promoted_from).
     """
+    if book not in BOOKS:
+        raise ValueError(f"book must be one of {BOOKS}")
+    if sample not in SAMPLES:
+        raise ValueError(f"sample must be one of {SAMPLES}")
     cfg = load_config().get("execution", {})
     if not cfg.get("allow_manual_fill_override", True) and (
             actual_fill is not None or leg_fills):
@@ -422,7 +462,9 @@ def accept(recommendation: dict, contracts: int | None = None,
     con = _connect()
     try:
         cycle_id = _cycle_id
-        if strategy == "csp" and cycle_id is None:
+        if book == "tracked":
+            cycle_id = None                     # a forward test never opens a wheel cycle
+        elif strategy == "csp" and cycle_id is None:
             cycle_id = con.execute(
                 "INSERT INTO cycles (ticker, state, opened_date, total_premium, total_fees) "
                 "VALUES (?, 'put_open', ?, ?, ?) RETURNING cycle_id",
@@ -462,9 +504,16 @@ def accept(recommendation: dict, contracts: int | None = None,
              net_mid, half, pop, recommendation.get("headline_policy"),
              _rolled_from, int(_rolls_used)]).fetchone()[0]
 
-        con.execute("UPDATE paper_positions SET max_profit_share = ?, legs_label = ? "
-                    "WHERE id = ?", [max_profit_share, recommendation.get("legs")
-                                     if generic else None, position_id])
+        con.execute("UPDATE paper_positions SET max_profit_share = ?, legs_label = ?, "
+                    "book = ?, sample = ?, logged_at = ? WHERE id = ?",
+                    [max_profit_share, recommendation.get("legs") if generic else None,
+                     book, sample, dt.datetime.now(), position_id])
+        extra = {k: v for k, v in (tracking or {}).items()
+                 if k in ("dedupe_key", "preset", "rank_at_log", "trade_id", "entry_spot",
+                          "entry_context", "source_row", "promoted_from")}
+        for column, value in extra.items():
+            con.execute(f"UPDATE paper_positions SET {column} = ? WHERE id = ?",
+                        [value, position_id])
         for index, leg in enumerate(legs):
             con.execute(
                 "INSERT INTO paper_legs (position_id, leg_index, option_type, side, strike, "
@@ -624,6 +673,7 @@ def close_position(position_id: int, status: str, exit_date: dt.date | None = No
                 leg_exits = [exit_price]
 
         # A spread assigned into shares is judged on its value at settlement.
+        tracked = str(row.get("book") or "taken") == "tracked"
         final_exit = economic_exit if assign_shares else exit_price
         best = _max_profit_share(row, entry_fill)
         final_pct = ((float(entry_fill) - final_exit) / best
@@ -645,6 +695,8 @@ def close_position(position_id: int, status: str, exit_date: dt.date | None = No
                 con.execute("UPDATE paper_legs SET exit_price = ? WHERE leg_id = ?",
                             [value, int(leg["leg_id"])])
 
+        if tracked:
+            return                              # forward tests never touch the wheel
         if assign_shares and cycle_id is None:
             # A spread opened no wheel cycle; its assignment starts one, so the
             # covered-call side manages the shares like any assigned CSP's.
@@ -785,12 +837,19 @@ def _query(sql: str, params: list | None = None) -> pd.DataFrame:
         con.close()
 
 
-def list_positions(status: str | None = None) -> pd.DataFrame:
+def list_positions(status: str | None = None, book: str | None = None) -> pd.DataFrame:
+    """Positions, optionally by status and book (Phase 18: capacity, exposure
+    and correlation use `book="taken"`; tracked forward tests never count)."""
     query = "SELECT * FROM paper_positions"
-    params: list = []
+    where, params = [], []
     if status:
-        query += " WHERE status = ?"
+        where.append("status = ?")
         params.append(status)
+    if book:
+        where.append("coalesce(book, 'taken') = ?")
+        params.append(book)
+    if where:
+        query += " WHERE " + " AND ".join(where)
     return _query(query + " ORDER BY entry_date DESC, id DESC", params)
 
 

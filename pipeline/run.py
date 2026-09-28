@@ -528,7 +528,7 @@ def _stage_analyse(reporter: BaseReporter, manifest: RunManifest,
             book = [{"ticker": r["ticker"], "spot": r.get("spot"),
                      "strike": r.get("strike"), "collateral": r.get("collateral")}
                     for r in results["candidates"]]
-            open_positions = paper.list_positions(status="open")
+            open_positions = paper.list_positions(status="open", book="taken")
             for _, row in open_positions.iterrows():
                 book.append({"ticker": row["ticker"], "spot": None,
                              "strike": float(row["strike"]),
@@ -596,7 +596,7 @@ def _stage_wheel(reporter: BaseReporter, manifest: RunManifest) -> dict:
             manifest.warnings.append(f"covered calls: {exc}")
 
         try:
-            positions = paper.list_positions(status="open")
+            positions = paper.list_positions(status="open", book="taken")
             at_risk = []
             if not positions.empty:
                 # Spread rolls come from the spread management engine
@@ -661,10 +661,12 @@ def _tickers_with_positions() -> set[str]:
 
 
 def _evaluate_open_positions(reporter: BaseReporter) -> list[dict]:
-    """Run the management engine over every open position in the paper book:
-    `evaluate_short_put` for CSPs, `evaluate_put_spread` for spreads (with
-    roll candidates when it says roll). Each position's mark is recorded to
-    `paper_marks`, which is what later scores its P(reach X%) predictions.
+    """Run the management engine over every open position in the paper book
+    (tracked and taken): `tracking.verdict` -- evaluate_short_put for CSPs,
+    evaluate_put_spread for spreads (with roll candidates when it says roll),
+    the spec's exit block for strategy-spec positions. Each position's mark is
+    recorded to `paper_marks`, which is what later scores its P(reach X%)
+    predictions.
     """
     try:
         from analytics import paper
@@ -674,12 +676,8 @@ def _evaluate_open_positions(reporter: BaseReporter) -> list[dict]:
     if open_rows.empty:
         return []
 
-    from analytics import book
-    from analytics.exit_rules import (OpenPut, OpenSpread, evaluate_put_spread,
-                                      evaluate_short_put, spread_roll_candidates)
-    from core.market_calendar import trading_days_between
+    from analytics import book, tracking
     from data_sources import chains
-    from data_sources.yfinance_sync import load_daily
 
     out = []
     today = dt.date.today()
@@ -687,98 +685,27 @@ def _evaluate_open_positions(reporter: BaseReporter) -> list[dict]:
     for _, row in open_rows.iterrows():
         ticker = str(row["ticker"]).upper()
         strategy = row.get("strategy") or "csp"
-        if strategy not in ("csp", "put", "pcs"):
-            decision = _evaluate_spec_row(row, legs, today, book, paper)
-            if decision is not None:
-                out.append(decision)
-                if decision.get("urgency") != "routine":
-                    reporter.log(f"{decision['urgency'].upper()}: {decision['headline']}")
-            continue
         chain, under = chains.load_chain(ticker)
         spot = chains.spot_from_underlying(under)
         if spot is None:
             continue
-        expiration = pd.Timestamp(row["expiration"]).date()
-        left = trading_days_between(today, expiration)
-        credit = float(row["actual_fill"] if pd.notna(row["actual_fill"])
-                       else row["modelled_fill"])
         mine = legs[legs["position_id"] == row["id"]]
-        marked = book.mark_position(row.to_dict(), mine, chain, spot, today)
-        mark = marked["mark"]
+        mark = book.mark_position(row.to_dict(), mine, chain, spot, today)["mark"]
         if mark is not None:
             try:
                 paper.record_mark(int(row["id"]), mark, spot, today, source="pipeline")
             except Exception as exc:
                 reporter.log(f"  could not record a mark for #{row['id']}: {exc}")
-        daily = load_daily(ticker, basis="price")
-        extra = {}
-        if strategy == "pcs":
-            short_leg = mine[mine["side"] == "short"]
-            quote = book.leg_quote(chain, short_leg.iloc[0].to_dict()) \
-                if not short_leg.empty else None
-            position = OpenSpread(
-                ticker=ticker, short_strike=float(row["strike"]),
-                long_strike=float(row["long_strike"]), contracts=int(row["contracts"]),
-                entry_credit=credit, spot=spot,
-                current_mark=mark if mark is not None else credit,
-                calendar_days_left=max((expiration - today).days, 0),
-                trading_days_left=max(left, 0),
-                entry_dte_calendar=(expiration - pd.Timestamp(row["entry_date"]).date()).days,
-                short_delta=(quote or {}).get("delta"),
-                rolls_used=int(row["rolls_used"]) if pd.notna(row.get("rolls_used")) else 0,
-                cash_settled=row.get("settlement_type") == "cash")
-            decision = evaluate_put_spread(position, daily)
-            if decision.action.value == "roll":
-                rolls = spread_roll_candidates(chain, position, expiration, today)
-                extra["roll_candidates"] = (json.loads(rolls.to_json(orient="records", date_format="iso"))
-                                            if not rolls.empty else [])
-        else:
-            if mark is None:
-                mark = _mark_for(chain, float(row["strike"]), row["expiration"])
-            position = OpenPut(
-                ticker=ticker, strike=float(row["strike"]),
-                contracts=int(row["contracts"]), entry_credit=credit,
-                spot=spot, current_mark=mark if mark is not None else 0.0,
-                trading_days_left=max(left, 0))
-            decision = evaluate_short_put(position, daily)
-        out.append({"position_id": int(row["id"]), "strategy": strategy,
-                    **decision.to_dict(), **extra})
-        if decision.urgency != "routine":
-            reporter.log(f"{decision.urgency.upper()}: {decision.headline}")
+        elif strategy in ("csp", "put"):
+            mark = _mark_for(chain, float(row["strike"]), row["expiration"])
+        decision = tracking.verdict(row.to_dict(), mine, chain, spot, mark, today)
+        if decision is None:
+            continue
+        decision["book"] = row.get("book") or "taken"
+        out.append(decision)
+        if decision.get("urgency") != "routine":
+            reporter.log(f"{decision['urgency'].upper()}: {decision['headline']}")
     return out
-
-
-def _evaluate_spec_row(row, legs, today, book, paper) -> dict | None:
-    """Phase 16: an open strategy-spec position, managed by its spec's exit
-    block (`exit_rules.evaluate_spec_position`); its mark is recorded."""
-    from analytics import strategy_spec
-    from analytics.exit_rules import OpenSpecPosition, evaluate_spec_position
-    from data_sources import chains
-    ticker = str(row["ticker"]).upper()
-    try:
-        spec = strategy_spec.load_all().get(row["strategy"])
-    except Exception:
-        spec = None
-    chain, under = chains.load_chain(ticker)
-    spot = chains.spot_from_underlying(under)
-    mine = legs[legs["position_id"] == row["id"]]
-    marked = book.mark_position(row.to_dict(), mine, chain, spot, today)
-    if marked["mark"] is None:
-        return None
-    paper.record_mark(int(row["id"]), marked["mark"], spot, today, source="pipeline")
-    credit = float(row["actual_fill"] if pd.notna(row["actual_fill"]) else row["modelled_fill"])
-    front = min(pd.Timestamp(e).date() for e in mine["expiration"])
-    best = row.get("max_profit_share")
-    position = OpenSpecPosition(
-        ticker=ticker, label=spec.label if spec else row["strategy"],
-        contracts=int(row["contracts"]), entry_credit=credit,
-        current_mark=float(marked["mark"]),
-        max_profit=float(best) if best is not None and pd.notna(best) else abs(credit),
-        calendar_days_left=max((front - today).days, 0),
-        entry_dte_calendar=(front - pd.Timestamp(row["entry_date"]).date()).days,
-        legs=tuple((l["side"], int(l["qty"] or 1)) for _, l in mine.iterrows()))
-    decision = evaluate_spec_position(position, spec.exit if spec else {})
-    return {"position_id": int(row["id"]), "strategy": row["strategy"], **decision.to_dict()}
 
 
 def _mark_for(chain, strike: float, expiration) -> float | None:

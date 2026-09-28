@@ -35,6 +35,10 @@ pages = [
             icon=":material/query_stats:"),
     st.Page(str(PAGES_DIR / "10_Strategies.py"), title="Strategies",
             icon=":material/category:"),
+    # Phase 18: tracked forward tests and taken trades -- marks, attribution,
+    # probabilities from now, hold vs managed outcomes.
+    st.Page(str(PAGES_DIR / "11_Tracking.py"), title="Tracking",
+            icon=":material/timeline:"),
     st.Page(str(PAGES_DIR / "0_Command_Center.py"), title="Command Center",
             icon=":material/bolt:"),
     st.Page(str(PAGES_DIR / "1_Decisions.py"), title="Decisions",
