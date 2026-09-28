@@ -240,7 +240,8 @@ class EntryVerdict:
 def screen_entry(credit: float, strike: float, contracts: int, dte: int,
                   iv_rv_ratio: float | None = None,
                   earnings_before_expiry: bool = False,
-                  prob_otm_empirical: float | None = None) -> EntryVerdict:
+                  prob_otm_empirical: float | None = None,
+                  dte_window: tuple[int, int] | None = None) -> EntryVerdict:
     """Apply the hard entry gates before a candidate is ever ranked.
 
     These are rejections, not score penalties: a trade that fails any of them
@@ -278,7 +279,7 @@ def screen_entry(credit: float, strike: float, contracts: int, dte: int,
             f"empirical odds of finishing OTM are only {prob_otm_empirical:.0%} -- "
             f"size this as a position you are content to be assigned in")
 
-    lo, hi = cfg.get("dte_min", 5), cfg.get("dte_max", 10)
+    lo, hi = dte_window or (cfg.get("dte_min", 5), cfg.get("dte_max", 10))
     if not (lo <= dte <= hi):
         warnings.append(f"{dte} DTE sits outside the {lo}-{hi} target window")
 

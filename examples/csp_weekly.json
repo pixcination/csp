@@ -1,0 +1,11 @@
+{
+  "name": "CSP 5-10 DTE (the config default, written out)",
+  "strategies": ["csp"],
+  "dte_min": 5,
+  "dte_max": 10,
+  "risk_mode": "delta_range",
+  "delta_range": [-0.30, -0.12],
+  "account_profile": "default",
+  "universe": "csp",
+  "top_n_underlyings": 15
+}

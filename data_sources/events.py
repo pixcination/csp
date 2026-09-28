@@ -333,21 +333,28 @@ class EventCheck:
         return next((h for h in self.hits if h.type == "earnings" and h.action == "block"), None)
 
 
-def _policy(strategy: str) -> dict:
+def _policy(strategy: str, overrides: dict | None = None) -> dict:
+    """config.yaml -> event_policy for `strategy`, with a scan request's
+    `event_policy_overrides` merged over it key by key (Phase 11)."""
+    rules = {k: dict(v or {}) for k, v in (load_config().get("event_policy") or {}).items()}
+    for kind, rule in (overrides or {}).items():
+        rules[kind] = {**rules.get(kind, {}), **(rule or {})}
     out = {}
-    for kind, rule in (load_config().get("event_policy") or {}).items():
-        rule = rule or {}
+    for kind, rule in rules.items():
         if strategy in (rule.get("applies_to") or [strategy]):
             out[kind] = rule
     return out
 
 
 def check(symbol: str, start: dt.date, end: dt.date, strategy: str = "csp",
-          asset_class: str | None = None, calendar_healthy: bool = True) -> EventCheck:
+          asset_class: str | None = None, calendar_healthy: bool = True,
+          overrides: dict | None = None, frame: pd.DataFrame | None = None) -> EventCheck:
     """What does a trade in `symbol` from `start` to `end` run into?
 
     Each event type's window is [start - days_before, end + days_after]. The
-    result's `action` is the most severe action among the hits.
+    result's `action` is the most severe action among the hits. `overrides`
+    are a scan request's `event_policy_overrides`; `frame` lets a caller
+    checking many symbols pass `load()` once.
     """
     if asset_class is None:
         try:
@@ -356,8 +363,8 @@ def check(symbol: str, start: dt.date, end: dt.date, strategy: str = "csp",
         except Exception:
             asset_class = "stock"
     result = EventCheck(symbol, start, end, strategy)
-    policy = _policy(strategy)
-    frame = load()
+    policy = _policy(strategy, overrides)
+    frame = load() if frame is None else frame
     frame = frame[frame["symbol"].isin([symbol, MARKET])] if not frame.empty else frame
 
     for kind, rule in policy.items():

@@ -210,6 +210,12 @@ chain_capture:
   dte_max_with_position: 60           # tickers holding an open leg or shares
   rth_refresh_minutes: 20             # re-pull during RTH if older than this
   offhours_one_snapshot_per_block: true
+  # Phase 11: request-driven window and strike filter
+  roll_buffer_days: 14                # request dte_max + this = chain window upper bound
+  put_window_em: [-3.0, 0.5]          # puts from spot - 3 EM to spot + 0.5 EM (per expiration)
+  call_window_em: [-0.5, 1.5]         # calls near the money: skew, forward, covered calls
+  min_window_pct: 0.03                # never narrower than +/- 3% of spot
+  max_subscriptions_per_symbol: 6000  # drop expirations furthest from the request DTE beyond this
 
 # === Massive.com historical archive (free tier) ===
 # Free tier = 5 requests/minute, end-of-day only. This is a background
@@ -394,3 +400,50 @@ oscillator_study:
   rsi_high: 70
   horizons: [5, 10, 20]
   lookback_years: 20
+
+# --- Scan request, underlying ranking, targeted chains (Phase 11) ------------
+# analytics/scan_request.py. A run without --request uses these defaults,
+# which reproduce the pre-Phase-11 CSP entry window (management.entry) so the
+# default run's numbers do not move.
+scan_defaults:
+  strategies: [csp]
+  dte_min: null                       # null = management.entry.dte_min / dte_max
+  dte_max: null
+  dte_target_tolerance_days: 3        # dte_targets: expirations within +/- this of a target
+  risk_mode: delta_range              # delta_range | min_pop | max_loss_per_trade | max_pct_capital
+  delta_range: null                   # null = management.entry.delta_band
+  spread_widths: [1, 2.5, 5, 10]      # dollars; PCS construction arrives in Phase 12
+  profit_targets: [25, 30, 50, 100]   # % of max profit; probabilities arrive in Phase 13
+  account_profile: default
+  universe: all                       # all | csp | etf | index | stock | tag:<tag> | [list]
+  top_n_underlyings: 15
+  strike_rule: delta                  # delta | em_multiple | support (applied in Phase 12)
+  em_multiple: 1.0
+
+# Chain-free ranking of every registry symbol. Weights are a STARTING POINT,
+# NOT VALIDATED: Phase 14 calibrates them against realised outcomes. Missing
+# components are dropped and the remaining weights renormalised per row
+# (`coverage` reports the share of weight that had data).
+underlying_rank:
+  weights:
+    iv_rank: 0.25                     # mean of TastyTrade IVR and IVP
+    iv_rv: 0.20                       # IV at request DTE / DTE-matched realised vol
+    liquidity: 0.20                   # TastyTrade liquidity rating 0-5 + log liquidity value
+    trend: 0.15                       # uptrend 1.0, range 0.6, downtrend 0.1
+    support: 0.10                     # strong level 0.5-2.0 EM below spot (Phase 10: mostly chance)
+    drawdown: 0.10                    # max drawdown over stage1 drawdown_lookback_years
+  trend_scores: {uptrend: 1.0, range: 0.6, downtrend: 0.1}
+  iv_rv_floor: 0.8                    # ratio scoring 0 ...
+  iv_rv_cap: 2.0                      # ... and 1 (IV at request DTE / DTE-matched bar RV)
+  liquidity_value_log10: [2.0, 5.5]   # tasty liquidity-value on a log scale: 100 -> 0, ~316k -> 1
+  support_em_band: [0.5, 2.0]         # a strong level in this EM band scores 1
+  drawdown_floor: -0.65               # this drawdown or worse scores 0
+  metrics_max_age_days: 5
+
+# Account profiles (roadmap B.7). Each profile overrides keys of `account:`;
+# `default` is the account block itself. Add e.g. roth_ira / taxable here with
+# their own net_liquidating_value, caps and permissions.
+account_profiles:
+  default:
+    allowed_strategies: [csp, pcs, covered_call]
+    spread_approval: true

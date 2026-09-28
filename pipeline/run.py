@@ -6,6 +6,7 @@ The activation button.
     python pipeline/run.py --tickers SPY,F # a subset
     python pipeline/run.py --force-chains  # ignore the staleness window
     python pipeline/run.py --data-only     # nightly: bars, metrics, events, technicals; no chains
+    python pipeline/run.py --request examples/pcs_30_45.json   # a saved scan request
 
 One orchestrator owns the whole run. Each stage decides for itself whether it
 has anything to do, so the cost of pressing the button scales with how stale
@@ -25,6 +26,13 @@ DESIGN RULES
 * **A manifest.** Every run writes `data/runs/<id>/manifest.json` recording
   what ran, what was skipped, how long it took and what the session state
   was, so a recommendation can always be traced back to the data behind it.
+* **A scan request (Phase 11).** Every run answers an explicit
+  `ScanRequest` (`--request file.json`, else `ScanRequest.default()`), and
+  embeds it in the manifest. The data stages still cover the whole registry;
+  `rank_underlyings` then scores every name without chains, and only the top
+  N (plus anything with an open position) get a chain pulled and analysed.
+  Roadmap stages construct -> probabilities -> rank_trades live inside
+  `analyse` for CSP until Phases 12-13 split them out.
 """
 from __future__ import annotations
 
@@ -54,6 +62,7 @@ STAGES = [
     ("events", "Events calendar"),
     ("stage1", "Stage 1 screen"),
     ("technicals", "Technicals and level study"),
+    ("rank_underlyings", "Underlying ranking"),
     ("chains", "Option chains"),
     ("analyse", "Analysis"),
     ("candidates", "Ranking candidates"),
@@ -90,6 +99,7 @@ class RunManifest:
     stages: dict = field(default_factory=dict)
     warnings: list = field(default_factory=list)
     banner: str = ""
+    request: dict = field(default_factory=dict)       # Phase 11: the ScanRequest
 
     def write(self) -> Path:
         folder = runs_dir() / self.run_id
@@ -326,23 +336,68 @@ def _stage_technicals(reporter: BaseReporter, manifest: RunManifest,
     return result
 
 
+def _stage_rank(reporter: BaseReporter, manifest: RunManifest, request,
+                symbols: list[str] | None, holder: dict) -> dict:
+    """Score every name in the request's universe without chains (Phase 11)
+    and choose the chain targets: the top N plus anything held."""
+    from analytics import underlying_rank
+    held = _tickers_with_positions()
+    with reporter.stage("rank_underlyings", "Underlying ranking", total=1):
+        ranked = underlying_rank.rank(request, symbols=symbols, held=held)
+        targets = underlying_rank.chain_targets(ranked, held)
+        holder["ranked"], holder["targets"] = ranked, targets
+        summary = underlying_rank.summary(ranked)
+        reporter.advance(1, note=f"{summary.get('eligible', 0)} eligible of "
+                                 f"{summary.get('ranked', 0)}; top "
+                                 f"{request.top_n_underlyings}: "
+                                 f"{', '.join(summary.get('selected', [])[:8])}")
+        for kind, count in (summary.get("excluded_by") or {}).items():
+            reporter.log(f"  {count} excluded on {kind}")
+    if not targets:
+        manifest.warnings.append("underlying ranking selected nothing -- "
+                                 "no chains will be pulled")
+    return {**summary, "chain_targets": targets, "held": sorted(held),
+            "weights_validated": False}
+
+
 def _stage_chains(reporter: BaseReporter, manifest: RunManifest,
-                   tickers: list[str], force: bool) -> dict:
+                   tickers: list[str], force: bool, request=None,
+                   ranked: pd.DataFrame | None = None) -> dict:
     from data_sources import chains
     with_positions = _tickers_with_positions()
-    results = chains.capture_universe(tickers, with_positions=with_positions,
-                                       force=force, reporter=reporter)
+    if request is None:
+        results = chains.capture_universe(tickers, with_positions=with_positions,
+                                          force=force, reporter=reporter)
+    else:
+        ivs = {}
+        if ranked is not None and not ranked.empty:
+            ivs = {r.symbol: float(r.iv_used) for r in ranked.itertuples()
+                   if r.iv_used is not None and r.iv_used == r.iv_used}
+        results = chains.capture_targets(tickers, request, with_positions=with_positions,
+                                         ivs=ivs, force=force, reporter=reporter)
     failed = [r.ticker for r in results if r.error]
     skipped = [r.ticker for r in results if r.skipped]
     if failed:
         manifest.warnings.append(f"chain capture failed: {', '.join(failed[:8])}")
+        for r in results:
+            if r.error:
+                reporter.log(f"  {r.ticker}: {r.error[:120]}")
     return {"captured": len(results) - len(failed) - len(skipped),
             "skipped": len(skipped), "failed": failed,
-            "block": session_block()}
+            "block": session_block(),
+            "per_ticker": {r.ticker: {"dte_window": r.dte_window, "rows": r.rows,
+                                      "strikes_listed": r.strikes_listed,
+                                      "subscriptions": r.subscriptions,
+                                      "filtered": r.filtered,
+                                      "expirations_dropped": r.expirations_dropped,
+                                      "skipped": r.reason if r.skipped else None,
+                                      "error": r.error}
+                           for r in results}}
 
 
 def _stage_analyse(reporter: BaseReporter, manifest: RunManifest,
-                    tickers: list[str]) -> dict:
+                    tickers: list[str], request=None,
+                    ranked: pd.DataFrame | None = None) -> dict:
     """Score entries, evaluate open positions, and apply the regime gate.
 
     Deliberately thin for now -- the full candidate ranking arrives with the
@@ -370,8 +425,20 @@ def _stage_analyse(reporter: BaseReporter, manifest: RunManifest,
     # Candidate ranking is its own stage: it is the expensive part of the
     # analysis and the part you actually wait for.
     from analytics.candidates import evaluate_universe, select_sheet
-    full_sheet = evaluate_universe(tickers, reporter=reporter)
+    from analytics.scan_request import ScanRequest
+    request = request or ScanRequest.default()
+    if "csp" in request.strategies:
+        full_sheet = evaluate_universe(tickers, reporter=reporter, request=request)
+    else:
+        full_sheet = pd.DataFrame()
+        reporter.log("request has no CSP; PCS construction arrives in Phase 12 -- "
+                     "ranking and chains only")
+    if "pcs" in request.strategies:
+        results["pcs"] = "not constructed: PCS arrives in Phase 12"
+    # Every accepted strike is kept (Phase 11); proposals come from the best
+    # row per ticker, so two strikes on one name never both get proposed.
     sheet = select_sheet(full_sheet)
+    best = sheet[sheet["best_per_ticker"]] if not sheet.empty else sheet
     proposed = pd.DataFrame()
     if not sheet.empty:
         # Portfolio construction runs BEFORE the proposal list is finalised.
@@ -383,7 +450,7 @@ def _stage_analyse(reporter: BaseReporter, manifest: RunManifest,
         held = sorted(_tickers_with_positions())
         with reporter.stage("portfolio", "Portfolio construction", total=1):
             try:
-                selection = portfolio.select(sheet, held=held)
+                selection = portfolio.select(best, held=held)
                 proposed = pd.DataFrame(selection.accepted)
                 results["portfolio_rejected"] = selection.rejected
                 results["clusters"] = selection.clusters
@@ -398,11 +465,14 @@ def _stage_analyse(reporter: BaseReporter, manifest: RunManifest,
             except Exception as exc:
                 reporter.advance(1, note="concentration check failed")
                 manifest.warnings.append(f"portfolio: {exc}")
-                proposed = sheet[sheet["proposed"]] if "proposed" in sheet else sheet
+                cap = load_config().get("management", {}).get("entry", {}).get(
+                    "max_new_positions_per_run", 3)
+                proposed = best.head(cap)
 
         results["candidates"] = (proposed.to_dict("records")
                                  if not proposed.empty else [])
         results["candidates_considered"] = int(len(sheet))
+        results["tickers_with_candidates"] = int(sheet["ticker"].nunique())
         if getattr(sheet, "attrs", {}).get("census"):
             results["census"] = sheet.attrs["census"]
         reporter.log(f"{len(proposed)} trade(s) proposed from "
@@ -436,7 +506,7 @@ def _stage_analyse(reporter: BaseReporter, manifest: RunManifest,
         if census:
             results["census"] = census
             manifest.warnings.append(f"no candidates: {census['headline']}")
-        else:
+        elif "csp" in request.strategies:
             reporter.log("no candidates passed the entry gates")
 
     # Persist the tables beside the manifest so pages survive a restart.
@@ -444,8 +514,9 @@ def _stage_analyse(reporter: BaseReporter, manifest: RunManifest,
         from pipeline import results as run_results
         written = run_results.write_tables(
             manifest.run_id,
-            run_results.annotate_sheet(full_sheet, sheet, proposed),
-            results.get("open_positions", []))
+            run_results.annotate_sheet(full_sheet, best, proposed),
+            results.get("open_positions", []),
+            underlyings=ranked)
         results["persisted"] = written
     except Exception as exc:
         manifest.warnings.append(f"could not persist run tables: {exc}")
@@ -597,9 +668,17 @@ import pandas as pd  # noqa: E402  (used by helpers above)
 
 def run(tickers: list[str] | None = None, quick: bool = False,
         force_chains: bool = False, data_only: bool = False,
-        reporter: BaseReporter | None = None) -> RunManifest:
+        reporter: BaseReporter | None = None, request=None) -> RunManifest:
     """`data_only`: refresh data (bars, earnings, metrics, events, Stage 1)
-    and stop -- the nightly job, so the interactive run only pulls chains."""
+    and stop -- the nightly job, so the interactive run only pulls chains.
+
+    `request`: an `analytics.scan_request.ScanRequest` (default: config).
+    `tickers` narrows both the data stages and the request's universe."""
+    from analytics.scan_request import ScanRequest
+    request = request or ScanRequest.default()
+    if tickers:
+        request.universe = list(tickers)
+        request.validate()
     # Data stages cover every active registry symbol, indices included;
     # chains and the CSP analysis cover what a cash-secured put can trade.
     data_universe = tickers or load_universe(scope="all")
@@ -618,7 +697,7 @@ def run(tickers: list[str] | None = None, quick: bool = False,
         run_id=dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4],
         started_at=dt.datetime.now().isoformat(timespec="seconds"),
         session_block=session_block(), session_state=info.state.value,
-        tickers=len(data_universe))
+        tickers=len(data_universe), request=request.to_dict())
 
     reporter = reporter or ConsoleReporter(STAGES)
     started = dt.datetime.now()
@@ -642,11 +721,19 @@ def run(tickers: list[str] | None = None, quick: bool = False,
             guarded("events", _stage_events, reporter, manifest, data_universe)
             guarded("stage1", _stage_stage1, reporter, manifest, data_universe)
             guarded("technicals", _stage_technicals, reporter, manifest, data_universe)
-            if not data_only:
-                guarded("chains", _stage_chains, reporter, manifest, universe,
-                        force_chains)
         if not data_only:
-            guarded("analyse", _stage_analyse, reporter, manifest, universe)
+            holder: dict = {"ranked": None, "targets": None}
+            guarded("rank_underlyings", _stage_rank, reporter, manifest, request,
+                    None, holder)
+            # A failed ranking must not cost the run: fall back to every
+            # tradable symbol, as before Phase 11.
+            targets = holder["targets"] if holder["targets"] is not None else universe
+            if not quick:
+                guarded("chains", _stage_chains, reporter, manifest, targets,
+                        force_chains, request, holder["ranked"])
+            analysable = [t for t in targets if t in tradable or t not in registered]
+            guarded("analyse", _stage_analyse, reporter, manifest, analysable,
+                    request, holder["ranked"])
 
     manifest.finished_at = dt.datetime.now().isoformat(timespec="seconds")
     manifest.elapsed_seconds = (dt.datetime.now() - started).total_seconds()
@@ -664,14 +751,23 @@ def main() -> int:
                      help="re-pull chains regardless of the staleness window")
     ap.add_argument("--data-only", action="store_true",
                     help="refresh data only (nightly job): no chains, no analysis")
+    ap.add_argument("--request", default=None,
+                    help="path to a ScanRequest JSON file (see examples/)")
     args = ap.parse_args()
+
+    from analytics.scan_request import RequestError, ScanRequest
+    try:
+        request = ScanRequest.load(args.request) if args.request else None
+    except (OSError, ValueError, RequestError) as exc:
+        print(f"bad --request {args.request}: {exc}")
+        return 2
 
     tickers = ([t.strip().upper() for t in args.tickers.split(",") if t.strip()]
                if args.tickers else None)
     reporter = ConsoleReporter(STAGES)
     try:
         manifest = run(tickers, quick=args.quick, force_chains=args.force_chains,
-                       data_only=args.data_only, reporter=reporter)
+                       data_only=args.data_only, reporter=reporter, request=request)
     except RunLocked as exc:
         print(f"\n{exc}")
         return 2

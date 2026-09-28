@@ -44,10 +44,21 @@ class AccountState:
     committed_collateral: float = 0.0
     share_value: float = 0.0
     open_positions: int = 0
+    profile: str = "default"
+    #: Per-run override of max_collateral_per_position_pct (a scan request's
+    #: max_pct_capital risk mode).
+    position_pct_override: float | None = None
+
+    @property
+    def config(self) -> dict:
+        cfg = account_config(self.profile)
+        if self.position_pct_override is not None:
+            cfg["max_collateral_per_position_pct"] = float(self.position_pct_override)
+        return cfg
 
     @property
     def deployable(self) -> float:
-        cfg = load_config().get("account", {})
+        cfg = self.config
         buffer_pct = cfg.get("cash_buffer_pct", 0.10)
         reserve = self.net_liquidating_value * buffer_pct
         return max(self.cash_available - reserve, 0.0)
@@ -59,10 +70,24 @@ class AccountState:
         return (self.committed_collateral + self.share_value) / self.net_liquidating_value
 
 
-def account_from_config() -> AccountState:
-    cfg = load_config().get("account", {})
+def account_config(profile: str | None = None) -> dict:
+    """`account:` with the named `account_profiles` entry merged over it
+    (roadmap B.7). `default`, or an unknown/None profile, is the account block."""
+    cfg = load_config()
+    base = dict(cfg.get("account", {}) or {})
+    profiles = cfg.get("account_profiles") or {}
+    base.update(profiles.get(profile or "default") or {})
+    base.setdefault("allowed_strategies", ["csp", "pcs", "covered_call"])
+    return base
+
+
+def account_from_config(profile: str | None = None,
+                        position_pct_override: float | None = None) -> AccountState:
+    cfg = account_config(profile)
     nlv = float(cfg.get("net_liquidating_value", 0.0))
-    return AccountState(net_liquidating_value=nlv, cash_available=nlv)
+    return AccountState(net_liquidating_value=nlv, cash_available=nlv,
+                        profile=profile or "default",
+                        position_pct_override=position_pct_override)
 
 
 @dataclass(frozen=True)
@@ -120,9 +145,9 @@ def max_contracts_for_strike(strike: float, account: AccountState | None = None,
     Returns 0 contracts with readable reasons rather than raising, so a
     high-scoring name that cannot be traded shows *why* instead of vanishing.
     """
-    cfg = load_config().get("account", {})
     liq = load_config().get("liquidity_limits", {})
     acct = account or account_from_config()
+    cfg = acct.config
     reasons: list[str] = []
     limits: dict[str, float] = {}
 
@@ -216,8 +241,8 @@ def max_tradable_strike(account: AccountState | None = None) -> float:
     """Highest strike this account can sell a single put on, after the
     per-position concentration cap. The single most useful number for
     filtering a screen down to what is actually actionable."""
-    cfg = load_config().get("account", {})
     acct = account or account_from_config()
+    cfg = acct.config
     cap_dollars = min(
         acct.net_liquidating_value * cfg.get("max_collateral_per_position_pct", 0.15),
         acct.deployable,
@@ -227,8 +252,8 @@ def max_tradable_strike(account: AccountState | None = None) -> float:
 
 def capacity_report(account: AccountState | None = None) -> dict:
     """What the book can hold, in plain numbers, for the Command Center."""
-    cfg = load_config().get("account", {})
     acct = account or account_from_config()
+    cfg = acct.config
     ceiling = max_tradable_strike(acct)
     return {
         "net_liquidating_value": acct.net_liquidating_value,

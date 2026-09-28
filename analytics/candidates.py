@@ -32,6 +32,19 @@ assignment would leave you owning the stock at a price worth owning it at.
 Gates are rejections, not penalties. A trade that fails one is not a worse
 trade, it is a trade not to take, so no amount of yield can buy past an
 earnings print or a 12% cost drag.
+
+SCAN REQUESTS (Phase 11)
+------------------------
+`evaluate_universe(request=...)` takes its DTE window or targets, delta
+range, account profile and event overrides from an
+`analytics.scan_request.ScanRequest`, plus the risk-mode gates: `min_pop`
+rejects a strike whose empirical P(finish OTM) is below it (or unknown);
+`max_loss_per_trade` caps contracts so (strike - fill) x 100 x contracts
+stays under it; `max_pct_capital` replaces the profile's per-position cap.
+Without a request, `ScanRequest.default()` reproduces the config window, so
+the numbers do not move. The sheet is no longer cut to one row per ticker:
+every accepted strike is kept, `best_per_ticker` marks the top one, and
+portfolio construction proposes from those.
 """
 from __future__ import annotations
 
@@ -117,6 +130,9 @@ class Recommendation:
     liquidity_rating: int | None = None
     events: tuple = ()                       # every event hit, as text
 
+    # Phase 11: which strategy built the row (PCS rows arrive in Phase 12)
+    strategy: str = "csp"
+
     def to_dict(self) -> dict:
         out = asdict(self)
         out["expiration"] = str(self.expiration)
@@ -170,18 +186,18 @@ def basis_assessment(daily: pd.DataFrame, effective_basis: float) -> tuple[str, 
 # --- Evaluation ------------------------------------------------------------
 
 def _candidate_strikes(chain: pd.DataFrame, spot: float, today: dt.date,
-                        cfg: dict) -> pd.DataFrame:
-    entry = cfg.get("management", {}).get("entry", {})
-    lo, hi = entry.get("delta_band", [-0.30, -0.12])
-    dte_min = entry.get("dte_min", 5)
-    dte_max = entry.get("dte_max", 10)
+                        cfg: dict, request=None) -> pd.DataFrame:
+    from analytics.scan_request import ScanRequest
+
+    request = request or ScanRequest.default()
+    lo, hi = request.delta_range
 
     frame = chain.copy()
     if "put_delta" not in frame.columns:
         return pd.DataFrame()
     frame["expiration"] = pd.to_datetime(frame["expiration"])
     frame["dte_calendar"] = (frame["expiration"].dt.date - today).apply(lambda d: d.days)
-    frame = frame[(frame["dte_calendar"] >= dte_min) & (frame["dte_calendar"] <= dte_max)]
+    frame = frame[frame["dte_calendar"].map(request.accepts_dte)]
     frame = frame[frame["put_delta"].notna()]
     frame = frame[(frame["put_delta"] >= lo) & (frame["put_delta"] <= hi)]
     # Only strikes below spot: a put above spot is already in the money and is
@@ -236,7 +252,10 @@ def evaluate_strike(ticker: str, row: pd.Series, spot: float, daily: pd.DataFram
                      event_rejections: tuple = (),
                      event_warnings: tuple = (),
                      event_hits: tuple = (),
-                     metrics: dict | None = None) -> Recommendation | None:
+                     metrics: dict | None = None,
+                     min_pop: float | None = None,
+                     max_loss_per_trade: float | None = None,
+                     dte_window: tuple[int, int] | None = None) -> Recommendation | None:
     strike = float(row["strike_price"])
     expiration = pd.Timestamp(row["expiration"]).date()
     today = dt.datetime.now(ET).date()
@@ -262,6 +281,17 @@ def evaluate_strike(ticker: str, row: pd.Series, spot: float, daily: pd.DataFram
     contracts = size.contracts
     mult, _ = regime.apply_to_sizing(contracts, regime_reading) if contracts else (0, "")
     contracts = mult
+
+    # Scan request risk mode: a dollar ceiling on the loss if the stock went
+    # to zero -- the CSP's true max loss, (strike - credit) per share.
+    loss_cap_reason = None
+    if max_loss_per_trade is not None:
+        per_contract_loss = max(strike - fill, 0.01) * 100.0
+        by_loss = int(max_loss_per_trade // per_contract_loss)
+        if by_loss < 1:
+            loss_cap_reason = (f"one contract risks ${per_contract_loss:,.0f}, over the "
+                               f"requested ${max_loss_per_trade:,.0f} max loss per trade")
+        contracts = min(contracts, max(by_loss, 0))
 
     econ = costs.csp_economics(strike, fill, max(contracts, 1), max(dte_cal, 1),
                                 outcome="expire")
@@ -300,7 +330,7 @@ def evaluate_strike(ticker: str, row: pd.Series, spot: float, daily: pd.DataFram
     verdict = screen_entry(credit=fill, strike=strike, contracts=max(contracts, 1),
                             dte=dte_cal, iv_rv_ratio=ratio,
                             earnings_before_expiry=earnings_blocks,
-                            prob_otm_empirical=prob_otm)
+                            prob_otm_empirical=prob_otm, dte_window=dte_window)
 
     rejections = list(verdict.reasons)
     warnings = list(verdict.warnings)
@@ -312,6 +342,13 @@ def evaluate_strike(ticker: str, row: pd.Series, spot: float, daily: pd.DataFram
     warnings.extend(event_warnings)
     if size.rejected:
         rejections.extend(size.reasons or ("no tradable size",))
+    if loss_cap_reason:
+        rejections.append(loss_cap_reason)
+    if min_pop is not None and (prob_otm is None or prob_otm < min_pop):
+        rejections.append(
+            f"empirical P(finish OTM) {prob_otm:.0%} is below the requested {min_pop:.0%}"
+            if prob_otm is not None else
+            f"no empirical P(finish OTM) to test against the requested {min_pop:.0%}")
     if ev == ev and ev <= 0:
         rejections.append(
             f"expected value is ${ev:,.0f} -- the empirical loss tail is larger than "
@@ -424,14 +461,16 @@ def _rationale(ticker, strike, expiration, fill, contracts, net, prob_otm,
 
 def build_decision_sheet(tickers: list[str] | None = None,
                           reporter: BaseReporter | None = None,
-                          include_rejected: bool = False) -> pd.DataFrame:
+                          include_rejected: bool = False,
+                          request=None) -> pd.DataFrame:
     """Rank every candidate strike across the universe by annualised EV."""
-    return select_sheet(evaluate_universe(tickers, reporter=reporter),
+    return select_sheet(evaluate_universe(tickers, reporter=reporter, request=request),
                         include_rejected=include_rejected)
 
 
 def evaluate_universe(tickers: list[str] | None = None,
-                      reporter: BaseReporter | None = None) -> pd.DataFrame:
+                      reporter: BaseReporter | None = None,
+                      request=None) -> pd.DataFrame:
     """Every candidate strike across the universe, accepted AND rejected.
 
     Sorted by rank key (rejected last), with the rejection census on
@@ -440,6 +479,7 @@ def evaluate_universe(tickers: list[str] | None = None,
     strike was turned down, not only what survived. `select_sheet` turns it
     into the proposal list.
     """
+    from analytics.scan_request import ScanRequest
     from core.paths import load_universe
     from data_sources import chains
     from data_sources import events, tasty_metrics
@@ -448,7 +488,8 @@ def evaluate_universe(tickers: list[str] | None = None,
     cfg = load_config()
     tickers = tickers or load_universe()
     reporter = reporter or NullReporter()
-    account = sizing.account_from_config()
+    request = request or ScanRequest.default()
+    account = sizing.account_from_config(request.account_profile, request.max_pct_capital)
     regime_reading = regime.current()
     today = dt.datetime.now(ET).date()
 
@@ -474,7 +515,7 @@ def evaluate_universe(tickers: list[str] | None = None,
                     reporter.advance(1, note=f"{ticker} no snapshot")
                     continue
 
-                strikes = _candidate_strikes(chain, spot, today, cfg)
+                strikes = _candidate_strikes(chain, spot, today, cfg, request)
                 if strikes.empty:
                     reporter.advance(1, note=f"{ticker} no strikes in band")
                     continue
@@ -488,7 +529,8 @@ def evaluate_universe(tickers: list[str] | None = None,
                 for expiration in strikes["expiration"].dt.date.unique():
                     checks[expiration] = events.check(
                         ticker, today, expiration, "csp",
-                        calendar_healthy=calendar["healthy"])
+                        calendar_healthy=calendar["healthy"],
+                        overrides=request.event_policy_overrides)
 
                 for _, row in strikes.iterrows():
                     expiration = pd.Timestamp(row["expiration"]).date()
@@ -506,7 +548,10 @@ def evaluate_universe(tickers: list[str] | None = None,
                                            event_rejections=others_block,
                                            event_warnings=warn,
                                            event_hits=tuple(h.text() for h in check.hits),
-                                           metrics=metrics_by_symbol.get(ticker))
+                                           metrics=metrics_by_symbol.get(ticker),
+                                           min_pop=request.min_pop,
+                                           max_loss_per_trade=request.max_loss_per_trade,
+                                           dte_window=request.dte_window())
                     if rec is not None:
                         rows.append(rec)
                 accepted = sum(1 for r in rows if r.ticker == ticker and r.accepted)
@@ -534,9 +579,12 @@ def evaluate_universe(tickers: list[str] | None = None,
     return frame
 
 
-def select_sheet(frame: pd.DataFrame, include_rejected: bool = False) -> pd.DataFrame:
-    """The proposal list from `evaluate_universe`'s full sheet: accepted rows
-    (unless `include_rejected`), best strike per ticker, run cap applied."""
+def select_sheet(frame: pd.DataFrame, include_rejected: bool = False,
+                 best_per_ticker_only: bool = False) -> pd.DataFrame:
+    """The ranked sheet from `evaluate_universe`: accepted rows (unless
+    `include_rejected`), EVERY strike kept, `best_per_ticker` marking the top
+    row of each ticker (Phase 11 -- the forced one-per-ticker cut is gone;
+    `best_per_ticker_only` restores that view)."""
     census = frame.attrs.get("census")
     if not frame.empty and not include_rejected:
         frame = frame[frame["accepted"]]
@@ -545,7 +593,9 @@ def select_sheet(frame: pd.DataFrame, include_rejected: bool = False) -> pd.Data
         if census:
             empty.attrs["census"] = census
         return empty
-    out = _one_per_ticker(frame.reset_index(drop=True), load_config())
+    out = mark_best_per_ticker(frame.reset_index(drop=True))
+    if best_per_ticker_only:
+        out = out[out["best_per_ticker"]].reset_index(drop=True)
     out.attrs["census"] = census
     return out
 
@@ -625,20 +675,18 @@ def rejection_census(rows: list) -> dict:
             "headline": headline}
 
 
-def _one_per_ticker(frame: pd.DataFrame, cfg: dict) -> pd.DataFrame:
-    """Keep the best strike per ticker, then cap how many new trades a single
-    run may propose.
+def mark_best_per_ticker(frame: pd.DataFrame) -> pd.DataFrame:
+    """Flag the best-ranked row of each ticker (the frame is in rank order).
 
-    Without this the sheet fills with six adjacent strikes on the same name,
-    which reads as six opportunities and is one.
+    Six adjacent strikes on one name read as six opportunities and are one,
+    so proposals are drawn from these rows only; the others stay visible.
     """
-    if frame.empty:
-        return frame
-    best = frame.drop_duplicates(subset=["ticker"], keep="first")
-    cap = cfg.get("management", {}).get("entry", {}).get("max_new_positions_per_run", 3)
-    best = best.copy()
-    best["proposed"] = [i < cap for i in range(len(best))]
-    return best.reset_index(drop=True)
+    out = frame.copy()
+    if out.empty:
+        out["best_per_ticker"] = pd.Series(dtype=bool)
+        return out
+    out["best_per_ticker"] = ~out["ticker"].duplicated()
+    return out
 
 
 def _adv_dollars(daily: pd.DataFrame, window: int = 90) -> float | None:

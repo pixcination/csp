@@ -10,6 +10,10 @@ model assumed.
 That override field is the most important control on the page. Every yield the
 tool displays rests on a slippage assumption, and the only way to find out
 whether it is right is to keep recording what really happened.
+
+Phase 11: the run's scan request is named at the top, the full sheet keeps
+every accepted strike (with a "best per ticker" toggle), and the underlying
+ranking that chose which chains to pull is shown with its component scores.
 """
 from __future__ import annotations
 
@@ -39,6 +43,21 @@ manifest, run_results, source = active_run()
 candidates = analyse_stage(manifest).get("candidates", [])
 considered = analyse_stage(manifest).get("candidates_considered", 0)
 run_caption(manifest, source)
+
+request = (getattr(manifest, "request", None) or {}) if manifest else {}
+if request:
+    dte = (f"{', '.join(map(str, request['dte_targets']))} DTE"
+           if request.get("dte_targets") else
+           f"{request.get('dte_min')}-{request.get('dte_max')} DTE")
+    st.caption(
+        f"Scan request: **{request.get('name') or 'default'}** · "
+        f"{' + '.join(s.upper() for s in request.get('strategies', []))} · {dte} · "
+        f"risk mode `{request.get('risk_mode')}` · profile `{request.get('account_profile')}` · "
+        f"top {request.get('top_n_underlyings')} underlyings")
+    if "csp" not in request.get("strategies", []):
+        st.info("This run did not request CSP. PCS trades are constructed from "
+                "Phase 12; until then a PCS request ranks underlyings and pulls "
+                "their chains only (see the ranking below).")
 
 execution = load_config().get("execution", {})
 allow_override = execution.get("allow_manual_fill_override", True)
@@ -148,8 +167,16 @@ if not sheet.empty and run_results.has_full_sheet:
     passed = int(sheet["accepted"].sum()) if "accepted" in sheet else 0
     with st.expander(f"Every strike evaluated in this run ({len(sheet):,}; "
                      f"{passed:,} passed the gates)"):
-        only_passed = st.toggle("Only strikes that passed every gate", value=False)
+        toggles = st.columns(2)
+        only_passed = toggles[0].toggle("Only strikes that passed every gate", value=False)
+        best_only = toggles[1].toggle(
+            "Best per ticker", value=False,
+            help="Only the top-ranked accepted strike of each ticker -- the rows "
+                 "portfolio construction proposes from.")
         view = sheet[sheet["accepted"]] if only_passed else sheet
+        if best_only:
+            flag = "best_per_ticker" if "best_per_ticker" in view else "selected"
+            view = view[view[flag].fillna(False).astype(bool)] if flag in view else view
         view = view.copy()
         if "rejections" in view:
             view["why_not"] = view["rejections"].map(
@@ -157,7 +184,7 @@ if not sheet.empty and run_results.has_full_sheet:
         columns = [c for c in ["ticker", "expiration", "strike", "dte_calendar",
                                "modelled_fill", "delta", "prob_otm_empirical",
                                "ev_annualised", "iv_rv_ratio", "ivr", "ivp", "open_interest",
-                               "accepted", "selected", "proposed", "why_not"]
+                               "accepted", "best_per_ticker", "proposed", "why_not"]
                    if c in view.columns]
         st.dataframe(
             view[columns], hide_index=True, width="stretch",
@@ -166,6 +193,43 @@ if not sheet.empty and run_results.has_full_sheet:
                 "ev_annualised": st.column_config.NumberColumn("EV ann.", format="percent"),
                 "modelled_fill": st.column_config.NumberColumn("Fill", format="$%.2f"),
                 "why_not": st.column_config.TextColumn("Rejected because", width="large"),
+            })
+
+# --- The underlying ranking (Phase 11) --------------------------------------
+
+ranked = run_results.underlyings if run_results is not None else pd.DataFrame()
+if not ranked.empty:
+    chosen = int(ranked["selected"].sum()) if "selected" in ranked else 0
+    with st.expander(f"Underlying ranking ({len(ranked)} names; chains pulled for "
+                     f"the top {chosen})"):
+        st.caption(
+            "Scored from data on disk, without chains: IV rank/percentile, IV/RV, "
+            "liquidity rating, trend state, nearest strong support in expected-move "
+            "units, and drawdown. Weights are in config.yaml → underlying_rank and are "
+            "**not yet validated** (Phase 14). Events and capital are gates, not "
+            "penalties: an excluded name says why.")
+        only_eligible = st.toggle("Only eligible names", value=True)
+        view = ranked[ranked["eligible"]] if only_eligible else ranked
+        columns = [c for c in ["rank", "symbol", "selected", "score", "coverage",
+                               "strategies", "event_status", "score_iv_rank",
+                               "score_iv_rv", "score_liquidity", "score_trend",
+                               "score_support", "score_drawdown", "ivr", "iv_rv",
+                               "liquidity_rating", "trend_state", "support_level_id",
+                               "support_distance_em", "em_pct", "max_drawdown",
+                               "event_notes", "exclusion"] if c in view.columns]
+        st.dataframe(
+            view[columns], hide_index=True, width="stretch",
+            column_config={
+                "score": st.column_config.ProgressColumn("Score", min_value=0.0,
+                                                         max_value=1.0, format="%.2f"),
+                "coverage": st.column_config.NumberColumn("Coverage", format="percent"),
+                "ivr": st.column_config.NumberColumn("IVR", format="percent"),
+                "em_pct": st.column_config.NumberColumn("EM", format="percent"),
+                "max_drawdown": st.column_config.NumberColumn("Max DD", format="percent"),
+                "support_distance_em": st.column_config.NumberColumn("Support (EM)",
+                                                                     format="%.2f"),
+                "event_notes": st.column_config.TextColumn("Events", width="large"),
+                "exclusion": st.column_config.TextColumn("Excluded because", width="large"),
             })
 
 st.divider()

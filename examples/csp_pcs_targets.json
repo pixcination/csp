@@ -1,0 +1,10 @@
+{
+  "name": "CSP + PCS at 21 and 35 DTE, min POP 80%",
+  "strategies": ["csp", "pcs"],
+  "dte_targets": [21, 35],
+  "risk_mode": "min_pop",
+  "min_pop": 0.80,
+  "universe": "all",
+  "top_n_underlyings": 20,
+  "event_policy_overrides": {"fomc": {"action": "ignore"}}
+}

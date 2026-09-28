@@ -1,0 +1,15 @@
+{
+  "name": "PCS 30-45 DTE, top 15",
+  "strategies": ["pcs"],
+  "dte_min": 30,
+  "dte_max": 45,
+  "risk_mode": "delta_range",
+  "delta_range": [-0.30, -0.15],
+  "spread_widths": [1, 2.5, 5, 10],
+  "profit_targets": [25, 30, 50, 100],
+  "account_profile": "default",
+  "universe": "all",
+  "top_n_underlyings": 15,
+  "event_policy_overrides": {},
+  "strike_rule": "delta"
+}

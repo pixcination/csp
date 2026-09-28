@@ -20,15 +20,47 @@ session block.
 
 DTE WINDOW
 ----------
-21 days for the whole universe, 60 for any ticker carrying an open position.
-The entry window is still 5-10 DTE, but you cannot rank a roll you did not
-download, and roll targets sit one to three weeks beyond the leg you are
-defending.
+Without a scan request: 21 days for the whole universe, 60 for any ticker
+carrying an open position. You cannot rank a roll you did not download, and
+roll targets sit one to three weeks beyond the leg you are defending.
+
+With a scan request (Phase 11): [request dte_min, request dte_max +
+chain_capture.roll_buffer_days], and [0, max(60, that)] for a ticker with an
+open position -- and only for the top-N ranked names (`capture_targets`).
+
+STRIKE FILTER (Phase 11)
+------------------------
+A 30-60 DTE pull of every strike does not fit the dxFeed budget: SPX alone
+has ~500 strikes per expiration and two option roots. Before subscribing,
+each expiration keeps only
+
+    puts   spot + put_window_em  x EM   (default -3 .. +0.5 EM)
+    calls  spot + call_window_em x EM   (default -0.5 .. +1.5 EM)
+
+with EM = spot x IV x sqrt(DTE/365) for THAT expiration, and each window no
+narrower than +/- min_window_pct of spot. Calls are kept near the money
+because skew, the implied forward and covered calls read them. IV is the
+ranking's IV for the request DTE, else the TastyTrade IV index, else 30-day
+RV; with none of them the chain is not filtered. If a symbol still exceeds
+max_subscriptions_per_symbol, the expirations furthest from the request's
+reference DTE are dropped first (recorded on the result).
+
+SYMBOLS
+-------
+The chain and the underlying quote are requested with the registry's
+`tt_symbol` (BRK/B, not BRK.B -- the canonical form returns an empty chain).
+Index chains (SPX, NDX, RUT, XSP) come from the same /option-chains endpoint,
+verified 2026-09-27. SPX, NDX and RUT return two roots (SPXW/NDXP/RUTW
+PM-settled weeklies and the AM-settled standard root), so a row carries
+`root_symbol`, `settlement_type` and `expiration_type`; the monthly
+expiration appears once per root. The underlying quote works for indices
+with the equity market-data kind.
 """
 from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -119,12 +151,29 @@ def existing_snapshot(ticker: str, block: str | None = None) -> SnapshotRef | No
         if "_" in block else "unknown")
 
 
-def needs_capture(ticker: str, now: dt.datetime | None = None) -> tuple[bool, str]:
+def snapshot_dte_window(ref: SnapshotRef) -> tuple[int, int]:
+    """The DTE window a snapshot was captured for. Snapshots before Phase 11
+    did not record it; they were 0-21 (0-60 with a position), so 0-21 is
+    assumed -- the conservative reading, which at worst re-pulls once."""
+    try:
+        under = pd.read_parquet(ref.underlying_path, columns=["dte_min", "dte_max"])
+        lo, hi = under["dte_min"].iloc[0], under["dte_max"].iloc[0]
+        if pd.notna(lo) and pd.notna(hi):
+            return int(lo), int(hi)
+    except Exception:
+        pass
+    default = load_config().get("chain_capture", {}).get("dte_max_universe", 21)
+    return 0, int(default)
+
+
+def needs_capture(ticker: str, now: dt.datetime | None = None,
+                  dte_window: tuple[int, int] | None = None) -> tuple[bool, str]:
     """Should this ticker be re-pulled right now? Returns (yes, reason).
 
     During RTH a snapshot goes stale on a clock. Outside RTH the underlying
     marks are not changing, so one capture per session block is all the
-    information that exists.
+    information that exists -- unless it does not cover the DTE window now
+    asked for (Phase 11: a 30-45 DTE request cannot use a 0-21 snapshot).
     """
     cfg = load_config().get("chain_capture", {})
     info = classify(now)
@@ -133,6 +182,12 @@ def needs_capture(ticker: str, now: dt.datetime | None = None) -> tuple[bool, st
 
     if snapshot is None:
         return True, "no snapshot for this session block"
+
+    if dte_window is not None:
+        have = snapshot_dte_window(snapshot)
+        if dte_window[0] < have[0] or dte_window[1] > have[1]:
+            return True, (f"snapshot covers {have[0]}-{have[1]} DTE, "
+                          f"{dte_window[0]}-{dte_window[1]} requested")
 
     if info.state is SessionState.RTH:
         max_age = dt.timedelta(minutes=cfg.get("rth_refresh_minutes", 20))
@@ -157,58 +212,183 @@ class CaptureResult:
     reason: str = ""
     error: str | None = None
     ref: SnapshotRef | None = None
+    dte_window: tuple[int, int] | None = None
+    strikes_listed: int = 0
+    filtered: bool = False
+    expirations_dropped: list = field(default_factory=list)
 
 
-def _rows_for_chain(ttc, chain: dict, tokens: str) -> tuple[list[dict], list[str], dict]:
+@dataclass
+class StrikeWindow:
+    """Per-expiration strike filter in expected-move units (Phase 11)."""
+    spot: float | None = None
+    iv: float | None = None
+    put_em: tuple[float, float] = (-3.0, 0.5)
+    call_em: tuple[float, float] = (-0.5, 1.5)
+    min_pct: float = 0.03
+    max_subscriptions: int | None = None
+    reference_dte: float | None = None
+
+    @classmethod
+    def from_config(cls, spot: float | None, iv: float | None,
+                    reference_dte: float | None = None) -> "StrikeWindow":
+        cfg = load_config().get("chain_capture", {})
+        return cls(spot=spot, iv=iv,
+                   put_em=tuple(cfg.get("put_window_em", [-3.0, 0.5])),
+                   call_em=tuple(cfg.get("call_window_em", [-0.5, 1.5])),
+                   min_pct=float(cfg.get("min_window_pct", 0.03)),
+                   max_subscriptions=cfg.get("max_subscriptions_per_symbol", 6000),
+                   reference_dte=reference_dte)
+
+    @property
+    def active(self) -> bool:
+        return bool(self.spot and self.iv and self.iv > 0)
+
+    def bounds(self, side: str, dte: int) -> tuple[float, float]:
+        """(low, high) strike bounds for one side at one expiration."""
+        if not self.active:
+            return (-float("inf"), float("inf"))
+        em = self.spot * self.iv * math.sqrt(max(dte, 1) / 365.0)
+        lo_k, hi_k = self.put_em if side == "put" else self.call_em
+        floor = self.spot * self.min_pct
+        lo = min(self.spot + lo_k * em, self.spot - floor)
+        hi = max(self.spot + hi_k * em, self.spot + floor)
+        return lo, hi
+
+
+def _rows_for_chain(ttc, chain: dict, tokens: str,
+                    window: StrikeWindow | None = None,
+                    today: dt.date | None = None) -> tuple[list[dict], list[str], dict, dict]:
+    """Chain rows inside the DTE token and the strike window.
+
+    Returns (rows, option symbols to subscribe, symbol -> (side, row),
+    info). Only sides inside the window are subscribed; a row with neither
+    side inside is dropped.
+    """
     items = chain.get("data", {}).get("items", [])
     flat = []
     for item in items:
         flat.extend(item.get("expirations", []))
     chosen = set(ttc.select_expirations(flat, tokens))
+    info = {"expirations_dropped": [], "strikes_listed": 0}
     if not chosen:
-        return [], [], {}
+        return [], [], {}, info
 
-    rows: list[dict] = []
-    symbols: list[str] = []
-    index: dict[str, tuple[str, dict]] = {}
+    window = window or StrikeWindow()
+    today = today or dt.date.today()
+    by_exp: dict[str, list[tuple[dict, list[tuple[str, str]]]]] = {}
     for item in items:
+        root = item.get("root-symbol")
         for exp in item.get("expirations", []):
             date_str = exp.get("expiration-date")
             if date_str not in chosen:
                 continue
+            dte = (dt.date.fromisoformat(date_str) - today).days
+            put_lo, put_hi = window.bounds("put", dte)
+            call_lo, call_hi = window.bounds("call", dte)
             for strike in exp.get("strikes", []):
-                call_sym, put_sym = strike.get("call"), strike.get("put")
+                info["strikes_listed"] += 1
+                k = float(strike.get("strike-price", 0) or 0)
+                sides = []
+                if strike.get("put") and put_lo <= k <= put_hi:
+                    sides.append(("put", strike["put"]))
+                if strike.get("call") and call_lo <= k <= call_hi:
+                    sides.append(("call", strike["call"]))
+                if not sides:
+                    continue
                 row = ttc.empty_strike_row(date_str, strike.get("strike-price", 0),
-                                            call_sym, put_sym)
-                rows.append(row)
-                for sym, side in ((call_sym, "call"), (put_sym, "put")):
-                    if sym:
-                        symbols.append(sym)
-                        index[sym] = (side, row)
-    return rows, symbols, index
+                                           strike.get("call"), strike.get("put"))
+                row["root_symbol"] = root
+                row["settlement_type"] = exp.get("settlement-type")
+                row["expiration_type"] = exp.get("expiration-type")
+                by_exp.setdefault(date_str, []).append((row, sides))
+
+    # Subscription cap: drop the expirations furthest from the request DTE.
+    def count(dates) -> int:
+        return sum(len(sides) for d in dates for _, sides in by_exp[d])
+    dates = sorted(by_exp)
+    cap = window.max_subscriptions
+    if cap and count(dates) > cap and len(dates) > 1:
+        ref = window.reference_dte if window.reference_dte is not None else 0.0
+        by_distance = sorted(dates, key=lambda d: abs(
+            (dt.date.fromisoformat(d) - today).days - ref))
+        keep = list(by_distance)
+        while len(keep) > 1 and count(keep) > cap:
+            info["expirations_dropped"].append(keep.pop())
+        dates = sorted(keep)
+
+    rows: list[dict] = []
+    symbols: list[str] = []
+    index: dict[str, tuple[str, dict]] = {}
+    for date_str in dates:
+        for row, sides in by_exp[date_str]:
+            rows.append(row)
+            for side, sym in sides:
+                symbols.append(sym)
+                index[sym] = (side, row)
+    return rows, symbols, index, info
+
+
+def _tt_symbol(ticker: str) -> str:
+    try:
+        from data_sources import universe
+        return universe.tt_symbols([ticker]).get(ticker, ticker)
+    except Exception:
+        return ticker
+
+
+def fallback_iv(ticker: str) -> float | None:
+    """IV for the strike window when the caller has none: the TastyTrade IV
+    index, else 30-day close-to-close RV from the daily bars."""
+    try:
+        from data_sources import tasty_metrics
+        iv = (tasty_metrics.for_symbol(ticker) or {}).get("iv_index")
+        if iv and iv == iv and iv > 0:
+            return float(iv)
+    except Exception:
+        pass
+    try:
+        import numpy as np
+        from data_sources.yfinance_sync import load_daily
+        bars = load_daily(ticker, basis="price", start=dt.date.today() - dt.timedelta(days=70))
+        closes = bars["close"].astype(float).tail(31).to_numpy()
+        if len(closes) > 20:
+            return float(np.std(np.diff(np.log(closes)), ddof=1) * math.sqrt(252))
+    except Exception:
+        pass
+    return None
 
 
 def capture(ticker: str, dte_max: int | None = None, dte_min: int = 0,
              limiter: SubscriptionLimiter | None = None,
              force: bool = False,
              reporter: BaseReporter | None = None,
-             now: dt.datetime | None = None) -> CaptureResult:
+             now: dt.datetime | None = None,
+             iv: float | None = None,
+             reference_dte: float | None = None,
+             strike_filter: bool = True) -> CaptureResult:
     """Pull one ticker's chain and underlying, stamped with the session block.
 
     REST supplies bid/ask/mark/last; DXLink streaming supplies open interest,
     IV and the Greeks -- REST alone does not populate those. A stream failure
     degrades to REST-only data with a recorded warning rather than losing the
     snapshot entirely.
+
+    The underlying is quoted FIRST (Phase 11): its spot sets the strike
+    window. `iv` sets the window's expected move (see `fallback_iv`);
+    `strike_filter=False` pulls every strike, as before Phase 11.
     """
     result = CaptureResult(ticker=ticker)
     cfg = load_config().get("chain_capture", {})
     dte_max = dte_max if dte_max is not None else cfg.get("dte_max_universe", 21)
 
     if not force:
-        wanted, reason = needs_capture(ticker, now)
+        wanted, reason = needs_capture(ticker, now, (dte_min, dte_max))
         if not wanted:
             result.skipped, result.reason = True, reason
             result.ref = existing_snapshot(ticker, session_block(now))
+            if result.ref is not None:
+                result.dte_window = snapshot_dte_window(result.ref)
             result.ok = True
             return result
 
@@ -216,11 +396,36 @@ def capture(ticker: str, dte_max: int | None = None, dte_min: int = 0,
     info = classify(now)
     captured_at = dt.datetime.now()
 
+    # Never lose coverage within a block: a 30-59 DTE request re-pulling a
+    # symbol captured 0-21 earlier in the same block pulls 0-59, not 30-59,
+    # or a later --quick CSP run would find its weekly strikes gone.
+    existing = existing_snapshot(ticker, block)
+    if existing is not None:
+        have = snapshot_dte_window(existing)
+        dte_min, dte_max = min(dte_min, have[0]), max(dte_max, have[1])
+    result.dte_window = (int(dte_min), int(dte_max))
+
     try:
         ttc = tt.common()
         tt.authenticate()
-        chain = ttc.fetch_equity_chain(ticker)
-        rows, symbols, index = _rows_for_chain(ttc, chain, tt.dte_token(dte_min, dte_max))
+        tt_symbol = _tt_symbol(ticker)
+
+        # Underlying first: its spot sets the strike window.
+        under = ttc.fetch_rest_market_data([tt_symbol], kind="equity").get(tt_symbol, {})
+        under_row = ttc.underlying_row_from_quote(under, "Equity") if under else {
+            "symbol": tt_symbol}
+        spot = next((float(under_row[c]) for c in ("mark", "last", "bid")
+                     if under_row.get(c) is not None and float(under_row[c]) > 0), None)
+        window = StrikeWindow.from_config(
+            spot, (iv or fallback_iv(ticker)) if strike_filter else None, reference_dte)
+
+        chain = ttc.fetch_equity_chain(tt_symbol)
+        rows, symbols, index, listing = _rows_for_chain(
+            ttc, chain, tt.dte_token(dte_min, dte_max), window,
+            (now or dt.datetime.now()).date())
+        result.strikes_listed = listing["strikes_listed"]
+        result.expirations_dropped = listing["expirations_dropped"]
+        result.filtered = window.active
         if not rows:
             result.reason = f"no expirations within {dte_min}-{dte_max} DTE"
             result.ok = True
@@ -257,11 +462,6 @@ def capture(ticker: str, dte_max: int | None = None, dte_min: int = 0,
                 side, row = index[tasty_sym]
                 ttc.apply_stream(row, side, payload)
 
-        # Underlying, captured in the same pass so spot and chain agree.
-        under = ttc.fetch_rest_market_data([ticker], kind="equity").get(ticker, {})
-        under_row = ttc.underlying_row_from_quote(under, "Equity") if under else {
-            "symbol": ticker}
-
         frame = pd.DataFrame(rows)
         frame["capture_block"] = block
         frame["captured_at"] = captured_at
@@ -270,9 +470,14 @@ def capture(ticker: str, dte_max: int | None = None, dte_min: int = 0,
 
         under_frame = pd.DataFrame([{
             **under_row,
+            "symbol": ticker,
+            "tt_symbol": tt_symbol,
+            "strike_window_iv": window.iv if window.active else None,
             "capture_block": block,
             "captured_at": captured_at,
             "session_state": info.state.value,
+            "dte_min": int(dte_min),
+            "dte_max": int(dte_max),
         }])
 
         chain_path, under_path = _paths(ticker, block)
@@ -310,13 +515,48 @@ def capture_universe(tickers: list[str], with_positions: set[str] | None = None,
             res = capture(ticker, dte_max=dte_max, limiter=limiter,
                            force=force, reporter=reporter)
             results.append(res)
-            if res.error:
-                note = f"{ticker} FAILED"
-            elif res.skipped:
-                note = f"{ticker} {res.reason}"
-            else:
-                note = f"{ticker} {res.rows} strikes / {res.expirations} exp"
-            reporter.advance(1, note=note)
+            reporter.advance(1, note=_note(res))
+    return results
+
+
+def _note(res: CaptureResult) -> str:
+    if res.error:
+        return f"{res.ticker} FAILED"
+    if res.skipped:
+        return f"{res.ticker} {res.reason}"
+    extra = f", {len(res.expirations_dropped)} exp over budget" if res.expirations_dropped else ""
+    return (f"{res.ticker} {res.rows}/{res.strikes_listed} strikes / "
+            f"{res.expirations} exp, {res.subscriptions} subs{extra}")
+
+
+def capture_targets(tickers: list[str], request, with_positions: set[str] | None = None,
+                    ivs: dict[str, float] | None = None, force: bool = False,
+                    reporter: BaseReporter | None = None) -> list[CaptureResult]:
+    """Phase 11: capture the ranked top N for a scan request.
+
+    DTE window = the request's chain window (entry window + roll buffer);
+    a ticker with an open position gets [0, max(dte_max_with_position, that)].
+    `ivs` (symbol -> IV at the request DTE, from the ranking) sets each
+    strike window.
+    """
+    cfg = load_config().get("chain_capture", {})
+    position_dte = int(cfg.get("dte_max_with_position", 60))
+    with_positions = with_positions or set()
+    ivs = ivs or {}
+    lo, hi = request.chain_dte_window()
+    ref = request.reference_dte()
+
+    reporter = reporter or NullReporter()
+    limiter = SubscriptionLimiter(load_config().get("stage3_subs_per_minute_budget", 8000))
+    results: list[CaptureResult] = []
+    with reporter.stage("chains", "Option chains", total=len(tickers)):
+        for ticker in tickers:
+            window = (0, max(position_dte, hi)) if ticker in with_positions else (lo, hi)
+            res = capture(ticker, dte_min=window[0], dte_max=window[1], limiter=limiter,
+                          force=force, reporter=reporter, iv=ivs.get(ticker),
+                          reference_dte=ref)
+            results.append(res)
+            reporter.advance(1, note=_note(res))
     return results
 
 

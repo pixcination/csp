@@ -7,6 +7,10 @@ for every active symbol, cached in data/technicals.duckdb (Phase 10).
                        new indicator needs no schema change
     level_stats        analytics/level_respect.py
     oscillator_stats   analytics/oscillator_study.py
+    support_latest     level_respect.support_map at study time (Phase 11):
+                       every studied level below spot with its strength, so
+                       the underlying ranking reads it instead of recomputing
+                       indicators (~1 s per symbol)
 
 `run()` is the pipeline's `technicals` stage. It skips a symbol whose cached
 stats are already as of its latest daily bar, so a second run on the same
@@ -24,6 +28,10 @@ from core.paths import db_technicals
 from core.progress import BaseReporter, NullReporter
 
 LATEST = "indicator_latest"
+SUPPORT = "support_latest"
+SUPPORT_COLUMNS = ["symbol", "as_of", "level_id", "timeframe", "level", "slope_now",
+                   "distance_pct", "distance_atr", "n", "hold_rate", "edge_vs_placebo",
+                   "edge_ci_lo", "median_pierce_atr", "status", "strong", "summary"]
 
 
 def _cached_as_of() -> dict[str, dt.date]:
@@ -83,6 +91,69 @@ def load_latest(symbol: str | None = None) -> pd.DataFrame:
     return wide.merge(states, on="symbol", how="left")
 
 
+def store_support(symbol: str, as_of: dt.date, support: pd.DataFrame) -> None:
+    frame = support.copy() if support is not None else pd.DataFrame()
+    for column in SUPPORT_COLUMNS:
+        if column not in frame:
+            frame[column] = None
+    frame["symbol"], frame["as_of"] = symbol, as_of
+    frame = frame[SUPPORT_COLUMNS]
+    frame["strong"] = frame["strong"].fillna(False).astype(bool)
+    con = duckdb.connect(str(db_technicals()))
+    try:
+        con.execute(f"CREATE TABLE IF NOT EXISTS {SUPPORT} (symbol VARCHAR, as_of DATE, "
+                    f"level_id VARCHAR, timeframe VARCHAR, level DOUBLE, slope_now VARCHAR, "
+                    f"distance_pct DOUBLE, distance_atr DOUBLE, n DOUBLE, hold_rate DOUBLE, "
+                    f"edge_vs_placebo DOUBLE, edge_ci_lo DOUBLE, median_pierce_atr DOUBLE, "
+                    f"status VARCHAR, strong BOOLEAN, summary VARCHAR)")
+        con.execute(f"DELETE FROM {SUPPORT} WHERE symbol = ?", [symbol])
+        if not frame.empty:
+            con.register("incoming", frame)
+            con.execute(f"INSERT INTO {SUPPORT} SELECT * FROM incoming")
+            con.unregister("incoming")
+    finally:
+        con.close()
+
+
+def load_support(symbol: str | None = None) -> pd.DataFrame:
+    """Cached support maps (all symbols, or one). Empty if never computed."""
+    path = db_technicals()
+    if not path.exists():
+        return pd.DataFrame(columns=SUPPORT_COLUMNS)
+    con = duckdb.connect(str(path), read_only=True)
+    try:
+        if SUPPORT not in {r[0] for r in con.execute("SHOW TABLES").fetchall()}:
+            return pd.DataFrame(columns=SUPPORT_COLUMNS)
+        query = f"SELECT * FROM {SUPPORT}" + (" WHERE symbol = ?" if symbol else "")
+        return con.execute(query, [symbol] if symbol else []).fetchdf()
+    finally:
+        con.close()
+
+
+def _support_symbols() -> set[str]:
+    """Symbols whose support map has been stored (even as zero levels)."""
+    path = db_technicals()
+    if not path.exists():
+        return set()
+    con = duckdb.connect(str(path), read_only=True)
+    try:
+        if "support_studied" not in {r[0] for r in con.execute("SHOW TABLES").fetchall()}:
+            return set()
+        return {r[0] for r in con.execute("SELECT symbol FROM support_studied").fetchall()}
+    finally:
+        con.close()
+
+
+def _mark_support_studied(symbol: str, as_of: dt.date) -> None:
+    con = duckdb.connect(str(db_technicals()))
+    try:
+        con.execute("CREATE TABLE IF NOT EXISTS support_studied (symbol VARCHAR, as_of DATE)")
+        con.execute("DELETE FROM support_studied WHERE symbol = ?", [symbol])
+        con.execute("INSERT INTO support_studied VALUES (?, ?)", [symbol, as_of])
+    finally:
+        con.close()
+
+
 def study_symbol(symbol: str) -> dict:
     from analytics import indicators, level_respect, oscillator_study, trend_state
     frame = indicators.for_symbol(symbol)
@@ -94,6 +165,9 @@ def study_symbol(symbol: str) -> dict:
     level_respect.store(symbol, levels)
     osc = oscillator_study.study(frame, symbol)
     oscillator_study.store(symbol, osc)
+    as_of = pd.Timestamp(frame["date"].iloc[-1]).date()
+    store_support(symbol, as_of, level_respect.support_map(symbol, frame=frame, stats=levels))
+    _mark_support_studied(symbol, as_of)
     headline = levels[(levels["horizon"] == level_respect.Params.from_config().headline_horizon)
                       & (levels["slope_regime"] == "all")] if not levels.empty else levels
     strong = headline[(headline["status"] == "ok") & (headline["edge_ci_lo"] > 0)]
@@ -108,6 +182,9 @@ def run(symbols: list[str], reporter: BaseReporter | None = None,
 
     reporter = reporter or NullReporter()
     cached = {} if force else _cached_as_of()
+    # A symbol studied before Phase 11 has no stored support map: restudy it once.
+    with_support = _support_symbols()
+    cached = {s: d for s, d in cached.items() if s in with_support}
     results, skipped, errors = [], 0, []
     with reporter.stage("technicals", "Technicals and level study", total=len(symbols)):
         for symbol in symbols:

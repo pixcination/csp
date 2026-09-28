@@ -12,6 +12,8 @@ also writes its tables beside the manifest:
                                        ticker within the run cap) and
                                        `proposed` (survived portfolio limits)
     data/runs/<id>/positions.parquet   open-position evaluations
+    data/runs/<id>/underlyings.parquet the underlying ranking, every symbol
+                                       with its component scores (Phase 11)
 
 and pages fall back to `latest_run()` when session state is empty.
 
@@ -32,6 +34,7 @@ from core.paths import runs_dir
 MANIFEST = "manifest.json"
 CANDIDATES = "candidates.parquet"
 POSITIONS = "positions.parquet"
+UNDERLYINGS = "underlyings.parquet"
 KEY = ["ticker", "expiration", "strike"]
 
 
@@ -42,7 +45,12 @@ class RunResults:
     manifest: object                     # pipeline.run.RunManifest
     candidates: pd.DataFrame = field(default_factory=pd.DataFrame)
     positions: pd.DataFrame = field(default_factory=pd.DataFrame)
+    underlyings: pd.DataFrame = field(default_factory=pd.DataFrame)
     has_full_sheet: bool = False
+
+    @property
+    def request(self) -> dict:
+        return getattr(self.manifest, "request", None) or {}
 
     @property
     def finished_at(self) -> str | None:
@@ -88,7 +96,8 @@ def _parquet_safe(frame: pd.DataFrame) -> pd.DataFrame:
 
 def annotate_sheet(full: pd.DataFrame, selected: pd.DataFrame,
                    proposed: pd.DataFrame) -> pd.DataFrame:
-    """Flag which rows of the full sheet were selected and finally proposed."""
+    """Flag which rows of the full sheet were selected (the best row of each
+    ticker -- `best_per_ticker` since Phase 11) and finally proposed."""
     if full.empty:
         return full
     out = full.copy()
@@ -103,12 +112,14 @@ def annotate_sheet(full: pd.DataFrame, selected: pd.DataFrame,
                 for t, e, k in out[KEY].itertuples(index=False)]
     chosen, final = keys(selected), keys(proposed)
     out["selected"] = [k in chosen for k in row_keys]
+    out["best_per_ticker"] = out["selected"]
     out["proposed"] = [k in final for k in row_keys]
     return out
 
 
 def write_tables(run_id: str, candidates: pd.DataFrame | None,
-                 positions: list[dict] | pd.DataFrame | None) -> dict:
+                 positions: list[dict] | pd.DataFrame | None,
+                 underlyings: pd.DataFrame | None = None) -> dict:
     """Write the run's tables. Returns {name: rows written}."""
     folder = runs_dir() / run_id
     folder.mkdir(parents=True, exist_ok=True)
@@ -120,6 +131,9 @@ def write_tables(run_id: str, candidates: pd.DataFrame | None,
         frame = positions if isinstance(positions, pd.DataFrame) else pd.DataFrame(positions)
         _parquet_safe(frame).to_parquet(folder / POSITIONS, index=False)
         written["positions"] = len(frame)
+    if underlyings is not None and not underlyings.empty:
+        _parquet_safe(underlyings).to_parquet(folder / UNDERLYINGS, index=False)
+        written["underlyings"] = len(underlyings)
     return written
 
 
@@ -163,6 +177,11 @@ def load_run(run_id: str) -> RunResults | None:
             pass
     elif analyse.get("open_positions"):
         result.positions = pd.DataFrame(analyse["open_positions"])
+    if (folder / UNDERLYINGS).exists():
+        try:
+            result.underlyings = pd.read_parquet(folder / UNDERLYINGS)
+        except Exception:
+            pass
     return result
 
 
