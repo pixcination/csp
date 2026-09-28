@@ -173,10 +173,10 @@ def _event_status(symbol: str, strategies: list[str], asset_class: str,
     """Blocked for every expiration / partial / warn / ok, per the request's policy."""
     from data_sources import events
 
-    lo, hi = request.dte_window()
     per_strategy = {}
     notes: list[str] = []
     for strategy in strategies:
+        lo, hi = request.dte_window(strategy)
         short = events.check(symbol, today, today + dt.timedelta(days=lo), strategy,
                              asset_class=asset_class, calendar_healthy=healthy,
                              overrides=request.event_policy_overrides, frame=events_frame)
@@ -234,9 +234,10 @@ def _capital(strategies: list[str], spot: float | None, em: float | None,
                 reasons.append(f"pcs: profile '{request.account_profile}' has no "
                                f"spread approval")
                 continue
-            width = min(request.spread_widths) if request.spread_widths else 1.0
+            widths = request.pcs_widths(spot)
+            width = min(widths) if widths else 1.0
             if width * 100 > cap:
-                reasons.append(f"pcs: ${width:g} width max loss exceeds the "
+                reasons.append(f"pcs: ${width:,.2f} width max loss exceeds the "
                                f"${cap:,.0f} per-position limit")
                 continue
         feasible.append(strategy)

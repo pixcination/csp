@@ -11,6 +11,10 @@ explicit and portable:
     risk_mode             delta_range | min_pop | max_loss_per_trade | max_pct_capital
                           (with its value in the field of the same name)
     spread_widths         PCS long-leg widths in dollars
+    spread_width_pct      PCS widths as % of spot; when set they replace the
+                          dollars (Phase 15 default: 4%)
+    pcs_dte_targets       DTE targets for spreads only (Phase 15 default: 45);
+                          unset, spreads use the shared DTE window
     profit_targets        % of max profit to report odds for
     account_profile       a key of config.yaml -> account_profiles
     universe              all | csp | stock | etf | index | tag:<tag> | [symbols]
@@ -72,6 +76,8 @@ class ScanRequest:
     max_loss_per_trade: float | None = None         # dollars
     max_pct_capital: float | None = None            # 0-1 of the profile's NLV
     spread_widths: list[float] = field(default_factory=lambda: [1, 2.5, 5, 10])
+    spread_width_pct: list[float] | None = None     # % of spot; when set, replaces the dollars
+    pcs_dte_targets: list[int] | None = None        # spreads' own DTE targets (else the shared window)
     profit_targets: list[int] = field(default_factory=lambda: [25, 30, 50, 100])
     account_profile: str = "default"
     universe: str | list[str] = "all"
@@ -91,6 +97,7 @@ class ScanRequest:
         cfg = load_config()
         base = dict(cfg.get("scan_defaults") or {})
         base.pop("dte_target_tolerance_days", None)
+        base.pop("pcs_dte_tolerance_days", None)
         base.update({k: v for k, v in overrides.items() if v is not None})
         return cls.from_dict(base)
 
@@ -146,6 +153,18 @@ class ScanRequest:
             if not 0 <= self.dte_min <= self.dte_max:
                 raise RequestError(f"need 0 <= dte_min <= dte_max, got "
                                    f"{self.dte_min}-{self.dte_max}")
+        if self.pcs_dte_targets:
+            self.pcs_dte_targets = sorted(int(t) for t in self.pcs_dte_targets)
+            if self.pcs_dte_targets[0] < 0:
+                raise RequestError("pcs_dte_targets must be >= 0")
+        else:
+            self.pcs_dte_targets = None
+        if self.spread_width_pct:
+            self.spread_width_pct = sorted(float(p) for p in self.spread_width_pct)
+            if self.spread_width_pct[0] <= 0 or self.spread_width_pct[-1] > 50:
+                raise RequestError("spread_width_pct are percents of spot in (0, 50]")
+        else:
+            self.spread_width_pct = None
         if self.risk_mode not in RISK_MODES:
             raise RequestError(f"risk_mode must be one of {RISK_MODES}")
         if self.delta_range is not None:
@@ -221,30 +240,83 @@ class ScanRequest:
         return int((load_config().get("scan_defaults") or {}).get(
             "dte_target_tolerance_days", 3))
 
-    def dte_window(self) -> tuple[int, int]:
-        """The entry window: [dte_min, dte_max], or the span of the targets
-        widened by the tolerance."""
-        if self.dte_targets:
-            return (max(self.dte_targets[0] - self.tolerance, 0),
-                    self.dte_targets[-1] + self.tolerance)
+    def _targets_for(self, strategy: str | None) -> list[int] | None:
+        """DTE targets that apply to `strategy`: spreads use `pcs_dte_targets`
+        when set (Phase 15 default: 45), everything else the shared ones."""
+        if strategy == "pcs" and self.pcs_dte_targets:
+            return self.pcs_dte_targets
+        return self.dte_targets
+
+    @property
+    def pcs_tolerance(self) -> int:
+        """How far from a spread DTE target an expiration may be. Wider than
+        the shared tolerance because many names list only monthlies near 45
+        DTE; `nearest_pcs_dtes` then keeps just the closest one."""
+        return int((load_config().get("scan_defaults") or {}).get(
+            "pcs_dte_tolerance_days", 14))
+
+    def _tolerance_for(self, strategy: str | None) -> int:
+        return self.pcs_tolerance if strategy == "pcs" and self.pcs_dte_targets \
+            else self.tolerance
+
+    def _window_for(self, strategy: str | None) -> tuple[int, int]:
+        targets = self._targets_for(strategy)
+        if targets:
+            tol = self._tolerance_for(strategy)
+            return max(targets[0] - tol, 0), targets[-1] + tol
         return int(self.dte_min), int(self.dte_max)
 
-    def reference_dte(self) -> float:
+    def nearest_pcs_dtes(self, dtes) -> set[int]:
+        """With `pcs_dte_targets`, the listed DTEs spreads are built at: for
+        each target, the one closest to it inside the tolerance. Without
+        them, every DTE the spread window accepts."""
+        listed = sorted({int(d) for d in dtes if self.accepts_dte(int(d), "pcs")})
+        if not self.pcs_dte_targets or not listed:
+            return set(listed)
+        return {min(listed, key=lambda d: (abs(d - t), d)) for t in self.pcs_dte_targets}
+
+    def dte_window(self, strategy: str | None = None) -> tuple[int, int]:
+        """The entry window for one strategy -- [dte_min, dte_max], or the span
+        of its targets widened by the tolerance -- or, with no strategy, the
+        span covering every requested strategy."""
+        if strategy is not None:
+            return self._window_for(strategy)
+        spans = [self._window_for(s) for s in self.strategies]
+        return min(lo for lo, _ in spans), max(hi for _, hi in spans)
+
+    def reference_dte(self, strategy: str | None = None) -> float:
         """One DTE to express expected moves in: the window midpoint, or the
-        median target."""
-        if self.dte_targets:
-            targets = self.dte_targets
+        median target. With no strategy, a spreads-only request uses the
+        spreads' targets."""
+        if strategy is None and self.strategies == ["pcs"]:
+            strategy = "pcs"
+        targets = self._targets_for(strategy)
+        if targets:
             mid = len(targets) // 2
             return float(targets[mid] if len(targets) % 2
                          else (targets[mid - 1] + targets[mid]) / 2)
-        lo, hi = self.dte_window()
+        lo, hi = self._window_for(strategy)
         return (lo + hi) / 2.0
 
-    def accepts_dte(self, dte: int) -> bool:
-        if self.dte_targets:
-            return any(abs(dte - t) <= self.tolerance for t in self.dte_targets)
-        lo, hi = self.dte_window()
+    def accepts_dte(self, dte: int, strategy: str | None = None) -> bool:
+        """Whether an expiration `dte` days out is in scope for `strategy`
+        (with no strategy: for any requested strategy)."""
+        if strategy is None:
+            return any(self.accepts_dte(dte, s) for s in self.strategies)
+        targets = self._targets_for(strategy)
+        if targets:
+            tol = self._tolerance_for(strategy)
+            return any(abs(dte - t) <= tol for t in targets)
+        lo, hi = self._window_for(strategy)
         return lo <= dte <= hi
+
+    def pcs_widths(self, spot: float | None) -> list[float]:
+        """Spread widths in dollars for an underlying at `spot`: the
+        `spread_width_pct` percents of spot when set (Phase 15 default 4%),
+        else the dollar `spread_widths`. Snapped to listed strikes later."""
+        if self.spread_width_pct and spot:
+            return sorted(p / 100.0 * float(spot) for p in self.spread_width_pct)
+        return sorted(self.spread_widths)
 
     def chain_dte_window(self) -> tuple[int, int]:
         """What to download: the entry window plus the roll buffer beyond it,
@@ -272,6 +344,10 @@ class ScanRequest:
             return self.name
         dte = (f"{','.join(map(str, self.dte_targets))} DTE" if self.dte_targets
                else f"{self.dte_min}-{self.dte_max} DTE")
+        if "pcs" in self.strategies and self.pcs_dte_targets:
+            pcs = f"PCS {','.join(map(str, self.pcs_dte_targets))} DTE"
+            dte = pcs if self.strategies == ["pcs"] else f"CSP {dte} + {pcs}"
+            return f"{dte}, top {self.top_n_underlyings}"
         return f"{'+'.join(s.upper() for s in self.strategies)} {dte}, top {self.top_n_underlyings}"
 
 

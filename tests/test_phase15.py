@@ -104,19 +104,51 @@ def test_index_spreads_are_cash_settled(ledger):
 
 # --- Closing, settling, rolling --------------------------------------------------------
 
-@pytest.mark.parametrize("price,debit,fee_case", [(695.0, 5.0, "short_itm"),
-                                                  (680.0, 10.0, "max_loss")])
-def test_settling_a_spread_prices_the_debit_and_exercise_fees(ledger, price, debit, fee_case):
-    result = paper.accept(PCS, actual_fill=2.0)
+@pytest.mark.parametrize("price,debit,fee_case,settlement", [
+    (695.0, 5.0, "short_itm", "cash"), (680.0, 10.0, "max_loss", "cash"),
+    (680.0, 10.0, "max_loss", "physical")])
+def test_settling_a_spread_prices_the_debit_and_exercise_fees(ledger, price, debit, fee_case,
+                                                              settlement):
+    result = paper.accept({**PCS, "settlement": settlement}, actual_fill=2.0)
     paper.close_position(result.position_id, "settled", dt.date(2026, 11, 20),
                          settlement_price=price)
     row = paper.list_positions().iloc[0]
+    assert row["status"] == "settled" and paper.list_share_lots().empty
     assert row["exit_price"] == pytest.approx(debit)
-    assert row["exit_fees"] == pytest.approx(costs.vertical_exit_fees(3, False)[fee_case])
+    assert row["exit_fees"] == pytest.approx(
+        costs.vertical_exit_fees(3, settlement == "cash")[fee_case])
     realised = paper.performance()["total_realized"]
     assert realised == pytest.approx((2.0 - debit) * 300 - row["entry_fees"] - row["exit_fees"])
     assert sorted(paper.list_legs()["exit_price"]) == sorted(
         [max(700 - price, 0), max(690 - price, 0)])
+
+
+def test_physical_spread_between_the_strikes_becomes_a_share_lot(ledger):
+    """Tom, 2026-09-28: treat it as an assigned CSP -- shares at the short
+    strike, basis lowered by the net credit, in a wheel cycle."""
+    result = paper.accept(PCS, actual_fill=2.0)
+    assert result.cycle_id is None
+    paper.close_position(result.position_id, "settled", dt.date(2026, 11, 20),
+                         settlement_price=695.0)
+    row = paper.list_positions().iloc[0]
+    assert row["status"] == "assigned" and row["exit_price"] == 0.0
+    assert row["exit_fees"] == pytest.approx(costs.vertical_exit_fees(3, False)["short_itm"])
+    assert row["max_profit_pct_seen"] == pytest.approx((2.0 - 5.0) / 2.0)
+    assert "300 shares held" in row["notes"]
+    lots = paper.list_share_lots()
+    assert len(lots) == 1
+    lot = lots.iloc[0]
+    assert lot["shares"] == 300 and lot["acquisition_price"] == 700
+    assert lot["adjusted_basis"] == pytest.approx(698.0)
+    assert lot["cycle_id"] == row["cycle_id"] and pd.notna(row["cycle_id"])
+    # POP: settled below the 698 breakeven, so the spread's claim failed ...
+    closed = paper.list_positions()
+    assert calibration.outcomes(closed).iloc[0] == 0.0
+    # ... and one settling between the breakeven and the short strike made money.
+    other = paper.accept(PCS, actual_fill=2.0)
+    paper.close_position(other.position_id, "settled", settlement_price=699.0)
+    won = calibration.outcomes(paper.list_positions().set_index("id"))
+    assert won[other.position_id] == 1.0
 
 
 def test_status_rules_per_strategy(ledger):
@@ -495,6 +527,37 @@ def test_wheel_credits_dividends_only_while_shares_are_held():
     with_div = compare_to_buy_and_hold(daily, paid)
     without = compare_to_buy_and_hold(daily.drop(columns="dividends"), paid)
     assert with_div["buy_and_hold_total"] > without["buy_and_hold_total"]
+
+
+# --- Default spread shape (Tom, 2026-09-28): 4% of spot, 45 DTE -------------------------
+
+def test_default_request_builds_spreads_at_45_dte_and_4pct_wide():
+    from analytics.scan_request import ScanRequest
+    req = ScanRequest.default(strategies=["csp", "pcs"])
+    assert req.spread_width_pct == [4.0] and req.pcs_dte_targets == [45]
+    assert req.pcs_widths(700.0) == [pytest.approx(28.0)]
+    tol = req.pcs_tolerance
+    assert req.accepts_dte(45 + tol, "pcs") and not req.accepts_dte(7, "pcs")
+    assert req.accepts_dte(7, "csp") and not req.accepts_dte(45, "csp")
+    assert req.accepts_dte(7) and req.accepts_dte(45)             # any requested strategy
+    assert req.dte_window() == (req.dte_min, 45 + tol)            # capture covers both
+    # Only the listed expiration nearest 45 is built (monthlies-only names too).
+    assert req.nearest_pcs_dtes([4, 11, 25, 39, 53, 88]) == {39}
+    assert req.nearest_pcs_dtes([4, 11]) == set()
+    assert req.dte_window("csp") == (req.dte_min, req.dte_max)
+    assert "PCS 45 DTE" in req.label()
+    assert ScanRequest.default(strategies=["pcs"]).reference_dte() == 45.0
+
+
+def test_explicit_requests_keep_dollar_widths_and_the_shared_window():
+    from analytics.scan_request import RequestError, ScanRequest
+    req = ScanRequest.from_dict({"strategies": ["pcs"], "dte_min": 30, "dte_max": 45,
+                                 "spread_widths": [5, 10]})
+    assert req.spread_width_pct is None and req.pcs_dte_targets is None
+    assert req.pcs_widths(700.0) == [5.0, 10.0]
+    assert req.accepts_dte(35, "pcs") and req.dte_window("pcs") == (30, 45)
+    with pytest.raises(RequestError, match="percents of spot"):
+        ScanRequest.from_dict({"strategies": ["pcs"], "spread_width_pct": [0]})
 
 
 # --- Pages ------------------------------------------------------------------------------

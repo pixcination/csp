@@ -171,7 +171,7 @@ def evaluate_universe(tickers: list[str] | None = None,
                                                metrics=metrics,
                                                min_pop=request.min_pop,
                                                max_loss_per_trade=request.max_loss_per_trade,
-                                               dte_window=request.dte_window(),
+                                               dte_window=request.dte_window("csp"),
                                                today=today)
                         if rec is not None:
                             rows.append(rec)
@@ -183,7 +183,7 @@ def evaluate_universe(tickers: list[str] | None = None,
                 if wants_pcs:
                     frame_exp = pd.to_datetime(chain["expiration"]).dt.date
                     expirations = sorted({e for e in frame_exp
-                                          if request.accepts_dte((e - today).days)})
+                                          if request.accepts_dte((e - today).days, "pcs")})
                     checks = event_checks("pcs", expirations)
                     for rec in pcs_mod.build_candidates(
                             ticker, ctx, daily, adv, account, cfg, regime_reading, request,

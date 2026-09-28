@@ -616,11 +616,10 @@ def recommended_starting_rules() -> dict:
             "loss stop at 2x the credit":
                 "A spread's loss is capped but arrives fast once the short strike is "
                 "through. The stop keeps a bad trade from being ridden to max loss.",
-            "no time stop (21 DTE available)":
-                "The conventional exit before the gamma zone. Measured against twice: "
-                "Phase 13 (lower EV on SPY/QQQ) and the Phase 15 backtest (roughly half "
-                "the annualised return at 45 DTE). Set management.spread.time_stop_dte "
-                "to use it.",
+            "time stop at 21 DTE":
+                "The conventional exit before the gamma zone, kept by choice. Its "
+                "cost is measured: Phase 13 (lower EV on SPY/QQQ) and the Phase 15 "
+                "backtest (roughly half the annualised return at 45 DTE).",
             "roll only for a net credit, at most once":
                 "Same logic as the CSP: a debit roll pays to postpone.",
         },

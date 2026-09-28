@@ -138,6 +138,13 @@ def outcomes(closed: pd.DataFrame) -> pd.Series:
     won = (fill - exit_price > 0).astype(float)
     won[closed["status"] == "assigned"] = 0.0
     won[closed["status"] == "expired_otm"] = 1.0
+    # A spread assigned into shares made money at expiry if it settled above
+    # its breakeven (short strike - credit): that is what its POP claimed.
+    if "settlement_price" in closed:
+        spread = (closed["status"] == "assigned") & (closed["strategy"].fillna("csp") == "pcs") \
+            & closed["settlement_price"].notna()
+        won[spread] = (closed.loc[spread, "settlement_price"].astype(float)
+                       > closed.loc[spread, "strike"].astype(float) - fill[spread]).astype(float)
     return won
 
 

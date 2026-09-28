@@ -160,7 +160,7 @@ def _candidate_strikes(chain: pd.DataFrame, spot: float, today: dt.date,
         return pd.DataFrame()
     frame["expiration"] = pd.to_datetime(frame["expiration"])
     frame["dte_calendar"] = (frame["expiration"].dt.date - today).apply(lambda d: d.days)
-    frame = frame[frame["dte_calendar"].map(request.accepts_dte)]
+    frame = frame[frame["dte_calendar"].map(lambda d: request.accepts_dte(d, "csp"))]
     frame = frame[frame["put_delta"].notna()]
     frame = frame[(frame["put_delta"] >= lo) & (frame["put_delta"] <= hi)]
     # Only strikes below spot: a put above spot is already in the money and is

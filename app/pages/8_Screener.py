@@ -148,9 +148,20 @@ with st.container(border=True):
                                           step=0.25, key=k + "emm")
 
     row = st.columns(4)
-    widths_text = row[0].text_input("Spread widths ($)",
-                                    ", ".join(f"{w:g}" for w in base.spread_widths),
-                                    key=k + "widths", disabled="pcs" not in strategies)
+    no_pcs = "pcs" not in strategies
+    width_unit = row[0].radio("Spread widths in", ["% of spot", "$"],
+                              index=0 if base.spread_width_pct else 1, horizontal=True,
+                              key=k + "wunit", disabled=no_pcs)
+    width_default = (base.spread_width_pct if width_unit == "% of spot" and base.spread_width_pct
+                     else [4.0] if width_unit == "% of spot" else base.spread_widths)
+    widths_text = row[0].text_input(f"Spread widths ({width_unit})",
+                                    ", ".join(f"{w:g}" for w in width_default),
+                                    key=k + "widths" + width_unit, disabled=no_pcs)
+    pcs_dte_text = row[0].text_input(
+        "Spread DTE targets", ", ".join(str(t) for t in (base.pcs_dte_targets or [])),
+        key=k + "pcsdte", disabled=no_pcs,
+        help="Spreads enter at these DTEs (± tolerance) whatever the DTE window above. "
+             "Leave blank to use the DTE window for spreads too.")
     targets = row[1].multiselect("Profit targets (% of max)", [10, 25, 30, 40, 50, 60, 75, 100],
                                  default=[t for t in base.profit_targets
                                           if t in (10, 25, 30, 40, 50, 60, 75, 100)],
@@ -210,7 +221,14 @@ try:
     fields = {**base.to_dict(),
               "strategies": strategies, "risk_mode": risk_mode, "delta_range": delta_range,
               "min_pop": min_pop, "max_loss_per_trade": max_loss, "max_pct_capital": max_pct,
-              "spread_widths": [float(w) for w in widths_text.replace(" ", "").split(",") if w],
+              **({"spread_width_pct": [float(w) for w in widths_text.replace(" ", "").split(",")
+                                       if w]}
+                 if width_unit == "% of spot" else
+                 {"spread_width_pct": None,
+                  "spread_widths": [float(w) for w in widths_text.replace(" ", "").split(",")
+                                    if w]}),
+              "pcs_dte_targets": [int(t) for t in pcs_dte_text.replace(" ", "").split(",")
+                                  if t] or None,
               "profit_targets": sorted(int(t) for t in targets) or [50],
               "account_profile": profile, "universe": universe,
               "top_n_underlyings": "all" if all_names else int(top_n),

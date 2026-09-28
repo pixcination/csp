@@ -42,8 +42,9 @@ Two more tables feed calibration:
                         "did it reach 50% of max profit?" has an answer
 
 The schema stays wheel-shaped: CSPs link to cycles, and cycles own share lots.
-A spread does not open a cycle -- its worst case is a defined loss, not
-shares. Nothing here writes an order anywhere. When live execution is
+A spread does not open a cycle at entry; one that is physically assigned
+(short leg in the money, long leg not) starts one and becomes a share lot,
+just as an assigned CSP does. Nothing here writes an order anywhere. When live execution is
 eventually built, it fills in `broker_order_id` and stops depending on
 `entered_by = 'manual'`; the ledger does not otherwise change.
 """
@@ -487,9 +488,10 @@ def close_position(position_id: int, status: str, exit_date: dt.date | None = No
     `exit_price` is the NET debit per share paid to close (0 for expiry). For
     a spread that finishes in the money use status `settled` with the
     underlying's `settlement_price`: the debit and the exercise/assignment
-    fees follow from it. (A physically settled equity spread with only the
-    short leg in the money leaves you holding shares; the ledger books the
-    loss at the settlement price and says so in the notes.)
+    fees follow from it. A physically settled spread with only the short leg
+    in the money is recorded as `assigned`: the shares become a share lot at
+    the short strike with basis lowered by the net credit, in a new wheel
+    cycle -- exactly as an assigned CSP (Tom, 2026-09-28).
     """
     if status not in STATUSES or status == "open":
         raise ValueError(f"status must be one of {STATUSES[1:]}")
@@ -508,6 +510,7 @@ def close_position(position_id: int, status: str, exit_date: dt.date | None = No
         legs = _legs(con, position_id)
         leg_exits: list[float | None] = [None] * len(legs)
         extra_note = None
+        assign_shares, economic_exit = False, None
 
         if strategy == "pcs":
             if status == "assigned":
@@ -524,8 +527,15 @@ def close_position(position_id: int, status: str, exit_date: dt.date | None = No
                 fees = costs.vertical_exit_fees(contracts, cash)
                 exit_fees = fees["max_loss"] if itm >= 2 else fees["short_itm"] if itm else 0.0
                 if itm == 1 and not cash:
-                    extra_note = ("short leg assigned: the account holds the shares; the "
-                                  "ledger books the loss at the settlement price")
+                    # Only the short leg is in the money and it settles in shares:
+                    # the spread becomes a wheel position exactly as an assigned
+                    # CSP does -- shares at the short strike, basis lowered by the
+                    # net credit, the long put expiring worthless. The loss is in
+                    # the lot, not in the option P&L.
+                    economic_exit = exit_price
+                    status, exit_price, assign_shares = "assigned", 0.0, True
+                    extra_note = (f"short leg assigned at settlement ${settlement_price:,.2f}: "
+                                  f"{100 * contracts} shares held as a share lot")
             else:
                 exit_fees = costs.legs_close(_fee_sides(
                     legs.to_dict("records"), contracts, opening=False)).total
@@ -543,8 +553,10 @@ def close_position(position_id: int, status: str, exit_date: dt.date | None = No
                 exit_price = float(exit_price or 0.0)
                 leg_exits = [exit_price]
 
-        final_pct = ((float(entry_fill) - exit_price) / float(entry_fill)
-                     if entry_fill and status != "assigned" else None)
+        # A spread assigned into shares is judged on its value at settlement.
+        final_exit = economic_exit if assign_shares else exit_price
+        final_pct = ((float(entry_fill) - final_exit) / float(entry_fill)
+                     if entry_fill and (status != "assigned" or assign_shares) else None)
         seen = row.get("max_profit_pct_seen")
         seen = None if seen is None or pd.isna(seen) else float(seen)
         if final_pct is not None:
@@ -562,6 +574,16 @@ def close_position(position_id: int, status: str, exit_date: dt.date | None = No
                 con.execute("UPDATE paper_legs SET exit_price = ? WHERE leg_id = ?",
                             [value, int(leg["leg_id"])])
 
+        if assign_shares and cycle_id is None:
+            # A spread opened no wheel cycle; its assignment starts one, so the
+            # covered-call side manages the shares like any assigned CSP's.
+            cycle_id = con.execute(
+                "INSERT INTO cycles (ticker, state, opened_date, total_premium, total_fees) "
+                "VALUES (?, 'put_open', ?, ?, ?) RETURNING cycle_id",
+                [ticker, row.get("entry_date"), float(entry_fill) * 100.0 * contracts,
+                 float(row.get("entry_fees") or 0.0)]).fetchone()[0]
+            con.execute("UPDATE paper_positions SET cycle_id = ? WHERE id = ?",
+                        [cycle_id, position_id])
         if cycle_id is None:
             return
         if status == "assigned":

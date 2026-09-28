@@ -40,8 +40,9 @@ You said "proceed", so these are my defaults. Each one can be changed.
 | What a spread's row holds | `strike` is the short strike. New columns: `long_strike`, `width`, and `max_loss`. `collateral` is the buying power a spread ties up (its max loss). |
 | How a spread closes | `expired_otm` or `closed_early` (the net debit you paid). A spread that finishes in the money is `settled`: you give the settlement price, and the debit and exercise/assignment fees follow from it. `rolled` records two linked positions. `assigned` stays CSP-only. |
 | Wheel cycles for spreads | None. A spread's worst case is a defined loss, not shares. |
-| Physically settled spread finishing between the strikes | Booked at the settlement price. The note says the account really holds the shares. |
-| Spread management defaults (`management.spread`) | **50% profit target** (only for trades entered above 14 DTE, and only if the gain clears the $5 net minimum). **2× loss stop**, kept as a risk control whose cost is now measured. **Time stop off**: two measurements now say it costs return (§4). Roll on a breach of the short strike or delta −0.45, only for a net credit, at most once, not under 5 DTE; otherwise close. |
+| Physically settled spread finishing between the strikes | **Your decision (after review):** recorded as `assigned`. It becomes a share lot at the short strike, with the basis lowered by the net credit, in a new wheel cycle, exactly like an assigned CSP. POP is scored on whether it settled above the breakeven. |
+| Spread management defaults (`management.spread`) | **Your decision (after review): both stops on, as convention suggests.** **50% profit target** (only for trades entered above 14 DTE, and only if the gain clears the $5 net minimum). **2× loss stop.** **21-DTE time stop**, kept knowing its cost (§4). Roll on a breach of the short strike or delta −0.45, only for a net credit, at most once, not under 5 DTE; otherwise close. |
+| Default spread shape | **Your decision (after review): 4% of spot wide at 45 DTE.** Two new request fields: `spread_width_pct: [4]` (replaces the dollar widths when set) and `pcs_dte_targets: [45]` (spreads only; CSPs keep their own window). Spreads are built at the listed expiration **nearest** 45, within ±14 days, because many names list only monthlies. Saved requests and the example files keep their dollar widths and shared window. The Screener has a width unit toggle and a "Spread DTE targets" field. |
 | Scoring P(reach X%) | **Hit** if the best profit seen (marks and the exit) reached X. **Miss** only if the position was held to expiry. A position closed early without reaching X is **censored** and left out. Marks are sampled, so the observed rate is a lower bound. |
 | POP outcome | A CSP loses on assignment. Anything else wins if it closed for less than its credit. Before, every early-closed CSP counted as a win, even one closed at a loss. |
 
@@ -114,7 +115,8 @@ You said "proceed", so these are my defaults. Each one can be changed.
 - New `management.spread` section.
 
 **Tests**
-- `tests/test_phase15.py`: 30 tests.
+- `tests/test_phase15.py`: 34 tests (including the decisions made after
+  review).
 - Three earlier tests changed on purpose, because the behaviour they pinned
   changed in this phase:
   - Phase 12: spreads were refused before Phase 15.
@@ -238,9 +240,11 @@ ETFs. It is the fairest view; the full-grid averages are dragged down by the
   difference of two synthetic prices, so the level is sensitive to the skew
   assumption. Read the comparisons between rule sets, not the percentages.
 
-**What I did with it.** I turned the time stop off by default. It has now
-been measured against twice, here and in Phase 13. I kept the 2× loss stop
-as a risk control whose price is now known. That is decision 1 in §7.
+**What ships.** You chose both stops on, as convention suggests. The
+shipped rules at 4% wide score 11.6% a year in this model, against 58.5%
+with no stops. The difference is the price of the tail protection. The
+backtest's fixed baseline is now the shipped rule set (45 DTE, 0.20Δ, 4%
+wide, 50% target, 2× stop, 21-DTE time stop).
 
 ## 5. Wheel backtest: price basis plus dividends
 
@@ -270,13 +274,17 @@ against prices that never traded. Buy-and-hold is unchanged to within
 
 ## 6. Verification
 
-- `python -m pytest tests -q`: **421 passed**. The 30 Phase 15
+- `python -m pytest tests -q`: **425 passed**. The 34 Phase 15
   tests cover:
   - **Schema:** the migration, run twice on a Phase 14 database.
   - **Recording spreads:** legs, BPR, the combined quote and predictions;
     leg fills and credit validation; cash settlement for index roots.
-  - **Closing:** settlement between and below the strikes, with the debit,
-    fees and realised P&L; the per-strategy status rules.
+  - **Closing:** cash and physical settlement, with the debit, fees and
+    realised P&L; a physical spread assigned between the strikes becomes a
+    share lot in a new cycle, with its POP outcome; the per-strategy status
+    rules.
+  - **Default request:** 45-DTE targets and 4% widths, the
+    nearest-expiration rule, and explicit requests keeping dollar widths.
   - **Rolls and marks:** CSP rolls stay in their cycle; a debit roll on a
     spread is flagged; the best profit seen is kept.
   - **Calibration:** hit, miss and censored target outcomes; POP outcomes
@@ -298,18 +306,28 @@ against prices that never traded. Buy-and-hold is unchanged to within
 - `python scripts/preflight.py`: no blocking issues. The known 1-minute
   archive warnings remain.
 
-## 7. Decisions to confirm
+## 7. Decisions
 
-1. **Spread stops.** The 2× loss stop is on and the 21-DTE time stop is off
-   (§4 has the numbers). Should the loss stop be off too, or should both be
-   on, the conventional practice?
-2. **Default entry for spreads.** The backtest prefers wider spreads (4% of
-   spot over 2%) and 45 DTE over 30. Should the default PCS request move that
-   way? Today it uses dollar widths from the scan request.
-3. **Physically settled spreads that finish between the strikes.** Booked at
-   the settlement price with a note (current), or should they create a share
-   lot the way an assigned CSP does?
-4. Still open from earlier phases:
+**Decided by you after review (2026-09-28), now built:**
+1. **Stops:** both on, the 2× loss stop and the 21-DTE time stop.
+2. **Spread shape:** 4% of spot wide, at the expiration nearest 45 DTE.
+3. **Spreads assigned between the strikes** become a share lot, like an
+   assigned CSP.
+
+**A first look at the new default on stored chains.** A spreads-only
+request on SPY, QQQ and IWM, using the chains captured on 25 Sep:
+- **Expiry.** The expiration nearest 45 DTE was Nov 6 (39 DTE). That
+  capture ran only to about 45 DTE, so Nov 13 was not pulled.
+- **Shape.** Widths came out at $30 on SPY and QQQ and $11 on IWM.
+  Credit/width was 8–12%, POP 86–91%.
+- **All six were rejected** by the open-interest and volume floors. The odd
+  strikes 4% below spot on a weekly expiry have almost no open interest.
+- A fresh run captures the full window (up to 59 DTE plus the roll buffer).
+  If the 4%-wide long legs are still thin there, choose one:
+  - prefer monthly expirations for spreads, or
+  - snap widths to strikes with open interest.
+
+**Still open from earlier phases:**
    - Phase 14: the default ranking preset, the grid default, and whether the
      Screener stays the landing page.
    - Phase 13: blend weights and earnings crush.

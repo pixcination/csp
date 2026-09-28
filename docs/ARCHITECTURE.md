@@ -323,7 +323,7 @@ Headless check: `python scripts/check_pages.py` runs every page through
 | `chain_capture` | DTE windows, RTH refresh interval; roll buffer, put/call strike windows in EM, minimum window %, per-symbol subscription cap (Phase 11) | `chains.py`, `scan_request.py` |
 | `massive` | archive pacing | `massive_sync.py` |
 | `management.entry/exit/defense/covered_call` | entry gates and DTE band, exit test, roll limits, call rules | `candidates.py`, `exit_rules.py`, `roll_engine.py`, `covered_call.py` |
-| `management.spread` | Phase 15 PCS rules: profit target, loss-stop multiple, time stop (off by default), roll triggers, max rolls, roll-out window, value floor | `exit_rules.py`, `trade_detail.management_plan` |
+| `management.spread` | Phase 15 PCS rules: profit target, loss-stop multiple, 21-DTE time stop, roll triggers, max rolls, roll-out window, value floor | `exit_rules.py`, `trade_detail.management_plan` |
 | `signals` | skew / gap / backwardation gates | `candidates.py` |
 | `portfolio` | cluster and correlation limits, stress horizon | `portfolio.py` |
 | `regime` | VIX term-structure thresholds and size multiplier | `regime.py` |
@@ -342,7 +342,7 @@ Headless check: `python scripts/check_pages.py` runs every page through
 | `pcs` | minimum credit, credit/width floor (a warning), short-leg IV/RV gate, tier labels | `analytics/strategies/pcs.py` |
 | `prob_engine` | paths, seed, block length, lookback, vol band, minimum matching days, blend weights, IV reversion, earnings crush, time stop, headline policy, T buckets | `analytics/prob_engine.py` |
 | `premium_flags` | IVP and IV/RV thresholds for the premium-opportunity flag | `analytics/strategies/context.py` |
-| `scan_defaults` | the default `ScanRequest` (null DTE/delta = `management.entry`), DTE-target tolerance | `analytics/scan_request.py` |
+| `scan_defaults` | the default `ScanRequest` (null DTE/delta = `management.entry`), DTE-target tolerance; Phase 15: spreads 4% of spot wide (`spread_width_pct`) at the expiration nearest 45 DTE (`pcs_dte_targets`, `pcs_dte_tolerance_days`) | `analytics/scan_request.py` |
 | `underlying_rank` | weight presets and the default preset (unvalidated; users add more on Settings), trend scores, IV/RV scale, liquidity-value log scale, support EM band, drawdown floor, metrics age | `analytics/underlying_rank.py` |
 | `account_profiles` | shipped profiles (`default`); user profiles live in `config/user_settings.yaml` | `core/user_settings.py`, `analytics/sizing.py` |
 
@@ -457,8 +457,8 @@ re-pulls `daily_bars_raw`, runs the adjustment check, drops
   first daily metrics snapshot (2026-09-27).
 - **The paper book records CSPs and put credit spreads only.** Other
   structures wait for the Phase 16 strategy DSL. A physically settled spread
-  that finishes between its strikes is booked at the settlement price; the
-  shares it would really leave in the account are noted, not tracked.
+  that finishes between its strikes becomes a share lot in a new wheel cycle,
+  like an assigned CSP.
 - **European Black-Scholes** throughout; no early-exercise modelling.
 - **Earnings dates** come from free yfinance data (roughly 90% reliable). An
   unknown date fails safe (blocks) unless the calendar as a whole is

@@ -76,12 +76,12 @@ CAVEATS = [
 @dataclass(frozen=True)
 class PCSParams:
     short_delta: float = -0.20
-    width_pct: float = 0.02                 # of spot at entry
+    width_pct: float = 0.04                 # of spot at entry
     # Defaults = the shipped management.spread rules (the walk-forward baseline).
     dte: int = 45                           # calendar days at entry
     profit_target_pct: float | None = 50    # None = hold to expiry
     loss_stop_multiple: float | None = 2.0  # None = no stop
-    time_stop_dte: int | None = None        # None = no time stop
+    time_stop_dte: int | None = 21          # None = no time stop
     close_on_breach: bool = False           # close when the close is below the short strike
     rv_window: int = 20
     vol_risk_premium: float = 1.15

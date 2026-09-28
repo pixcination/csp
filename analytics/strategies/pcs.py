@@ -235,11 +235,14 @@ def build_candidates(ticker: str, ctx, daily: pd.DataFrame, adv_dollars: float |
         return []
     chain["expiration"] = pd.to_datetime(chain["expiration"])
     chain["dte_calendar"] = (chain["expiration"].dt.date - today).apply(lambda d: d.days)
-    chain = chain[chain["dte_calendar"].map(request.accepts_dte)]
+    # With spread DTE targets (Phase 15 default 45), build at the listed
+    # expiration nearest each target; otherwise at every one in the window.
+    keep = request.nearest_pcs_dtes(chain["dte_calendar"].unique())
+    chain = chain[chain["dte_calendar"].isin(keep)]
     if "root_symbol" not in chain:
         chain["root_symbol"] = None
     strongest = ctx.strongest_support()
-    widths = sorted(request.spread_widths)
+    widths = request.pcs_widths(ctx.spot)
     out: list[SpreadRecommendation] = []
 
     for (expiration, root), group in chain.groupby(["expiration", "root_symbol"], dropna=False):

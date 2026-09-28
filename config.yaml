@@ -265,10 +265,11 @@ management:
     loss_stop_multiple: 2.0           # close when the loss reaches 2x the credit taken in. A priced
                                       # risk control: the Phase 15 backtest has it cutting max-loss
                                       # trades from 3.5% to 0.1% and return from 58.5% to 20.7%/yr
-    # 21 = close at 21 calendar DTE (entries above it only). Off by default: measured
-    # against twice -- Phase 13 (lower EV under H and T on SPY/QQQ) and the Phase 15
-    # PCS backtest (45 DTE 0.20d 4%-wide 50%-target: 58.5%/yr without it, 29.8% with).
-    time_stop_dte: null
+    # Close at 21 calendar DTE (entries above it only); null = off. On by Tom's decision
+    # (2026-09-28: both stops, as convention suggests), knowing its measured cost -- Phase 13
+    # (lower EV under H and T on SPY/QQQ) and the Phase 15 PCS backtest (45 DTE 0.20d
+    # 4%-wide 50%-target: 58.5%/yr with no stops, 11.6% with both).
+    time_stop_dte: 21
     roll_when_short_delta_beyond: -0.45
     roll_when_price_below_short: true
     min_dte_to_roll: 5                # calendar days
@@ -432,6 +433,12 @@ scan_defaults:
   risk_mode: delta_range              # delta_range | min_pop | max_loss_per_trade | max_pct_capital
   delta_range: null                   # null = management.entry.delta_band
   spread_widths: [1, 2.5, 5, 10]      # PCS long-leg widths in dollars, snapped to listed strikes
+  spread_width_pct: [4]               # Phase 15 (Tom, 2026-09-28): widths as % of spot; when set they
+                                      # replace the dollar widths (the PCS backtest preferred 4% to 1-2%)
+  pcs_dte_targets: [45]               # Phase 15 (Tom): spreads enter at 45 DTE (+/- tolerance), whatever
+                                      # the CSP window; null = spreads share the CSP DTE window
+  pcs_dte_tolerance_days: 14          # spreads are built at the listed expiration NEAREST each
+                                      # pcs target within +/- this (many names list only monthlies)
   profit_targets: [25, 30, 50, 100]   # % of max profit; probabilities arrive in Phase 13
   account_profile: default
   universe: all                       # all | csp | etf | index | stock | tag:<tag> | [list]
