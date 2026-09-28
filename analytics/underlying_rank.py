@@ -6,7 +6,9 @@ budget, and most of the universe is not worth pricing on any given day.
 This scores every registry symbol from data already on disk -- no chains --
 and the pipeline pulls chains for the top N only.
 
-COMPONENTS (each scored 0-1, weights in config.yaml -> underlying_rank)
+COMPONENTS (each scored 0-1; weights from the request's `ranking_weights`:
+a preset in config.yaml -> underlying_rank.weight_presets or the Settings
+page, or the request's own mapping)
 ----------------------------------------------------------------------
     iv_rank    mean of TastyTrade IV rank and IV percentile
     iv_rv      IV at the request's DTE (TastyTrade per-expiration IV, else
@@ -252,7 +254,7 @@ def rank(request: ScanRequest | None = None, symbols: list[str] | None = None,
     today = today or dt.datetime.now(ET).date()
     cfg = load_config()
     rcfg = cfg.get("underlying_rank", {}) or {}
-    weights = {k: float(v) for k, v in (rcfg.get("weights") or {}).items()}
+    weights = request.weights()
     trend_table = rcfg.get("trend_scores") or {"uptrend": 1.0, "range": 0.6, "downtrend": 0.1}
     band = tuple(rcfg.get("support_em_band", [0.5, 2.0]))
     dd_years = (cfg.get("stage1_thresholds") or {}).get("drawdown_lookback_years")
@@ -381,7 +383,8 @@ def rank(request: ScanRequest | None = None, symbols: list[str] | None = None,
         .drop(columns="_key").reset_index(drop=True)
     eligible = frame["eligible"].to_numpy()
     frame["rank"] = np.where(eligible, np.cumsum(eligible), np.nan)
-    frame["selected"] = eligible & (frame["rank"] <= request.top_n_underlyings)
+    top_n = request.top_n
+    frame["selected"] = eligible & ((frame["rank"] <= top_n) if top_n else True)
     frame.attrs["request"] = request.to_dict()
     frame.attrs["weights"] = weights
     return frame

@@ -74,13 +74,15 @@ D:\csp\
 ├── examples/              saved ScanRequest JSON files (Phase 11)
 ├── config/                versioned hand-maintained inputs (Phase 9)
 │   ├── macro_calendar.yaml  FOMC / CPI / NFP dates, sourced
+│   ├── user_settings.yaml   account profiles and weight presets from the Settings page
 │   └── universe.csv         snapshot of the registry, rewritten on every change
 ├── core/                  cross-cutting infrastructure
 │   ├── paths.py           every path; no module builds one from a literal
 │   ├── env.py             credentials, TastyTrade token rotation
 │   ├── market_calendar.py sessions, holidays, session blocks
 │   ├── progress.py        stage reporters (console + Streamlit)
-│   └── freshness.py       cache ages vs config thresholds (Phase 8)
+│   ├── freshness.py       cache ages vs config thresholds (Phase 8)
+│   └── user_settings.py   user account profiles + ranking-weight presets (config/user_settings.yaml)
 ├── data_sources/          everything that talks to an external API
 │   ├── universe.py        the universe registry + symbol mapping (Phase 9)
 │   ├── yfinance_sync.py   daily bars (raw, batched), earnings, dividends
@@ -277,12 +279,13 @@ sample size.
 
 | Page | Shows | Run data from |
 |---|---|---|
-| Command Center (default) | session banner, **Run** button with stage progress, open-position decisions, capacity | `active_run()` |
+| Command Center (default) | session banner, **Run** button with a scan-request form (strategies, DTE, profile, ranking weights, top N or all) and stage progress, open-position decisions, capacity | `active_run()` |
 | Decisions | the run's scan request; proposed trades, accept with actual fill → paper book; expander with **every evaluated strike** and why each was rejected, with a **best per ticker** toggle; the **underlying ranking** with component scores and exclusions | `active_run()` + `candidates.parquet` + `underlyings.parquet` |
 | Wheel | defensive rolls, covered calls against assigned lots, wheel backtest (total basis) | `active_run()` |
 | Validation | calibration, slippage, IV coverage, walk-forward | disk |
 | Portfolio | exposure, clusters, stress, correlation | `active_run()` |
 | Signals | **Levels** (universe chance check, support map with %/ATR/EM distances, every level ranked by edge CI, chart of tests, RSI extremes), gap risk, skew, term structure | technicals cache, disk |
+| Settings | user account profiles (capital, caps, permissions) and ranking-weight presets; saved to `config/user_settings.yaml` | disk |
 | Universe | registry editor (add / deactivate / tag), IVR/IVP, next earnings and disagreements, Stage 1 verdicts, per-symbol weekly bars and earnings reactions, 45-day market-event calendar with policy | registry, metrics, events |
 
 `app/components/run_state.py`: `active_run()` prefers the run made in this
@@ -326,8 +329,8 @@ Headless check: `python scripts/check_pages.py` runs every page through
 | `events` | OPEX horizon, earnings disagreement tolerance, calendar-health minimum | `data_sources/events.py` |
 | `market_metrics` | request batch size | `data_sources/tasty_metrics.py` |
 | `scan_defaults` | the default `ScanRequest` (null DTE/delta = `management.entry`), DTE-target tolerance | `analytics/scan_request.py` |
-| `underlying_rank` | component weights (unvalidated), trend scores, IV/RV scale, liquidity-value log scale, support EM band, drawdown floor, metrics age | `analytics/underlying_rank.py` |
-| `account_profiles` | per-profile overrides of `account:` plus `allowed_strategies`, `spread_approval` | `analytics/sizing.py` |
+| `underlying_rank` | weight presets and the default preset (unvalidated; users add more on Settings), trend scores, IV/RV scale, liquidity-value log scale, support EM band, drawdown floor, metrics age | `analytics/underlying_rank.py` |
+| `account_profiles` | shipped profiles (`default`); user profiles live in `config/user_settings.yaml` | `core/user_settings.py`, `analytics/sizing.py` |
 
 ---
 
@@ -411,10 +414,9 @@ re-pulls `daily_bars_raw`, runs the adjustment check, drops
   TastyTrade IVR/IVP is informational on every candidate, and since Phase 11
   a component of the underlying ranking; it is not a trade gate.
 - **Underlying-ranking weights are unvalidated** until Phase 14. On
-  2026-09-27 the top 15 for the weekly CSP request held 3 of the 10 tickers
-  that had passing CSP strikes in the last full-universe run; SPY and QQQ
-  rank ~30th because their ATM IV sits below 10-day RV while the gate prices
-  the OTM put's (skewed) IV. See PHASE11_SUMMARY.md.
+  2026-09-27 no preset's top 15 held more than 4 of the 10 tickers with
+  passing weekly CSP strikes, so the default request pulls chains for every
+  eligible name (`top_n_underlyings: all`); see PHASE11_SUMMARY.md §7.
 - **Moving-average "support" is mostly chance in this universe** (Phase 10:
   median edge over the bootstrap placebo +0.4 pts; 32 strong levels vs ~26
   expected by chance). Treat a strong level as a hypothesis; the Levels tab

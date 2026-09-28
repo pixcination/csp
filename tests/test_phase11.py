@@ -33,7 +33,8 @@ def test_default_request_reproduces_the_config_entry_window():
     assert request.strategies == ["csp"]
     assert request.dte_window() == (entry["dte_min"], entry["dte_max"])
     assert request.delta_range == sorted(entry["delta_band"])
-    assert request.top_n_underlyings == 15
+    assert request.top_n_underlyings == load_config()["scan_defaults"]["top_n_underlyings"]
+    assert request.ranking_weights == load_config()["underlying_rank"]["default_weight_preset"]
     assert request.profit_targets == [25, 30, 50, 100]
 
 
@@ -356,21 +357,18 @@ def test_annotate_marks_best_per_ticker_and_underlyings_persist(tmp_path, monkey
 
 # --- Account profiles and request caps ---------------------------------------
 
-def test_account_profile_merges_over_the_account_block(monkeypatch):
-    import core.paths
-    cfg = dict(load_config())
-    cfg["account_profiles"] = {"default": {}, "roth": {"net_liquidating_value": 100_000,
-                                                      "max_collateral_per_position_pct": 0.10,
-                                                      "allowed_strategies": ["csp"]}}
-    monkeypatch.setattr(sizing, "load_config", lambda: cfg)
+def test_account_profile_merges_over_the_account_block(user_file):
+    from core import user_settings as us
+    us.save_account_profile("roth", {"net_liquidating_value": 100_000,
+                                     "max_collateral_per_position_pct": 0.10,
+                                     "allowed_strategies": ["csp"]})
     roth = sizing.account_from_config("roth")
     assert roth.net_liquidating_value == 100_000
     assert roth.config["allowed_strategies"] == ["csp"]
-    assert roth.config["cash_buffer_pct"] == cfg["account"]["cash_buffer_pct"]
+    assert roth.config["cash_buffer_pct"] == load_config()["account"]["cash_buffer_pct"]
     assert sizing.max_tradable_strike(roth) == pytest.approx(100.0)
     capped = sizing.account_from_config("roth", position_pct_override=0.05)
     assert sizing.max_tradable_strike(capped) == pytest.approx(50.0)
-    assert core.paths.load_config() is not cfg
 
 
 def test_screen_entry_uses_the_request_dte_window():
@@ -386,3 +384,85 @@ def test_manifest_carries_the_request():
     assert "request" in RunManifest.__dataclass_fields__
     keys = [k for k, _ in STAGES]
     assert keys.index("rank_underlyings") < keys.index("chains") < keys.index("analyse")
+
+
+# --- Decisions after Phase 11: top N "all", weight presets, user profiles -------
+
+@pytest.fixture
+def user_file(tmp_path, monkeypatch):
+    from core import user_settings
+    monkeypatch.setattr(user_settings, "config_dir", lambda: tmp_path)
+    return tmp_path / user_settings.FILE
+
+
+def test_top_n_all_selects_every_eligible_name():
+    request = ScanRequest.from_dict({"top_n_underlyings": "all"})
+    assert request.top_n is None
+    assert ScanRequest.from_dict({"top_n_underlyings": 0}).top_n_underlyings == "all"
+    with pytest.raises(RequestError, match="count"):
+        ScanRequest.from_dict({"top_n_underlyings": "lots"})
+
+
+def test_ranking_weights_preset_or_custom(ranked):
+    presets = load_config()["underlying_rank"]["weight_presets"]
+    request = ScanRequest.from_dict({"ranking_weights": "premium"})
+    assert request.weights() == presets["premium"]
+    custom = ScanRequest.from_dict({"ranking_weights": {"liquidity": 2}})
+    assert custom.weights()["liquidity"] == 2.0 and custom.weights()["iv_rank"] == 0.0
+    with pytest.raises(RequestError, match="not a preset"):
+        ScanRequest.from_dict({"ranking_weights": "nonsense"})
+    with pytest.raises(RequestError, match="ranking_weights"):
+        ScanRequest.from_dict({"ranking_weights": {"luck": 1}})
+
+
+def test_weights_change_the_ranking():
+    base = {"strategies": ["csp"], "top_n_underlyings": "all"}
+    by_liq = ur.rank(ScanRequest.from_dict({**base, "ranking_weights": {"liquidity": 1}}))
+    eligible = by_liq[by_liq["eligible"]]
+    assert eligible["score"].tolist() == pytest.approx(
+        sorted(eligible["score_liquidity"].tolist(), reverse=True))
+    assert by_liq["selected"].sum() == len(eligible)
+
+
+def test_user_profiles_are_defined_saved_and_used(user_file):
+    from core import user_settings as us
+    us.save_account_profile("roth_ira", {"net_liquidating_value": 200_000,
+                                         "max_collateral_per_position_pct": 0.05,
+                                         "allowed_strategies": ["csp"],
+                                         "spread_approval": False})
+    assert user_file.exists()
+    assert "roth_ira" in us.profile_names() and us.profile_names()[0] == "default"
+    cfg = sizing.account_config("roth_ira")
+    assert cfg["net_liquidating_value"] == 200_000
+    assert cfg["cash_buffer_pct"] == load_config()["account"]["cash_buffer_pct"]
+    request = ScanRequest.from_dict({"strategies": ["csp", "pcs"], "account_profile": "roth_ira"})
+    feasible, reasons = ur._capital(["csp", "pcs"], 50.0, 2.0, request, cfg)
+    assert feasible == ["csp"] and "pcs" in reasons[0]
+    assert us.delete_account_profile("roth_ira")
+    with pytest.raises(RequestError, match="not defined"):
+        ScanRequest.from_dict({"account_profile": "roth_ira"})
+
+
+@pytest.mark.parametrize("fields, message", [
+    ({"net_liquidating_value": -5}, "between"),
+    ({"max_collateral_per_position_pct": 2}, "between"),
+    ({"allowed_strategies": ["naked_calls"]}, "choose from"),
+    ({"favourite_colour": "blue"}, "unknown"),
+])
+def test_profile_validation(user_file, fields, message):
+    from core import user_settings as us
+    with pytest.raises(us.SettingsError, match=message):
+        us.save_account_profile("taxable", fields)
+
+
+def test_user_weight_presets_override_and_delete(user_file):
+    from core import user_settings as us
+    with pytest.raises(us.SettingsError, match="names"):
+        us.save_weight_preset("Bad Name", {"iv_rank": 1})
+    us.save_weight_preset("mine", {"iv_rank": 1, "trend": 1})
+    us.save_weight_preset("balanced", {"liquidity": 1})           # override a shipped one
+    presets = us.weight_presets()
+    assert presets["mine"]["trend"] == 1.0 and presets["balanced"]["liquidity"] == 1.0
+    assert ScanRequest.from_dict({"ranking_weights": "mine"}).weights()["iv_rank"] == 1.0
+    us.delete_weight_preset("balanced")
+    assert us.weight_presets()["balanced"] ==         load_config()["underlying_rank"]["weight_presets"]["balanced"]

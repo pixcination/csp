@@ -71,11 +71,17 @@ class AccountState:
 
 
 def account_config(profile: str | None = None) -> dict:
-    """`account:` with the named `account_profiles` entry merged over it
-    (roadmap B.7). `default`, or an unknown/None profile, is the account block."""
+    """`account:` with the named profile merged over it (roadmap B.7).
+    Profiles come from config.yaml -> account_profiles and the user's own
+    config/user_settings.yaml (core.user_settings). `default`, or an
+    unknown/None profile, is the account block."""
+    from core import user_settings
     cfg = load_config()
     base = dict(cfg.get("account", {}) or {})
-    profiles = cfg.get("account_profiles") or {}
+    try:
+        profiles = user_settings.account_profiles()
+    except Exception:
+        profiles = cfg.get("account_profiles") or {}
     base.update(profiles.get(profile or "default") or {})
     base.setdefault("allowed_strategies", ["csp", "pcs", "covered_call"])
     return base

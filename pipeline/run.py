@@ -349,7 +349,8 @@ def _stage_rank(reporter: BaseReporter, manifest: RunManifest, request,
         summary = underlying_rank.summary(ranked)
         reporter.advance(1, note=f"{summary.get('eligible', 0)} eligible of "
                                  f"{summary.get('ranked', 0)}; top "
-                                 f"{request.top_n_underlyings}: "
+                                 f"{request.top_n_underlyings} "
+                                 f"({request.ranking_weights if isinstance(request.ranking_weights, str) else 'custom'} weights): "
                                  f"{', '.join(summary.get('selected', [])[:8])}")
         for kind, count in (summary.get("excluded_by") or {}).items():
             reporter.log(f"  {count} excluded on {kind}")
@@ -357,7 +358,7 @@ def _stage_rank(reporter: BaseReporter, manifest: RunManifest, request,
         manifest.warnings.append("underlying ranking selected nothing -- "
                                  "no chains will be pulled")
     return {**summary, "chain_targets": targets, "held": sorted(held),
-            "weights_validated": False}
+            "weights": request.weights(), "weights_validated": False}
 
 
 def _stage_chains(reporter: BaseReporter, manifest: RunManifest,

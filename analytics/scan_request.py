@@ -14,7 +14,9 @@ explicit and portable:
     profit_targets        % of max profit to report odds for
     account_profile       a key of config.yaml -> account_profiles
     universe              all | csp | stock | etf | index | tag:<tag> | [symbols]
-    top_n_underlyings     how many ranked names get a chain pulled
+    top_n_underlyings     how many ranked names get a chain pulled, or "all"
+    ranking_weights       a weight preset name (config / Settings page) or
+                          {component: weight}
     event_policy_overrides  {event type: {action, days_before, ...}} merged
                           over config.yaml -> event_policy
     strike_rule, em_multiple  how the short strike is chosen
@@ -68,7 +70,8 @@ class ScanRequest:
     profit_targets: list[int] = field(default_factory=lambda: [25, 30, 50, 100])
     account_profile: str = "default"
     universe: str | list[str] = "all"
-    top_n_underlyings: int = 15
+    top_n_underlyings: int | str = 15
+    ranking_weights: str | dict | None = None
     event_policy_overrides: dict = field(default_factory=dict)
     strike_rule: str = "delta"
     em_multiple: float = 1.0
@@ -162,9 +165,28 @@ class ScanRequest:
             raise RequestError("max_loss_per_trade must be positive dollars")
         if self.strike_rule not in STRIKE_RULES:
             raise RequestError(f"strike_rule must be one of {STRIKE_RULES}")
-        if int(self.top_n_underlyings) < 1:
-            raise RequestError("top_n_underlyings must be >= 1")
-        self.top_n_underlyings = int(self.top_n_underlyings)
+        if str(self.top_n_underlyings).lower() in ("all", "0"):
+            self.top_n_underlyings = "all"
+        else:
+            try:
+                self.top_n_underlyings = int(self.top_n_underlyings)
+            except (TypeError, ValueError):
+                raise RequestError('top_n_underlyings must be a count or "all"') from None
+            if self.top_n_underlyings < 1:
+                raise RequestError('top_n_underlyings must be >= 1 (or "all")')
+        from core import user_settings
+        if self.ranking_weights is None:
+            self.ranking_weights = user_settings.default_weight_preset()
+        if isinstance(self.ranking_weights, str):
+            if self.ranking_weights not in user_settings.weight_presets():
+                raise RequestError(
+                    f"ranking_weights '{self.ranking_weights}' is not a preset "
+                    f"({', '.join(user_settings.weight_presets())})")
+        else:
+            try:
+                self.ranking_weights = user_settings.validate_weights(self.ranking_weights)
+            except (user_settings.SettingsError, TypeError, ValueError) as exc:
+                raise RequestError(f"ranking_weights: {exc}") from None
         self.spread_widths = sorted(float(w) for w in self.spread_widths)
         self.profit_targets = sorted(int(t) for t in self.profit_targets)
         if isinstance(self.universe, str):
@@ -176,10 +198,10 @@ class ScanRequest:
             self.universe = [str(s).strip().upper() for s in self.universe if str(s).strip()]
             if not self.universe:
                 raise RequestError("universe list is empty")
-        profiles = load_config().get("account_profiles") or {"default": {}}
+        profiles = user_settings.profile_names()
         if self.account_profile not in profiles:
-            raise RequestError(f"account_profile '{self.account_profile}' is not in "
-                               f"config.yaml -> account_profiles ({', '.join(profiles)})")
+            raise RequestError(f"account_profile '{self.account_profile}' is not defined "
+                               f"({', '.join(profiles)}); add it on the Settings page")
         for kind, rule in (self.event_policy_overrides or {}).items():
             if not isinstance(rule, dict):
                 raise RequestError(f"event_policy_overrides.{kind} must be a mapping")
@@ -225,6 +247,20 @@ class ScanRequest:
         buffer = int(load_config().get("chain_capture", {}).get("roll_buffer_days", 14))
         lo, hi = self.dte_window()
         return lo, hi + buffer
+
+    @property
+    def top_n(self) -> int | None:
+        """The chain-pull count; None = every eligible name."""
+        return None if self.top_n_underlyings == "all" else int(self.top_n_underlyings)
+
+    def weights(self) -> dict[str, float]:
+        """The ranking weights this request resolves to."""
+        from core import user_settings
+        if isinstance(self.ranking_weights, dict):
+            return dict(self.ranking_weights)
+        presets = user_settings.weight_presets()
+        name = self.ranking_weights or user_settings.default_weight_preset()
+        return {k: float(v) for k, v in presets[name].items()}
 
     def label(self) -> str:
         if self.name:

@@ -201,3 +201,43 @@ Options for Tom, none of them applied:
 4. Carried over: the Phase 10 placebo choice and the "strong" definition;
    `drawdown_lookback_years: 10`; BLS 2027 dates in
    `config/macro_calendar.yaml`.
+
+## 7. Decisions taken after review (2026-09-27)
+
+Tom's answers to §6, and what was built:
+
+1. **Top N: whichever gives the most options.** I measured the pass rate
+   against rank. Weekly chains were pulled for all 63 eligible names (about
+   7 minutes), then a `--quick` run used `top_n_underlyings: all` (run
+   `20260927-202209-5938`). That run accepted 42 strikes on 10 tickers.
+   Where those 10 tickers rank under each weight preset:
+
+   | Preset | Ranks of the 10 passing tickers | In top 15 / 20 / 25 / 30 / 40 |
+   |---|---|---|
+   | balanced | 3, 13, 15, 16, 29, 30, 32, 40, 42, 58 | 3 / 4 / 4 / 6 / 8 |
+   | premium | 5, 7, 13, 20, 34, 37, 40, 42, 43, 52 | 3 / 4 / 4 / 4 / 7 |
+   | liquidity | 2, 6, 11, 13, 18, 21, 24, 36, 40, 60 | 4 / 5 / 7 / 7 / 9 |
+   | defensive | 2, 11, 15, 18, 19, 28, 33, 40, 47, 55 | 3 / 5 / 5 / 6 / 8 |
+   | technical | 4, 15, 22, 25, 26, 27, 36, 40, 53, 56 | 2 / 2 / 4 / 6 / 8 |
+
+   A skew proxy would only reorder the list, and no N short of the whole
+   universe keeps the passing names. **The default is therefore
+   `top_n_underlyings: all`**, which pulls chains for every eligible name.
+   The ranking still orders the results, and a request can still set any N
+   (the Run form has a checkbox and a number). `"all"` and `0` both mean
+   every eligible name.
+2. **Account profiles are user-defined.** Profiles are defined on the new
+   **Settings** page, validated (`core/user_settings.py`), and stored in
+   `config/user_settings.yaml`, which is versioned. User entries override
+   the shipped `config.yaml` entries of the same name. The Run form offers
+   every profile, and `sizing.account_config` resolves them.
+3. **Ranking weights are user-selectable.** `underlying_rank.weight_presets`
+   ships five presets: balanced (default), premium, liquidity, defensive
+   and technical. A request picks one with `ranking_weights: <name>`, or
+   passes its own `{component: weight}` mapping. Users add or override
+   presets on the Settings page. None of the presets is validated. The
+   `liquidity` preset kept the most passing names on this one day's data;
+   that is a single observation, not a calibration.
+
+Tests: 332 pass (9 more in `test_phase11.py`), and 9/9 pages pass the
+headless check.

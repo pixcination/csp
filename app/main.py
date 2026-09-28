@@ -42,6 +42,8 @@ pages = [
             icon=":material/insights:"),
     st.Page(str(PAGES_DIR / "6_Universe.py"), title="Universe",
             icon=":material/list_alt:"),
+    st.Page(str(PAGES_DIR / "7_Settings.py"), title="Settings",
+            icon=":material/tune:"),
 ]
 # The Phase-2 Scanner / Ticker Detail / Trade Log pages were retired to
 # legacy/ in Phase 8; the Screener and Trade Detail pages replace them.

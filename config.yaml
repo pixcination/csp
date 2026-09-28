@@ -416,7 +416,9 @@ scan_defaults:
   profit_targets: [25, 30, 50, 100]   # % of max profit; probabilities arrive in Phase 13
   account_profile: default
   universe: all                       # all | csp | etf | index | stock | tag:<tag> | [list]
-  top_n_underlyings: 15
+  top_n_underlyings: all             # all | N. 2026-09-27: every weight preset's top 15 held only
+                                    # 2-4 of the 10 names with passing weekly CSP strikes, so the
+                                    # default pulls every eligible name (~7 min); lower it per request
   strike_rule: delta                  # delta | em_multiple | support (applied in Phase 12)
   em_multiple: 1.0
 
@@ -424,14 +426,23 @@ scan_defaults:
 # NOT VALIDATED: Phase 14 calibrates them against realised outcomes. Missing
 # components are dropped and the remaining weights renormalised per row
 # (`coverage` reports the share of weight that had data).
+# A scan request picks a preset by name (`ranking_weights: premium`) or gives
+# its own weights; users add presets on the Settings page
+# (config/user_settings.yaml). Components:
+#   iv_rank    mean of TastyTrade IVR and IVP
+#   iv_rv      IV at request DTE / DTE-matched realised vol
+#   liquidity  TastyTrade liquidity rating 0-5 + log liquidity value
+#   trend      uptrend 1.0, range 0.6, downtrend 0.1
+#   support    strong level 0.5-2.0 EM below spot (Phase 10: mostly chance)
+#   drawdown   max drawdown over stage1 drawdown_lookback_years
 underlying_rank:
-  weights:
-    iv_rank: 0.25                     # mean of TastyTrade IVR and IVP
-    iv_rv: 0.20                       # IV at request DTE / DTE-matched realised vol
-    liquidity: 0.20                   # TastyTrade liquidity rating 0-5 + log liquidity value
-    trend: 0.15                       # uptrend 1.0, range 0.6, downtrend 0.1
-    support: 0.10                     # strong level 0.5-2.0 EM below spot (Phase 10: mostly chance)
-    drawdown: 0.10                    # max drawdown over stage1 drawdown_lookback_years
+  default_weight_preset: balanced
+  weight_presets:
+    balanced:   {iv_rank: 0.25, iv_rv: 0.20, liquidity: 0.20, trend: 0.15, support: 0.10, drawdown: 0.10}
+    premium:    {iv_rank: 0.35, iv_rv: 0.35, liquidity: 0.15, trend: 0.05, support: 0.05, drawdown: 0.05}
+    liquidity:  {iv_rank: 0.15, iv_rv: 0.20, liquidity: 0.45, trend: 0.10, support: 0.05, drawdown: 0.05}
+    defensive:  {iv_rank: 0.15, iv_rv: 0.15, liquidity: 0.15, trend: 0.25, support: 0.10, drawdown: 0.20}
+    technical:  {iv_rank: 0.10, iv_rv: 0.10, liquidity: 0.15, trend: 0.35, support: 0.25, drawdown: 0.05}
   trend_scores: {uptrend: 1.0, range: 0.6, downtrend: 0.1}
   iv_rv_floor: 0.8                    # ratio scoring 0 ...
   iv_rv_cap: 2.0                      # ... and 1 (IV at request DTE / DTE-matched bar RV)
@@ -441,8 +452,8 @@ underlying_rank:
   metrics_max_age_days: 5
 
 # Account profiles (roadmap B.7). Each profile overrides keys of `account:`;
-# `default` is the account block itself. Add e.g. roth_ira / taxable here with
-# their own net_liquidating_value, caps and permissions.
+# `default` is the account block itself. User profiles (Roth IRA, taxable...)
+# are defined on the Settings page and stored in config/user_settings.yaml.
 account_profiles:
   default:
     allowed_strategies: [csp, pcs, covered_call]

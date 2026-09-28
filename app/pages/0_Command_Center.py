@@ -104,8 +104,54 @@ with left:
                          help="Ignores the staleness window. Outside regular hours "
                               "this only re-fetches the same closing marks.")
     subset = st.text_input("Tickers (blank = whole universe)", "")
+
+    # Scan request (Phase 11): a saved request file, adjusted here.
+    from analytics.scan_request import RequestError, ScanRequest
+    from core import user_settings
+    from core.paths import project_root
+    with st.expander("Scan request", expanded=False):
+        files = sorted((project_root() / "examples").glob("*.json"))
+        source = st.selectbox("Start from", ["config default"] + [f.name for f in files])
+        try:
+            base = (ScanRequest.default() if source == "config default"
+                    else ScanRequest.load(project_root() / "examples" / source))
+        except (OSError, ValueError, RequestError) as exc:
+            st.error(f"{source}: {exc}")
+            base = ScanRequest.default()
+        strategies = st.multiselect("Strategies", ["csp", "pcs"], default=base.strategies)
+        lo, hi = base.dte_window()
+        dte = st.slider("DTE window", 0, 90, (lo, hi))
+        profiles = user_settings.profile_names()
+        profile = st.selectbox("Account profile", profiles,
+                               index=profiles.index(base.account_profile)
+                               if base.account_profile in profiles else 0,
+                               help="Define profiles on the Settings page.")
+        presets = list(user_settings.weight_presets())
+        current = base.ranking_weights if isinstance(base.ranking_weights, str) else presets[0]
+        weights = st.selectbox("Ranking weights", presets,
+                               index=presets.index(current) if current in presets else 0,
+                               help="Presets and your own weightings: Settings page.")
+        all_names = st.checkbox("Pull chains for every eligible name",
+                                value=base.top_n is None,
+                                help="Most choice; ~7 min for the whole universe at "
+                                     "weekly DTE. Untick to pull only the top N.")
+        top_n = None if all_names else st.number_input(
+            "Top N underlyings", 1, 200, value=base.top_n or 15)
+    try:
+        overrides = {"strategies": strategies, "account_profile": profile,
+                     "ranking_weights": weights,
+                     "top_n_underlyings": "all" if all_names else int(top_n)}
+        if base.dte_targets and dte == (lo, hi):
+            overrides["dte_targets"] = base.dte_targets
+        else:
+            overrides.update({"dte_targets": None, "dte_min": dte[0], "dte_max": dte[1]})
+        scan = ScanRequest.from_dict({**base.to_dict(), **overrides})
+        st.caption(f"Request: {scan.label()} · profile `{scan.account_profile}`")
+    except RequestError as exc:
+        scan = None
+        st.error(f"Scan request: {exc}")
     go = st.button("Run", type="primary", width="stretch",
-                    disabled=not cred_ok)
+                    disabled=not cred_ok or scan is None)
 
 with right:
     st.subheader("Progress")
@@ -119,7 +165,8 @@ if go:
     reporter = StreamlitReporter(progress_box, STAGES)
     try:
         with st.spinner("Running..."):
-            manifest = run(tickers, quick=quick, force_chains=force, reporter=reporter)
+            manifest = run(tickers, quick=quick, force_chains=force, reporter=reporter,
+                           request=scan)
         st.session_state["last_manifest"] = manifest
         st.success(f"Finished in {manifest.elapsed_seconds:.0f}s — "
                    f"run {manifest.run_id}")
