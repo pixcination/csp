@@ -354,7 +354,7 @@ def test_trade_detail_fully_populated(run_id, trade_id):
     at.run()
     assert not at.exception, [e.message for e in at.exception]
     assert len(at.tabs) == 10
-    assert len(at.get("plotly_chart")) == 10          # 7 + the three Outlook gauges (Phase 20)
+    assert len(at.get("plotly_chart")) == 11          # 7 + three Outlook gauges + the IV/RV ratio
     assert trade_id.split("|")[1] in at.title[0].value
 
 

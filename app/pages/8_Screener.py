@@ -386,13 +386,21 @@ if not outlook_table.empty:
         if mode == "a fixed horizon":
             fixed = o[0].select_slider("Horizon (days)", list(outlook.HORIZONS), value=14,
                                        key="scr_outlook_h")
-        use_dir = o[1].checkbox("Direction", key="scr_o_dir")
-        dir_b = o[1].slider("Direction", 0.0, 10.0, (6.0, 10.0), 0.5, key="scr_o_dir_b",
-                            label_visibility="collapsed", disabled=not use_dir)
-        use_rng = o[2].checkbox("Range", key="scr_o_rng")
+        # Direction has no measurable edge on most names: its filter is hidden
+        # unless asked for, and no-edge rows never match it (Tom, 2026-09-28).
+        show_dir = o[1].toggle("Show Direction filter", value=False, key="scr_o_dir_show",
+                               help="Direction has no measurable walk-forward edge on most "
+                                    "names; rows without one are blank and never match.")
+        use_dir = False
+        dir_b = (6.0, 10.0)
+        if show_dir:
+            use_dir = o[1].checkbox("Direction (vs realised-vol move)", key="scr_o_dir")
+            dir_b = o[1].slider("Direction", 0.0, 10.0, (6.0, 10.0), 0.5, key="scr_o_dir_b",
+                                label_visibility="collapsed", disabled=not use_dir)
+        use_rng = o[2].checkbox("Range (vs realised-vol move)", key="scr_o_rng")
         rng_b = o[2].slider("Range", 0.0, 10.0, (7.0, 10.0), 0.5, key="scr_o_rng_b",
                             label_visibility="collapsed", disabled=not use_rng)
-        use_vol = o[3].checkbox("Volatility", key="scr_o_vol")
+        use_vol = o[3].checkbox("Volatility (relative richness)", key="scr_o_vol")
         vol_b = o[3].slider("Volatility", 0.0, 10.0, (6.0, 10.0), 0.5, key="scr_o_vol_b",
                             label_visibility="collapsed", disabled=not use_vol)
         conf = o[4].selectbox("Min confidence", list(outlook.LEVELS), index=0,
@@ -402,10 +410,10 @@ if not outlook_table.empty:
         use_window = o[4].checkbox("From-to DTE window", key="scr_o_win")
         window = o[4].slider("DTE window", 0, 90, (21, 45), key="scr_o_win_b",
                              label_visibility="collapsed", disabled=not use_window)
-        st.caption("Direction ≥ 6 = bullish, ≤ 4 = bearish; Range ≥ 7 = likelier than usual to "
-                   "stay inside ±1 EM; Volatility ≥ 6 = IV rich vs forecast realised vol. "
-                   "Direction has ~0 walk-forward skill on most names, so its dial mostly "
-                   "sits at 5 (Universe / Validation pages).")
+        st.caption("Range ≥ 7 = likelier than usual to stay inside ±1 realised-vol move; "
+                   "Volatility ≥ 6 = IV / forecast-realised-vol ratio in the richest 40% of the "
+                   "universe. Direction ≥ 6 = bullish, ≤ 4 = bearish, where it has an edge at "
+                   "all (Universe / Validation pages).")
     view = outlook.annotate(view, outlook_table, horizon=fixed)
     view = outlook.filter_rows(view, dir_b if use_dir else None, rng_b if use_rng else None,
                                vol_b if use_vol else None, conf,
@@ -454,10 +462,13 @@ config = {
     "proposed": st.column_config.CheckboxColumn("Proposed"),
     "best_per_ticker": st.column_config.CheckboxColumn("Best of ticker"),
     "why_not": st.column_config.TextColumn("Rejected because", width="large"),
-    "outlook_direction": st.column_config.NumberColumn("Direction", format="%.1f",
-                                                       help="Outlook at the row's expiry"),
-    "outlook_range": st.column_config.NumberColumn("Range", format="%.1f"),
-    "outlook_volatility": st.column_config.NumberColumn("Vol dial", format="%.1f"),
+    "outlook_direction": st.column_config.NumberColumn(
+        "Direction", format="%.1f",
+        help="Outlook vs the realised-vol move, at the row's expiry; blank = no measurable edge"),
+    "outlook_range": st.column_config.NumberColumn(
+        "Range", format="%.1f", help="Outlook vs the realised-vol move, at the row's expiry"),
+    "outlook_volatility": st.column_config.NumberColumn(
+        "Vol richness", format="%.1f", help="Relative richness: percentile across the universe"),
     "outlook_direction_conf": None, "outlook_range_conf": None,
     "outlook_volatility_conf": None,
 }

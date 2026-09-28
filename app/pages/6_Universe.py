@@ -214,10 +214,13 @@ if table.empty:
                "the nightly job).")
 else:
     st.caption(f"As of the {table['as_of'].max()} close. Three dials per symbol and horizon "
-               "(analytics/outlook.py): Direction (P(up) vs P(down) beyond a quarter of the "
-               "expected move), Range (P(inside ±1 EM) against the stock's own normal), "
-               "Volatility (IV vs the realised vol the engine forecasts). Direction and Range "
-               "are shrunk toward 5 by their walk-forward skill (Validation page).")
+               "(analytics/outlook.py). Direction and Range are measured **vs the realised-vol "
+               "move** (the expected move from 20-day realised vol): Direction = P(up) vs P(down) "
+               "beyond a quarter of it, Range = P(inside ±1 of it) against the stock's own "
+               "normal; both are shrunk toward 5 by their walk-forward skill (Validation page), "
+               "and a reading with no measurable skill shows as **no edge**. Volatility = "
+               "**relative richness**: where today's IV / forecast-realised-vol ratio ranks "
+               "across the universe (5 = the median name).")
     c = st.columns([2, 2, 3])
     dial = c[0].segmented_control("Dial", list(outlook.DIALS), default="direction",
                                   key="outlook_dial") or "direction"
@@ -229,8 +232,8 @@ else:
     st.plotly_chart(outlook_heatmap(table, dial, column), width="stretch", key="outlook_heat")
     if dial == "direction" and not raw:
         share = (table["direction_conf"] == "none").mean()
-        st.caption(f"{share:.0%} of cells have no measurable Direction skill and sit at 5. "
-                   "That is the honest answer for most names (review D.1), not a missing value.")
+        st.caption(f"{share:.0%} of cells show 'no edge': no measurable walk-forward skill. "
+                   "That is the honest answer for most names (review D.1), not missing data.")
     grid = [int(h) for h in sorted(table["horizon"].unique())]
     horizon = st.select_slider("Horizon for the gauges", grid, value=30 if 30 in grid else grid[0],
                                key="outlook_h")

@@ -527,7 +527,9 @@ outlook:
   skill_none: 0.005                   # Brier skill at or below this: the dial sits at 5
   skill_full: 0.03                    # ... at or above this: full length
   skill_prior_n: 300                  # a symbol's skill is pulled toward the pooled one (n_eff vs K)
-  vol_full_ratio: 1.5                 # IV / forecast RV of 1.5 (or 1/1.5) = Volatility 10 (or 0)
+  vol_ratio_scale_max: 2.0            # the IV / forecast-RV ratio gauge: log scale 1/2.0 .. 2.0
+                                      # (the Volatility DIAL is relative richness: the ratio's
+                                      # percentile across the universe -- Tom, 2026-09-28)
   n_paths: 4000                       # engine paths per symbol for the live dials
   refit_days: 7                       # the pipeline refits the model (and skill) when older
   recommender_source: outlook         # outlook | trend_state: what the recommender's trend

@@ -542,14 +542,20 @@ def chain_liquidity_chart(window: pd.DataFrame) -> go.Figure:
 
 OUTLOOK_POLES = {"direction": ("bearish", "neutral", "bullish"),
                  "range": ("breakout", "its normal", "range-bound"),
-                 "volatility": ("IV cheap", "fair", "IV rich")}
+                 "volatility": ("least rich", "median", "richest")}
+OUTLOOK_LABELS = {"direction": "Direction (vs realised-vol move)",
+                  "range": "Range (vs realised-vol move)",
+                  "volatility": "Volatility (relative richness)"}
 CONFIDENCE_DOTS = {"none": "○○○", "low": "●○○", "medium": "●●○", "high": "●●●"}
+NO_EDGE = "no measurable edge"
 
 
 def outlook_heatmap(table: pd.DataFrame, dial: str, value_column: str | None = None) -> go.Figure:
     """Symbols x horizons for one dial. Diverging around 5 (red below, gray
     at 5, blue above); each cell shows the score and confidence dots
-    (○○○ none ... ●●● high), the hover the probabilities behind it."""
+    (○○○ none ... ●●● high). A Direction or Range reading with no
+    measurable skill is drawn greyed out as 'no edge' instead of a 5
+    (unless `value_column` asks for the raw model reading)."""
     column = value_column or dial
     frame = table.dropna(subset=[column])
     grid = frame.pivot_table(index="ticker", columns="horizon", values=column)
@@ -557,17 +563,32 @@ def outlook_heatmap(table: pd.DataFrame, dial: str, value_column: str | None = N
                              aggfunc="first").reindex_like(grid)
     grid = grid.sort_index(ascending=False)
     conf = conf.reindex(grid.index)
-    text = [[("" if not np.isfinite(v) else f"{v:.1f} {CONFIDENCE_DOTS.get(c, '')}")
-             for v, c in zip(row, crow)] for row, crow in zip(grid.values, conf.values)]
+    greyed = (conf == "none").to_numpy() if dial != "volatility" and column == dial \
+        else np.zeros(grid.shape, bool)
+    values = grid.to_numpy(float)
+    shown = np.where(greyed, np.nan, values)
+    text = [[("" if greyed[i][j] or not np.isfinite(v)
+              else f"{v:.1f} {CONFIDENCE_DOTS.get(c, '')}")
+             for j, (v, c) in enumerate(zip(row, crow))]
+            for i, (row, crow) in enumerate(zip(values, conf.to_numpy()))]
     low, mid, high = OUTLOOK_POLES[dial]
+    x = [f"{h}d" for h in grid.columns]
+    y = list(grid.index)
     fig = go.Figure(go.Heatmap(
-        z=grid.values, x=[f"{h}d" for h in grid.columns], y=list(grid.index),
-        zmin=0, zmax=10, zmid=5,
+        z=shown, x=x, y=y, zmin=0, zmax=10, zmid=5,
         colorscale=[[0, DIVERGING_NEGATIVE], [0.5, DIVERGING_MIDPOINT], [1, DIVERGING_POSITIVE]],
         text=text, texttemplate="%{text}", textfont=dict(size=10, color=PRIMARY_INK),
-        xgap=2, ygap=2,
+        xgap=2, ygap=2, hoverongaps=False,
         hovertemplate="%{y} @ %{x}: %{z:.2f}<extra></extra>",
-        colorbar=dict(title=dial, tickvals=[0, 5, 10], ticktext=[low, mid, high])))
+        colorbar=dict(title=OUTLOOK_LABELS[dial].split(" (")[0], tickvals=[0, 5, 10],
+                      ticktext=[low, mid, high])))
+    if greyed.any():
+        fig.add_trace(go.Heatmap(
+            z=np.where(greyed, 1.0, np.nan), x=x, y=y, zmin=0, zmax=1, showscale=False,
+            colorscale=[[0, BASELINE_INK], [1, BASELINE_INK]], xgap=2, ygap=2,
+            hoverongaps=False, text=np.where(greyed, "no edge", ""),
+            texttemplate="%{text}", textfont=dict(size=9, color=MUTED_INK),
+            hovertemplate=f"%{{y}} @ %{{x}}: {NO_EDGE} (walk-forward skill ~0)<extra></extra>"))
     fig.update_layout(xaxis_title="Horizon (calendar days)", xaxis_type="category",
                       yaxis_type="category")
     fig = _apply_layout(fig, height=max(360, 18 * len(grid) + 120))
@@ -576,22 +597,30 @@ def outlook_heatmap(table: pd.DataFrame, dial: str, value_column: str | None = N
 
 
 def outlook_gauge(dial: str, score: float | None, lo: float | None, hi: float | None,
-                  base: float | None, confidence: str | None = None) -> go.Figure:
+                  base: float | None, confidence: str | None = None,
+                  no_edge: bool = False) -> go.Figure:
     """One dial as a horizontal line 0-10: the shaded band (uncertainty), the
-    arrow at the score, a tick at the stock's normal position, pole labels."""
+    arrow at the score, a tick at the stock's normal position, pole labels.
+    With `no_edge` the whole gauge is greyed out and says so."""
     low, mid, high = OUTLOOK_POLES[dial]
     fig = go.Figure()
     fig.add_shape(type="line", x0=0, x1=10, y0=0, y1=0, line=dict(color=BASELINE_INK, width=2))
     for x in (0, 5, 10):
         fig.add_shape(type="line", x0=x, x1=x, y0=-0.12, y1=0.12,
                       line=dict(color=MUTED_INK, width=1))
-    if lo is not None and hi is not None and np.isfinite(lo) and np.isfinite(hi):
+    if not no_edge and lo is not None and hi is not None and np.isfinite(lo) and np.isfinite(hi):
         fig.add_shape(type="rect", x0=lo, x1=hi, y0=-0.3, y1=0.3, line_width=0,
                       fillcolor="rgba(195,194,183,0.18)")
-    if base is not None and np.isfinite(base):
+    if not no_edge and base is not None and np.isfinite(base):
         fig.add_shape(type="line", x0=base, x1=base, y0=-0.42, y1=0.42,
                       line=dict(color=SECONDARY_INK, width=2, dash="dot"))
-    if score is not None and np.isfinite(score):
+    if no_edge:
+        fig.add_trace(go.Scatter(
+            x=[5], y=[0.55], mode="text", text=[NO_EDGE], textposition="middle center",
+            textfont=dict(color=MUTED_INK, size=12),
+            hovertemplate="Walk-forward skill is ~0 for this symbol and horizon: the models' "
+                          "reading is noise, so none is shown.<extra></extra>"))
+    elif score is not None and np.isfinite(score):
         color = (DIVERGING_POSITIVE if score > 5.25 else DIVERGING_NEGATIVE if score < 4.75
                  else SECONDARY_INK)
         fig.add_trace(go.Scatter(
@@ -602,13 +631,53 @@ def outlook_gauge(dial: str, score: float | None, lo: float | None, hi: float | 
             hovertemplate=f"{dial} %{{x:.2f}}" + (f" (band {lo:.1f}-{hi:.1f})"
                                                   if lo is not None and hi is not None else "")
             + "<extra></extra>"))
+    title = OUTLOOK_LABELS[dial] + ("" if no_edge or not confidence else
+                                    f"  {CONFIDENCE_DOTS.get(confidence, '')} {confidence}")
     fig.update_layout(**PLOTLY_TEMPLATE["layout"])
     fig.update_layout(
         height=120, margin=dict(l=10, r=10, t=28, b=8), showlegend=False,
-        title=dict(text=f"{dial.capitalize()}" + (f"  {CONFIDENCE_DOTS.get(confidence, '')} "
-                                                  f"{confidence}" if confidence else ""),
-                   font=dict(size=13, color=SECONDARY_INK), x=0.01),
+        title=dict(text=title, font=dict(size=13, color=MUTED_INK if no_edge else SECONDARY_INK),
+                   x=0.01),
         xaxis=dict(range=[-0.4, 10.4], tickvals=[0, 5, 10], ticktext=[low, mid, high],
+                   showgrid=False, zeroline=False, tickfont=dict(color=MUTED_INK, size=11)),
+        yaxis=dict(range=[-0.6, 1.2], visible=False))
+    return fig
+
+
+def vol_ratio_gauge(ratio: float | None, lo: float | None = None, hi: float | None = None,
+                    top: float = 2.0) -> go.Figure:
+    """IV / forecast realised vol as a number on a log scale 1/top .. top
+    (1 = fair); values beyond the scale sit at its end, labelled."""
+    import math
+    fig = go.Figure()
+    lo_x, hi_x = math.log10(1.0 / top), math.log10(top)
+    fig.add_shape(type="line", x0=lo_x, x1=hi_x, y0=0, y1=0,
+                  line=dict(color=BASELINE_INK, width=2))
+    for tick in (1.0 / top, 1.0, top):
+        fig.add_shape(type="line", x0=math.log10(tick), x1=math.log10(tick), y0=-0.12, y1=0.12,
+                      line=dict(color=MUTED_INK, width=1))
+    if lo and hi:
+        fig.add_shape(type="rect", x0=max(math.log10(lo), lo_x), x1=min(math.log10(hi), hi_x),
+                      y0=-0.3, y1=0.3, line_width=0, fillcolor="rgba(195,194,183,0.18)")
+    if ratio:
+        x = min(max(math.log10(ratio), lo_x), hi_x)
+        color = (DIVERGING_POSITIVE if ratio > 1.05 else DIVERGING_NEGATIVE if ratio < 0.95
+                 else SECONDARY_INK)
+        fig.add_trace(go.Scatter(
+            x=[x], y=[0.55], mode="markers+text",
+            text=[f"{ratio:.2f}x" + ("+" if ratio > top else "")],
+            textposition="top center", textfont=dict(color=PRIMARY_INK, size=13),
+            marker=dict(symbol="triangle-down", size=16, color=color,
+                        line=dict(color=CHART_SURFACE, width=2)),
+            hovertemplate=f"IV / forecast realised vol {ratio:.2f}<extra></extra>"))
+    fig.update_layout(**PLOTLY_TEMPLATE["layout"])
+    fig.update_layout(
+        height=120, margin=dict(l=10, r=10, t=28, b=8), showlegend=False,
+        title=dict(text="IV / forecast realised vol (log scale)",
+                   font=dict(size=13, color=SECONDARY_INK), x=0.01),
+        xaxis=dict(range=[lo_x - 0.09, hi_x + 0.09],
+                   tickvals=[lo_x, 0.0, hi_x], ticktext=[f"{1 / top:.1f}x cheap", "1.0x fair",
+                                                        f"{top:.1f}x rich"],
                    showgrid=False, zeroline=False, tickfont=dict(color=MUTED_INK, size=11)),
         yaxis=dict(range=[-0.6, 1.2], visible=False))
     return fig

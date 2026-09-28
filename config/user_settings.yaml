@@ -8,8 +8,8 @@ account_profiles:
     - pcs
     - covered_call
     cash_buffer_pct: 0.1
-    max_collateral_per_position_pct: 0.1
-    max_collateral_per_ticker_pct: 0.15
+    max_collateral_per_position_pct: 0.2
+    max_collateral_per_ticker_pct: 0.2
     max_open_positions: 10
     max_sector_collateral_pct: 0.3
     naked_approval: false
@@ -52,3 +52,133 @@ account_profiles:
     placeholder: false
     require_cash_secured: true
     spread_approval: true
+scan_presets:
+  csp_weekly_taxable:
+    account_profile: taxable
+    delta_range:
+    - -0.3
+    - -0.12
+    dte_max: 11
+    dte_min: 3
+    dte_targets: null
+    em_multiple: 1.0
+    event_policy_overrides: {}
+    max_loss_per_trade: null
+    max_pct_capital: null
+    min_pop: null
+    name: csp_weekly_taxable
+    pcs_dte_targets:
+    - 45
+    profit_targets:
+    - 25
+    - 30
+    - 50
+    - 100
+    ranking_weights: calibrated
+    recommend: false
+    risk_mode: delta_range
+    specs: []
+    spread_width_pct:
+    - 4.0
+    spread_widths:
+    - 1.0
+    - 2.5
+    - 5.0
+    - 10.0
+    strategies:
+    - csp
+    strike_rule: conservative
+    top_n_underlyings: all
+    universe: all
+  pcs_45_trad_ira:
+    account_profile: traditional_ira
+    delta_range:
+    - -0.3
+    - -0.12
+    dte_max: 11
+    dte_min: 3
+    dte_targets: null
+    em_multiple: 1.0
+    event_policy_overrides: {}
+    max_loss_per_trade: null
+    max_pct_capital: null
+    min_pop: null
+    name: pcs_45_trad_ira
+    pcs_dte_targets:
+    - 45
+    profit_targets:
+    - 25
+    - 30
+    - 50
+    - 100
+    ranking_weights: calibrated
+    recommend: false
+    risk_mode: delta_range
+    specs: []
+    spread_width_pct:
+    - 4.0
+    spread_widths:
+    - 1.0
+    - 2.5
+    - 5.0
+    - 10.0
+    strategies:
+    - pcs
+    strike_rule: conservative
+    top_n_underlyings: all
+    universe: all
+  xsp_pcs_roth:
+    account_profile: roth_ira
+    delta_range:
+    - -0.3
+    - -0.12
+    dte_max: 11
+    dte_min: 3
+    dte_targets: null
+    em_multiple: 1.0
+    event_policy_overrides: {}
+    max_loss_per_trade: null
+    max_pct_capital: null
+    min_pop: null
+    name: xsp_pcs_roth
+    pcs_dte_targets:
+    - 45
+    profit_targets:
+    - 25
+    - 30
+    - 50
+    - 100
+    ranking_weights: calibrated
+    recommend: false
+    risk_mode: delta_range
+    specs: []
+    spread_width_pct:
+    - 4.0
+    spread_widths:
+    - 1.0
+    - 2.5
+    - 5.0
+    - 10.0
+    strategies:
+    - pcs
+    strike_rule: conservative
+    top_n_underlyings: all
+    universe:
+    - XSP
+schedule:
+  auto_presets:
+    csp_weekly_taxable:
+      control_m: 3
+      daily_cap: 11
+      observe_hourly: false
+      top_k: 5
+    pcs_45_trad_ira:
+      control_m: 3
+      daily_cap: 11
+      observe_hourly: false
+      top_k: 5
+    xsp_pcs_roth:
+      control_m: 3
+      daily_cap: 11
+      observe_hourly: false
+      top_k: 5

@@ -5,8 +5,12 @@ Outlook v1 (Phase 20, review Part D): three dials per symbol and horizon.
                      5 = balanced
     Range      0-10  P(inside +/-1 EM) against the stock's own base rate,
                      5 = its normal
-    Volatility 0-10  implied vol vs the realised vol the engine forecasts,
-                     5 = fair, above 5 = IV rich (credit), below = cheap (debit)
+    Volatility 0-10  RELATIVE RICHNESS (Tom, 2026-09-28): the percentile of
+                     today's IV / forecast-realised-vol ratio across the
+                     universe at that horizon, x 10 (5 = the median name). The
+                     ratio itself (`vol_ratio`) is shown beside it on a log
+                     scale 0.5-2.0. Once the archive holds enough IV history,
+                     each symbol's own history replaces the universe.
 
 on the horizon grid 3, 5, 7, 10, 14, 21, 30, 45, 60 calendar days (converted
 to trading days, x 252/365). Display and filter only: nothing here ranks or
@@ -18,7 +22,14 @@ WHAT "EM" MEANS HERE
     that is the only move unit with 20+ years of history, so every one of
     these probabilities is tested walk-forward. The IV-based EM needs IV
     history (Phase 18's archive is building it); the live rows also carry
-    P(inside the IV EM) from the engine, for reference.
+    P(inside the IV EM) from the engine, shown beside every Range reading.
+    Every Direction and Range reading is labelled "vs realised-vol move".
+    Once the archive holds 6 months of history: add an IV-unit version and
+    its skill (Tom, 2026-09-28).
+
+    NO MEASURABLE EDGE: a Direction or Range reading whose confidence is
+    "none" is shown greyed out as "no measurable edge" (not as a plain 5),
+    and `annotate` leaves it blank so no Screener filter can select on it.
 
 TWO MODELS, BLENDED (D.2)
     engine    the probability engine's H and T paths (analytics/prob_engine:
@@ -84,7 +95,7 @@ def cfg() -> dict:
     base = {"horizons": list(HORIZONS), "history_start": "2000-01-01", "test_start_year": 2015,
             "step_days": 5, "l2": 10.0, "base_window_days": 2520, "min_base_days": 250,
             "hist_band": 0.25, "hist_min_days": 100, "skill_full": 0.03, "skill_none": 0.005,
-            "n_paths": 4000, "refit_days": 7, "vol_full_ratio": 1.5, "min_n_eff": 30,
+            "n_paths": 4000, "refit_days": 7, "vol_ratio_scale_max": 2.0, "min_n_eff": 30,
             "skill_prior_n": 300}
     base.update(load_config().get("outlook", {}) or {})
     return base
@@ -480,13 +491,6 @@ def range_raw(p_in: float, base: float) -> float:
     return float(5.0 - 5.0 * (base - p_in) / max(base, 1e-6))
 
 
-def vol_raw(iv: float | None, forecast_rv: float | None, c: dict) -> float | None:
-    if not iv or not forecast_rv or iv <= 0 or forecast_rv <= 0:
-        return None
-    x = math.log(iv / forecast_rv) / math.log(float(c["vol_full_ratio"]))
-    return float(5.0 + 5.0 * np.clip(x, -1.0, 1.0))
-
-
 def level(skill: float | None, n_eff: float | None, spread: float, c: dict) -> str:
     """none / low / medium / high from (a) sample, (b) skill, (c) agreement."""
     s = shrink_for(skill, c)
@@ -697,13 +701,16 @@ def for_ticker(ticker: str, daily: pd.DataFrame, spy: pd.DataFrame | None, model
         iv = _iv_at(metrics, h)
         vols = [reads[m]["path_vol"] for m in reads]
         frv = float(np.mean(vols)) if vols else None
-        v = vol_raw(iv, frv, c)
+        ratio = iv / frv if iv and frv and iv > 0 and frv > 0 else None
         v_spread = (abs(vols[0] - vols[1]) / max(np.mean(vols), 1e-6)) if len(vols) == 2 else 0.3
-        rec.update({"iv": iv, "forecast_rv": frv, "volatility": v,
-                    "volatility_lo": None if v is None else max(v - 1.0 - 5 * v_spread, 0.0),
-                    "volatility_hi": None if v is None else min(v + 1.0 + 5 * v_spread, 10.0),
+        # The dial (a percentile across the universe) is filled in by
+        # `relative_volatility` once every symbol's ratio is known.
+        rec.update({"iv": iv, "forecast_rv": frv, "vol_ratio": ratio,
+                    "vol_ratio_lo": None if ratio is None else ratio / (1.0 + 0.1 + v_spread),
+                    "vol_ratio_hi": None if ratio is None else ratio * (1.0 + 0.1 + v_spread),
+                    "volatility": None, "volatility_lo": None, "volatility_hi": None,
                     "volatility_base": 5.0, "volatility_skill": None,
-                    "volatility_conf": "none" if v is None else
+                    "volatility_conf": "none" if ratio is None else
                     ("medium" if v_spread < 0.15 else "low")})
         # The IV-based move, for reference, and G vs T
         if iv:
@@ -777,12 +784,46 @@ def build(tickers: list[str], reporter=None, c: dict | None = None, save: bool =
                 reporter.advance(1, note=ticker)
             except Exception as exc:
                 reporter.advance(1, note=f"{ticker}: {exc}")
-    frame = pd.DataFrame(rows)
+    frame = relative_volatility(pd.DataFrame(rows))
     if save and not frame.empty:
         frame.to_parquet(folder() / "latest.parquet", index=False)
         day = str(frame["as_of"].max())
         frame.to_parquet(folder() / f"{day}.parquet", index=False)
     return frame
+
+
+def relative_volatility(frame: pd.DataFrame) -> pd.DataFrame:
+    """The Volatility dial as relative richness: 10 x the percentile of each
+    symbol's IV / forecast ratio among the universe at the same horizon (the
+    band: the percentiles of its ratio band). Needs the whole table."""
+    if frame is None or frame.empty or "vol_ratio" not in frame:
+        return frame
+    out = frame.copy()
+    for column in ("vol_ratio", "vol_ratio_lo", "vol_ratio_hi", "volatility", "volatility_lo",
+                   "volatility_hi"):
+        out[column] = pd.to_numeric(out.get(column), errors="coerce").astype(float)
+    for h, group in out.groupby("horizon"):
+        values = np.sort(group["vol_ratio"].dropna().to_numpy(float))
+        if len(values) < 2:
+            continue
+
+        def pct(x):
+            if x is None or not np.isfinite(x):
+                return np.nan
+            below = np.searchsorted(values, x, side="left")
+            upto = np.searchsorted(values, x, side="right")
+            return 10.0 * ((below + upto) / 2.0) / len(values)
+        idx = group.index
+        out.loc[idx, "volatility"] = group["vol_ratio"].map(pct)
+        out.loc[idx, "volatility_lo"] = group["vol_ratio_lo"].map(pct)
+        out.loc[idx, "volatility_hi"] = group["vol_ratio_hi"].map(pct)
+    out["volatility_measure"] = "universe percentile"
+    return out
+
+
+def no_edge(rec: dict | pd.Series, dial: str = "direction") -> bool:
+    """A reading with no measurable skill (shown greyed out, 'no measurable edge')."""
+    return dial != "volatility" and rec.get(f"{dial}_conf") == "none"
 
 
 def load_latest() -> pd.DataFrame:
@@ -824,7 +865,8 @@ def confidence_rank(value: str | None) -> int:
 def annotate(rows: pd.DataFrame, table: pd.DataFrame, horizon: float | None = None,
              dte_column: str = "dte_calendar") -> pd.DataFrame:
     """Add `outlook_{dial}` and `outlook_{dial}_conf` to sheet rows: each row
-    at its own expiry (its DTE), or every row at a fixed `horizon`."""
+    at its own expiry (its DTE), or every row at a fixed `horizon`. A reading
+    with no measurable edge is left blank (NaN), so no filter can select on it."""
     out = rows.copy()
     for dial in DIALS:
         out[f"outlook_{dial}"] = np.nan
@@ -842,6 +884,8 @@ def annotate(rows: pd.DataFrame, table: pd.DataFrame, horizon: float | None = No
             continue
         for dial in DIALS:
             value = rec.get(dial)
+            if no_edge(rec, dial):
+                value = None               # no measurable edge: not a number to filter on
             out.at[i, f"outlook_{dial}"] = value if value is not None else np.nan
             out.at[i, f"outlook_{dial}_conf"] = rec.get(f"{dial}_conf")
     return out

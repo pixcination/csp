@@ -87,9 +87,6 @@ def test_dial_mappings_shrink_and_levels():
     assert outlook.direction_raw(0.7, 0.1) == pytest.approx(8.0)
     assert outlook.range_raw(0.6, 0.6) == 5.0
     assert outlook.range_raw(1.0, 0.6) == 10.0 and outlook.range_raw(0.0, 0.6) == 0.0
-    assert outlook.vol_raw(0.30, 0.20, CFG) == pytest.approx(10.0)  # IV 1.5x forecast
-    assert outlook.vol_raw(0.20, 0.20, CFG) == 5.0
-    assert outlook.vol_raw(None, 0.2, CFG) is None
     assert outlook.shrink_for(0.0, CFG) == 0.0 and outlook.shrink_for(0.05, CFG) == 1.0
     assert 0 < outlook.shrink_for(0.015, CFG) < 1
     assert outlook.level(0.001, 500, 0.0, CFG) == "none"
@@ -191,3 +188,30 @@ def test_recommender_reads_the_outlook_direction():
 def test_pipeline_has_an_outlook_stage():
     from pipeline import run
     assert ("outlook", "Outlook dials") in run.STAGES
+
+
+def test_volatility_is_relative_richness_across_the_universe():
+    """Tom 2026-09-28: the dial is the percentile of IV / forecast across the
+    universe at that horizon; the ratio itself stays beside it."""
+    frame = pd.DataFrame({"ticker": list("ABCDE") * 2, "horizon": [7] * 5 + [30] * 5,
+                          "vol_ratio": [0.8, 1.0, 1.2, 1.4, 2.5, 1.1, 1.1, 1.1, 1.1, None]})
+    frame["vol_ratio_lo"], frame["vol_ratio_hi"] = frame["vol_ratio"] * 0.9, frame["vol_ratio"] * 1.1
+    out = outlook.relative_volatility(frame)
+    seven = out[out["horizon"] == 7].set_index("ticker")["volatility"]
+    assert list(seven) == pytest.approx([1.0, 3.0, 5.0, 7.0, 9.0])      # midrank percentiles
+    thirty = out[out["horizon"] == 30].set_index("ticker")["volatility"]
+    assert thirty[list("ABCD")].tolist() == [5.0] * 4 and np.isnan(thirty["E"])
+    row = out.iloc[2]
+    assert row["volatility_lo"] <= row["volatility"] <= row["volatility_hi"]
+
+
+def test_no_edge_readings_are_blank_for_the_screener():
+    table = pd.DataFrame({"ticker": ["A", "A"], "horizon": [14, 30], "direction": [5.0, 5.0],
+                          "direction_conf": ["none", "none"], "range": [7.5, 7.5],
+                          "range_conf": ["high", "high"], "volatility": [6.0, 6.0],
+                          "volatility_conf": ["low", "low"]})
+    rows = outlook.annotate(pd.DataFrame({"ticker": ["A"], "dte_calendar": [20]}), table)
+    assert np.isnan(rows["outlook_direction"].iloc[0]) and rows["outlook_range"].iloc[0] == 7.5
+    assert outlook.filter_rows(rows, direction=(0, 10)).empty           # never matches
+    assert outlook.no_edge({"direction_conf": "none"}) and not outlook.no_edge(
+        {"volatility_conf": "none"}, "volatility")

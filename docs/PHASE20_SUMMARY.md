@@ -172,3 +172,26 @@ exactly at 5; the other 28% are within 0.2 of it. Range spreads from 2.6 to
    and a pooled prior worth 300 outcomes.
 4. **The Volatility scale saturates at an IV/forecast ratio of 1.5**, so
    many names read 10. Should the scale be wider?
+
+## 7. Decisions applied (Tom, 2026-09-28)
+
+| Decision | Applied |
+|---|---|
+| Keep the realised-vol EM | Every Direction and Range reading is labelled **"vs realised-vol move"** (gauges, heatmap, Screener, Universe), with P(inside the IV move) beside each Range reading. **To do once the archive has 6 months of history:** an IV-unit version and its skill. |
+| Recommender trend source | Kept: `outlook`. |
+| Shrink thresholds | Accepted: 0.005 / 0.03, prior worth 300 outcomes. |
+| Volatility dial | Now **relative richness**: 10 × the percentile of today's IV / forecast-realised-vol ratio across the universe at the same horizon, so 5 is the median name (`relative_volatility`). The ratio itself is shown as a number on a log-scale gauge from 0.5× to 2.0×. **To do once the archive allows:** use each symbol's own history instead of the universe. The absolute 1.5 cap is gone. |
+| Direction display | A reading with no measurable skill shows **greyed out as "no measurable edge"**, not as a 5, in the heatmap and the gauges. The Screener hides the Direction filter unless "Show Direction filter" is switched on, and no-edge rows are blank, so no filter can select them. |
+
+Profiles: traditional IRA confirmed at $3,250,000. The Roth's per-position
+and per-ticker caps were raised to 20%, allowing strikes up to $72 (29
+names).
+
+Auto presets, each with K 5, M 3, a daily cap of 11, and logged once a day
+at 10:45:
+
+| Preset | What it runs | Profile |
+|---|---|---|
+| `pcs_45_trad_ira` | put spreads, 45 DTE, 4% wide, whole universe | traditional IRA |
+| `csp_weekly_taxable` | CSPs, 3–11 DTE, whole universe | taxable |
+| `xsp_pcs_roth` | XSP put spreads, 45 DTE, 4% wide | Roth IRA |
