@@ -25,11 +25,16 @@ st.set_page_config(
 )
 
 pages = [
-    # Command Center is the default landing page: it is the single activation
-    # button, and it carries the session banner that says how far the numbers
-    # on every other page can be trusted right now.
+    # Phase 14: the Screener is the landing page -- ask, run, pick a trade --
+    # and carries Command Center's session banner on top. Trade Detail opens
+    # from a selected row (?run=...&trade=...). Command Center stays for the
+    # open-position decisions, account capacity and the rules in force.
+    st.Page(str(PAGES_DIR / "8_Screener.py"), title="Screener",
+            icon=":material/filter_alt:", default=True),
+    st.Page(str(PAGES_DIR / "9_Trade_Detail.py"), title="Trade Detail",
+            icon=":material/query_stats:"),
     st.Page(str(PAGES_DIR / "0_Command_Center.py"), title="Command Center",
-            icon=":material/bolt:", default=True),
+            icon=":material/bolt:"),
     st.Page(str(PAGES_DIR / "1_Decisions.py"), title="Decisions",
             icon=":material/fact_check:"),
     st.Page(str(PAGES_DIR / "2_Wheel.py"), title="Wheel",
@@ -46,7 +51,7 @@ pages = [
             icon=":material/tune:"),
 ]
 # The Phase-2 Scanner / Ticker Detail / Trade Log pages were retired to
-# legacy/ in Phase 8; the Screener and Trade Detail pages replace them.
+# legacy/ in Phase 8; the Screener and Trade Detail pages (Phase 14) replace them.
 
 with st.sidebar:
     st.markdown(f"## {APP_NAME}")

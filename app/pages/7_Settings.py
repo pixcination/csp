@@ -102,9 +102,11 @@ with tab_profiles:
 # --- Ranking weights ---------------------------------------------------------------
 
 with tab_weights:
-    st.caption("How the underlying ranking combines its components. **None of these "
-               "weightings is validated yet** (Phase 14 calibrates them); pick the one "
-               "that matches what you are looking for, or define your own.")
+    st.caption("How the underlying ranking combines its components. The Phase 14 "
+               "calibration (Validation page) found only the IV-rank component (and, weakly, "
+               "drawdown) predicting how much premium a short put kept; trend and support "
+               "showed nothing, and IV/RV and liquidity cannot be tested. `calibrated` "
+               "follows that result. Pick a preset, or define your own.")
     presets = us.weight_presets()
     user_presets = set((us.load().get("ranking_weight_presets") or {}))
     table = pd.DataFrame(presets).T.reindex(columns=list(us.COMPONENTS)).fillna(0.0)

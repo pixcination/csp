@@ -422,8 +422,9 @@ scan_defaults:
   strike_rule: conservative           # conservative (lowest short strike any rule gives) | delta | em_multiple | support
   em_multiple: 1.0
 
-# Chain-free ranking of every registry symbol. Weights are a STARTING POINT,
-# NOT VALIDATED: Phase 14 calibrates them against realised outcomes. Missing
+# Chain-free ranking of every registry symbol. Weights are a STARTING POINT;
+# Phase 14 calibrated the testable components (docs/PHASE14_SUMMARY.md §3, the
+# `calibrated` preset) -- the default stays `balanced` until Tom decides. Missing
 # components are dropped and the remaining weights renormalised per row
 # (`coverage` reports the share of weight that had data).
 # A scan request picks a preset by name (`ranking_weights: premium`) or gives
@@ -443,6 +444,12 @@ underlying_rank:
     liquidity:  {iv_rank: 0.15, iv_rv: 0.20, liquidity: 0.45, trend: 0.10, support: 0.05, drawdown: 0.05}
     defensive:  {iv_rank: 0.15, iv_rv: 0.15, liquidity: 0.15, trend: 0.25, support: 0.10, drawdown: 0.20}
     technical:  {iv_rank: 0.10, iv_rv: 0.10, liquidity: 0.15, trend: 0.35, support: 0.25, drawdown: 0.05}
+    # Phase 14 calibration (scripts/calibrate_rank_weights.py, 2026-09-27): mean of the
+    # 21- and 5-day suggestions. Point-in-time over 8y x 67 names, only the RV-percentile
+    # proxy for iv_rank (IC 0.14 / 0.12) and, weakly, drawdown (5d t 3.2) predicted the
+    # share of premium kept; trend and support ICs were ~0. iv_rv and liquidity cannot be
+    # tested point-in-time and keep balanced's weights. Offered, NOT the default.
+    calibrated: {iv_rank: 0.54, iv_rv: 0.20, liquidity: 0.20, trend: 0.0, support: 0.0, drawdown: 0.06}
   trend_scores: {uptrend: 1.0, range: 0.6, downtrend: 0.1}
   iv_rv_floor: 0.8                    # ratio scoring 0 ...
   iv_rv_cap: 2.0                      # ... and 1 (IV at request DTE / DTE-matched bar RV)

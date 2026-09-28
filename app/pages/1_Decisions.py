@@ -11,6 +11,9 @@ That override field is the most important control on the page. Every yield the
 tool displays rests on a slippage assumption, and the only way to find out
 whether it is right is to keep recording what really happened.
 
+Phase 14: the trade selected on the Screener (or sent from Trade Detail) is
+shown first, with the same accept/override form.
+
 Phase 11: the run's scan request is named at the top, the full sheet keeps
 every accepted strike (with a "best per ticker" toggle), and the underlying
 ranking that chose which chains to pull is shown with its component scores.
@@ -43,6 +46,28 @@ manifest, run_results, source = active_run()
 candidates = analyse_stage(manifest).get("candidates", [])
 considered = analyse_stage(manifest).get("candidates_considered", 0)
 run_caption(manifest, source)
+
+# Phase 14: the trade picked on the Screener / Trade Detail comes first, with
+# the same card and accept form as the run's own proposals.
+picked = st.session_state.get("screener_selection") or {}
+if picked.get("trade"):
+    from analytics import trade_detail as td
+    from pipeline.results import load_run
+    picked_run = (run_results if run_results is not None and run_results.run_id == picked["run"]
+                  else load_run(picked["run"]))
+    picked_rec = td.record(picked_run, picked["trade"]) if picked_run is not None else None
+    if picked_rec is not None:
+        picked_rec["_run_id"] = picked["run"]
+        picked_rec["_from_screener"] = True
+        candidates = [picked_rec] + [c for c in candidates
+                                     if c.get("trade_id") != picked["trade"]]
+        cols = st.columns([4, 1])
+        cols[0].info(f"Selected on the Screener: **{td.escape_md(td.trade_label(picked_rec))}** "
+                     f"(run `{picked['run']}`) -- shown first below.",
+                     icon=":material/filter_alt:")
+        if cols[1].button("Clear selection"):
+            st.session_state.pop("screener_selection", None)
+            st.rerun()
 
 request = (getattr(manifest, "request", None) or {}) if manifest else {}
 if request:
@@ -233,7 +258,7 @@ else:
             with st.form(f"accept_{i}"):
                 fields = st.columns([1, 1, 1, 1])
                 contracts = fields[0].number_input(
-                    "Contracts", min_value=1, value=int(rec["contracts"]), step=1,
+                    "Contracts", min_value=1, value=max(int(rec["contracts"] or 0), 1), step=1,
                     key=f"c{i}",
                     help="Override if you took a different size than recommended.")
                 fill = fields[1].number_input(
@@ -255,7 +280,8 @@ else:
                         rec, contracts=int(contracts),
                         actual_fill=float(fill) if used_real_fill else None,
                         entry_date=entry,
-                        run_id=manifest.run_id if manifest else None, notes=note)
+                        run_id=rec.get("_run_id") or (manifest.run_id if manifest else None),
+                        notes=note)
                     st.success(result.message)
                 except Exception as exc:
                     st.error(f"{type(exc).__name__}: {exc}")
@@ -330,8 +356,8 @@ if not ranked.empty:
         st.caption(
             "Scored from data on disk, without chains: IV rank/percentile, IV/RV, "
             "liquidity rating, trend state, nearest strong support in expected-move "
-            "units, and drawdown. Weights are in config.yaml → underlying_rank and are "
-            "**not yet validated** (Phase 14). Events and capital are gates, not "
+            "units, and drawdown. Weights are in config.yaml → underlying_rank; the Phase 14 "
+            "calibration (Validation page) backs the IV-rank component only. Events and capital are gates, not "
             "penalties: an excluded name says why.")
         only_eligible = st.toggle("Only eligible names", value=True)
         view = ranked[ranked["eligible"]] if only_eligible else ranked

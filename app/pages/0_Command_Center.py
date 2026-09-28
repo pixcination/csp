@@ -31,22 +31,7 @@ from core.paths import load_config, load_universe  # noqa: E402
 
 st.set_page_config(page_title="Command Center", layout="wide")
 
-BANNER_STYLE = {
-    "ok": ("#0B6B62", "#E1EFEC"),
-    "info": ("#0B6B62", "#E1EFEC"),
-    "warn": ("#8A6410", "#F6EEDC"),
-    "error": ("#A6382A", "#F6E5E2"),
-}
-
-
-def banner(severity: str, message: str, title: str = "") -> None:
-    fg, bg = BANNER_STYLE.get(severity, BANNER_STYLE["info"])
-    st.markdown(
-        f"""<div style="border-left:4px solid {fg};background:{bg};
-             padding:.85rem 1.1rem;border-radius:4px;margin-bottom:1rem;">
-          {'<strong style="color:' + fg + ';">' + title + '</strong><br>' if title else ''}
-          <span style="color:#14201E;font-size:.92rem;line-height:1.55;">{message}</span>
-        </div>""", unsafe_allow_html=True)
+from app.components.status import banner  # noqa: E402
 
 
 # --- 1. Status -------------------------------------------------------------

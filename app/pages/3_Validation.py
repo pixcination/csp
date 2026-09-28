@@ -298,3 +298,54 @@ try:
                 st.markdown(f"- {caveat}")
 except Exception as exc:
     st.caption(f"Could not read the probability-engine validation: {exc}")
+
+# --- 7. Ranking-weight calibration (Phase 14) ---------------------------------
+
+st.divider()
+st.subheader("Underlying ranking: which components predict outcomes?")
+st.caption("From `python scripts/calibrate_rank_weights.py` (analytics/rank_calibration.py). "
+           "On a shared calendar, each name gets a synthetic put 1 expected move out "
+           "(IV = RV × 1.15). The table shows the mean cross-sectional rank correlation (IC) "
+           "between a component's score on the entry date and the share of premium kept at "
+           "expiry. Positive means a higher score went with keeping more.")
+try:
+    import json
+
+    from core.paths import validation_dir
+    folder = validation_dir()
+    found = sorted(folder.glob("rank_calibration_ic_*d.csv"))
+    if not found:
+        st.caption("Not run yet.")
+    for path in found:
+        horizon = path.stem.rsplit("_", 1)[-1]
+        ic = pd.read_csv(path)
+        meta_path = folder / f"rank_calibration_{horizon}.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+        st.markdown(f"**{horizon.removesuffix('d')} trading days** · {meta.get('symbols', '?')} names, "
+                    f"{meta.get('dates', '?')} dates, {meta.get('entries', '?')} entries, "
+                    f"breach rate {meta.get('breach_rate', float('nan')):.1%}")
+        st.dataframe(ic, hide_index=True, width="stretch",
+                     column_config={
+                         "mean_ic": st.column_config.NumberColumn("Mean IC", format="%.3f"),
+                         "t_stat": st.column_config.NumberColumn("t", format="%.1f"),
+                         "hit_rate": st.column_config.NumberColumn("IC > 0", format="percent"),
+                         "tercile_spread": st.column_config.NumberColumn(
+                             "Top − bottom tercile (premium kept)", format="%.2f")})
+        if meta.get("suggested_weights"):
+            st.caption("Suggested weights (untestable components keep the default's share): "
+                       + ", ".join(f"{k} {v:.2f}" for k, v in meta["suggested_weights"].items()))
+    with st.expander("What this can and cannot show"):
+        st.markdown(
+            "- **iv_rank is a proxy here**: the percentile of 20-day realised vol within its "
+            "trailing year, because no IV history exists before 2026.\n"
+            "- **support is a proxy**: the nearest daily moving average below spot. The live "
+            "component uses only *strong* levels, and strength comes from a full-history "
+            "study that would leak the future.\n"
+            "- **iv_rv and liquidity cannot be tested**: with IV proxied from RV the ratio is "
+            "constant, and only today's liquidity rating exists.\n"
+            "- A preset's IC here covers only its testable components.\n"
+            "- The trade is priced at a fixed premium over RV, so this measures whether a name "
+            "moved *less than its recent vol implied*. It cannot reward finding rich implied "
+            "vol.")
+except Exception as exc:
+    st.caption(f"Could not read the ranking calibration: {exc}")

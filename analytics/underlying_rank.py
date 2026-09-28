@@ -32,8 +32,12 @@ page, or the request's own mapping)
 
 A component with no data is dropped and the rest renormalised, so a name is
 not punished for a missing feed; `coverage` reports the share of total weight
-that had data. **The weights are a starting point, not validated** -- Phase 14
-calibrates them against outcomes. Every row keeps its component breakdown.
+that had data. Every row keeps its component breakdown. **Calibration (Phase
+14, analytics/rank_calibration.py):** point-in-time over 8 years and 67 names,
+only iv_rank (through an RV-percentile proxy) and weakly drawdown predicted the
+share of premium a 1-EM short put kept; trend and support ICs were ~0; iv_rv
+and liquidity cannot be tested. The `calibrated` preset follows that; the
+default preset is unchanged pending Tom's decision.
 
 GATES, NOT PENALTIES
 --------------------

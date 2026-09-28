@@ -17,6 +17,9 @@ overridden (deleting the override restores the default).
       my_mix: {iv_rank: 0.3, iv_rv: 0.3, liquidity: 0.2, trend: 0.1,
                support: 0.05, drawdown: 0.05}
 
+    scan_presets:                # Screener requests saved by name (Phase 14)
+      weekly_roth: {strategies: [csp], dte_min: 5, dte_max: 10, ...}
+
 A profile overrides keys of `account:`; anything it leaves out is inherited.
 """
 from __future__ import annotations
@@ -187,6 +190,59 @@ def save_weight_preset(name: str, weights: dict) -> str:
 def delete_weight_preset(name: str) -> bool:
     data = load()
     presets = data.get("ranking_weight_presets") or {}
+    if name not in presets:
+        return False
+    del presets[name]
+    _write(data)
+    return True
+
+
+# --- Saved scan requests (Phase 14) --------------------------------------------------
+# The Screener's input form saves a whole ScanRequest under a name:
+#
+#     scan_presets:
+#       weekly_csp_roth: {strategies: [csp], dte_min: 5, dte_max: 10, ...}
+#
+# The request files in examples/ are offered alongside as read-only presets.
+
+def scan_presets() -> dict[str, dict]:
+    """Saved requests by name (user file), each a ScanRequest dict."""
+    return {name: dict(fields or {}) for name, fields in
+            (load().get("scan_presets") or {}).items()}
+
+
+def example_requests() -> dict[str, dict]:
+    """The shipped request files in examples/, by file stem."""
+    import json
+
+    from core.paths import project_root
+    out = {}
+    for file in sorted((project_root() / "examples").glob("*.json")):
+        try:
+            out[file.stem] = json.loads(file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def save_scan_preset(name: str, request: dict) -> str:
+    """Validate through ScanRequest before writing; returns the stored name."""
+    from analytics.scan_request import RequestError, ScanRequest
+    name = _check_name(name)
+    try:
+        fields = ScanRequest.from_dict(dict(request)).to_dict()
+    except RequestError as exc:
+        raise SettingsError(str(exc)) from exc
+    fields["name"] = fields.get("name") or name
+    data = load()
+    data.setdefault("scan_presets", {})[name] = fields
+    _write(data)
+    return name
+
+
+def delete_scan_preset(name: str) -> bool:
+    data = load()
+    presets = data.get("scan_presets") or {}
     if name not in presets:
         return False
     del presets[name]

@@ -1,7 +1,9 @@
 """
-Shared Plotly chart builders. Written for the (now retired, see legacy/)
-Ticker Detail page; to be generalised to multi-leg positions for the Trade
-Detail page (Phase 14 -- inventory in legacy/README.md). Every chart pulls
+Shared Plotly chart builders. The first half was written for the (now
+retired, see legacy/) single-leg Ticker Detail page; the Trade Detail builders
+at the end (Phase 14) take any `Position` -- several strike lines, T+n payoff
+curves, Greeks as small multiples, price x IV heatmap, chain OI with the legs
+hatched. Every chart pulls
 its colors from app/theme.py rather than Plotly defaults, and follows the
 dataviz skill's mark specs (thin lines, direct labels over legends where a
 chart has <=4 series, status colors reserved for pass/fail-type meaning).
@@ -10,7 +12,9 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-from app.theme import CATEGORICAL, CHART_SURFACE, STATUS, PLOTLY_TEMPLATE, MUTED_INK
+from app.theme import (BASELINE as BASELINE_INK, CATEGORICAL, CHART_SURFACE,
+                       DIVERGING_MIDPOINT, DIVERGING_NEGATIVE, DIVERGING_POSITIVE, MUTED_INK,
+                       PLOTLY_TEMPLATE, PRIMARY_INK, SECONDARY_INK, STATUS)
 from analytics.options_math import bs_price_greeks, expected_move
 
 
@@ -267,4 +271,268 @@ def levels_chart(frame: pd.DataFrame, levels: list[tuple[str, str]],
     fig = _apply_layout(fig, height=460)
     fig.update_layout(legend=dict(orientation="h", y=1.08, x=0),
                       margin=dict(l=50, r=90, t=40, b=40))
+    return fig
+
+
+# --- Trade Detail builders (Phase 14): any Position, any number of legs ------------
+
+# Leg identity takes categorical red (short: the downside leg) and violet
+# (long); status colours stay reserved for state. MA overlays on the price
+# chart therefore use aqua, yellow and magenta only.
+LEG_COLORS = {"short": CATEGORICAL[5], "long": CATEGORICAL[4]}
+MA_HUES = [CATEGORICAL[1], CATEGORICAL[2], CATEGORICAL[6]]
+MODEL_COLORS = {"G": CATEGORICAL[0], "H": CATEGORICAL[1], "T": CATEGORICAL[2],
+                "blend": CATEGORICAL[5]}
+
+
+def _style_axes(fig: go.Figure) -> go.Figure:
+    """The template styles only the first axis pair; subplots need every axis."""
+    axis = PLOTLY_TEMPLATE["layout"]["xaxis"]
+    fig.update_xaxes(**axis)
+    fig.update_yaxes(**axis)
+    return fig
+
+
+def _money(v: float) -> str:
+    return f"-${abs(v):,.0f}" if v < 0 else f"${v:,.0f}"
+
+
+def _vline(fig: go.Figure, x, label: str, color: str, dash: str = "dot",
+           position: str = "top") -> None:
+    """Vertical line plus label as separate shape/annotation (add_vline's
+    annotation maths fails on datetime axes -- see price_vol_chart)."""
+    x_val = pd.Timestamp(x).to_pydatetime()
+    fig.add_shape(type="line", x0=x_val, x1=x_val, y0=0, y1=1, yref="paper",
+                  line=dict(color=color, width=1, dash=dash))
+    if label:
+        fig.add_annotation(x=x_val, y=1 if position == "top" else 0, yref="paper",
+                           yanchor="bottom" if position == "top" else "top",
+                           text=label, showarrow=False, font=dict(color=MUTED_INK, size=10))
+
+
+def trade_price_chart(frame: pd.DataFrame, ma_columns: list[tuple[str, str]],
+                      strikes: list[tuple[str, float, str]],
+                      levels: pd.DataFrame | None = None,
+                      cone: pd.DataFrame | None = None,
+                      events: list[tuple] | None = None,
+                      lookback: int = 180, title: str = "") -> go.Figure:
+    """Candles with MA overlays, respected levels, the trade's strike lines,
+    the IV and straddle expected-move cones to expiry and event markers.
+
+    `strikes` = [(label, price, "short"|"long")]; `levels` = support table rows
+    (level_id, level, strong); `cone` from trade_detail.em_cone;
+    `events` = [(date, label)].
+    """
+    view = frame.tail(lookback)
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=view["date"], open=view["open"], high=view["high"], low=view["low"],
+        close=view["close"], name="Price",
+        increasing=dict(line=dict(color=CATEGORICAL[0], width=1), fillcolor=CATEGORICAL[0]),
+        decreasing=dict(line=dict(color=MUTED_INK, width=1), fillcolor=MUTED_INK)))
+    for i, (label, column) in enumerate(ma_columns[:3]):
+        if column in view:
+            fig.add_trace(go.Scatter(x=view["date"], y=view[column], name=label,
+                                     line=dict(color=MA_HUES[i], width=1.5),
+                                     hovertemplate="%{y:,.2f}"))
+    if cone is not None and not cone.empty:
+        for name, color, dash in (("iv", CATEGORICAL[7], "dash"),
+                                  ("straddle", CATEGORICAL[3], "dot")):
+            if f"{name}_upper" not in cone:
+                continue
+            for side in ("upper", "lower"):
+                fig.add_trace(go.Scatter(
+                    x=cone["date"], y=cone[f"{name}_{side}"],
+                    name=f"EM cone ({name})", legendgroup=name, showlegend=side == "upper",
+                    line=dict(color=color, width=1.5, dash=dash),
+                    hovertemplate=f"{name} EM {side}: %{{y:,.2f}}<extra></extra>"))
+    if levels is not None and not levels.empty:
+        for _, lv in levels.iterrows():
+            strong = bool(lv.get("strong"))
+            fig.add_hline(y=float(lv["level"]),
+                          line=dict(color=STATUS["good"] if strong else BASELINE_INK,
+                                    width=1.5 if strong else 1,
+                                    dash="solid" if strong else "dot"),
+                          annotation_text=f"{lv['level_id']}{' (strong)' if strong else ''}",
+                          annotation_position="bottom left",
+                          annotation_font=dict(color=MUTED_INK, size=10))
+    for label, price, leg in strikes:
+        fig.add_hline(y=price, line=dict(color=LEG_COLORS.get(leg, STATUS["warning"]),
+                                         width=2, dash="dash"),
+                      annotation_text=label, annotation_position="top right",
+                      annotation_font=dict(color=SECONDARY_INK, size=11))
+    for when, label in events or []:
+        when = pd.Timestamp(when)
+        if when >= pd.Timestamp(view["date"].iloc[0]):
+            _vline(fig, when, label, MUTED_INK)
+    if cone is not None and not cone.empty:
+        _vline(fig, cone["date"].iloc[-1], "Expiry", SECONDARY_INK, dash="dash",
+               position="bottom")
+    fig.update_layout(xaxis_rangeslider_visible=False, yaxis_title="Price")
+    fig = _apply_layout(fig, title, height=540)
+    fig.update_layout(legend=dict(orientation="h", y=-0.08, x=0), hovermode="x",
+                      margin=dict(l=50, r=30, t=40, b=60))
+    return fig
+
+
+def terminal_distribution_chart(dists: dict, strikes: list[tuple[str, float, str]],
+                                spot: float, em: float | None = None) -> go.Figure:
+    """Empirical vs lognormal terminal price densities (one axis, two series
+    with a legend), strikes and +/-1 EM marked."""
+    fig = go.Figure()
+    series = [("empirical", CATEGORICAL[0]), ("lognormal", CATEGORICAL[2])]
+    present = [dists[m] for m, _ in series if m in dists]
+    values = np.concatenate(present) if present else np.array([spot * 0.9, spot * 1.1])
+    lo, hi = np.percentile(values, [0.5, 99.5])
+    bins = np.linspace(lo, hi, 90)
+    centers = (bins[:-1] + bins[1:]) / 2
+    for model, color in series:
+        if model not in dists:
+            continue
+        density, _ = np.histogram(dists[model], bins=bins, density=True)
+        fig.add_trace(go.Scatter(x=centers, y=density, mode="lines",
+                                 name=dists.get("label", {}).get(model, model),
+                                 line=dict(color=color, width=2),
+                                 hovertemplate="$%{x:,.2f}: %{y:.4f}<extra>" + model + "</extra>"))
+    for label, price, leg in strikes:
+        fig.add_vline(x=price, line=dict(color=LEG_COLORS.get(leg, STATUS["warning"]),
+                                         width=2, dash="dash"),
+                      annotation_text=label,
+                      annotation_position="top left" if leg == "long" else "top right",
+                      annotation_font=dict(color=SECONDARY_INK, size=11))
+    fig.add_vline(x=spot, line=dict(color=SECONDARY_INK, width=1),
+                  annotation_text=f"Spot ${spot:,.2f}", annotation_position="top right",
+                  annotation_font=dict(color=SECONDARY_INK, size=11))
+    if em:
+        for k in (-1, 1):
+            fig.add_vline(x=spot + k * em, line=dict(color=MUTED_INK, width=1, dash="dot"),
+                          annotation_text=f"{k:+d} EM", annotation_position="bottom right",
+                          annotation_font=dict(color=MUTED_INK, size=10))
+    fig.update_layout(xaxis_title="Price at expiry", yaxis_title="Density")
+    fig = _apply_layout(fig, height=400)
+    fig.update_layout(legend=dict(orientation="h", y=1.1, x=0), hovermode="closest")
+    return fig
+
+
+def payoff_chart(frame: pd.DataFrame, spot: float, breakevens: list[float],
+                 strikes: list[tuple[str, float, str]]) -> go.Figure:
+    """P&L at expiry and at T+n for any number of legs (from
+    trade_detail.payoff_frame)."""
+    fig = go.Figure()
+    curves = list(dict.fromkeys(frame["curve"]))
+    hues = [CATEGORICAL[0], CATEGORICAL[1], CATEGORICAL[2], CATEGORICAL[4]]
+    for i, curve in enumerate(curves):
+        part = frame[frame["curve"] == curve]
+        fig.add_trace(go.Scatter(
+            x=part["price"], y=part["pnl"], mode="lines", name=curve,
+            line=dict(color=hues[i % 4], width=2.5 if curve == "expiry" else 1.5,
+                      dash="solid" if curve == "expiry" else "dash"),
+            hovertemplate="$%{x:,.2f}: $%{y:,.0f}<extra>" + curve + "</extra>"))
+    fig.add_hline(y=0, line=dict(color=BASELINE_INK, width=1))
+    for b in breakevens:
+        fig.add_vline(x=b, line=dict(color=STATUS["serious"], width=1.5, dash="dot"),
+                      annotation_text=f"Breakeven ${b:,.2f}", annotation_position="bottom left",
+                      annotation_font=dict(color=SECONDARY_INK, size=10))
+    for label, price, leg in strikes:
+        fig.add_vline(x=price, line=dict(color=LEG_COLORS.get(leg, STATUS["warning"]),
+                                         width=1, dash="dash"),
+                      annotation_text=label,
+                      annotation_position="top left" if leg == "long" else "top right",
+                      annotation_font=dict(color=MUTED_INK, size=10))
+    fig.add_vline(x=spot, line=dict(color=SECONDARY_INK, width=1),
+                  annotation_text=f"Spot ${spot:,.2f}", annotation_position="top right",
+                  annotation_font=dict(color=SECONDARY_INK, size=11))
+    fig.update_layout(xaxis_title="Underlying price", yaxis_title="P&L ($, before fees)")
+    fig = _apply_layout(fig, height=420)
+    fig.update_layout(legend=dict(orientation="h", y=1.1, x=0), hovermode="x unified")
+    return fig
+
+
+def prob_curves_chart(curves: pd.DataFrame) -> go.Figure:
+    """P(reach X% of max profit by day d) -- one small multiple per target,
+    one line per model, shared 0-1 y scale."""
+    from plotly.subplots import make_subplots
+    # "expire worthless" is only reachable at expiry: a step, not a curve
+    targets = sorted(int(t) for t in curves["target"].unique() if int(t) < 100)
+    fig = make_subplots(rows=1, cols=len(targets), shared_yaxes=True,
+                        subplot_titles=[("expire worthless" if t == 100 else f"reach {t}%")
+                                        for t in targets])
+    for j, target in enumerate(targets, start=1):
+        part = curves[curves["target"] == target]
+        for model in ("G", "H", "T"):
+            m = part[part["model"] == model].sort_values("day")
+            if m.empty:
+                continue
+            fig.add_trace(go.Scatter(
+                x=m["day"], y=m["prob"], mode="lines", name=model, legendgroup=model,
+                showlegend=j == 1, line=dict(color=MODEL_COLORS[model], width=2),
+                hovertemplate="day %{x:.0f}: %{y:.0%}<extra>" + model + "</extra>"),
+                row=1, col=j)
+    fig = _style_axes(_apply_layout(fig, height=340))
+    fig.update_yaxes(range=[0, 1], tickformat=".0%")
+    fig.update_xaxes(title_text="calendar days")
+    fig.update_layout(legend=dict(orientation="h", y=-0.3, x=0), hovermode="closest",
+                      margin=dict(l=50, r=30, t=40, b=80))
+    return fig
+
+
+def greeks_time_chart(frame: pd.DataFrame) -> go.Figure:
+    """Net position Greeks from entry to expiry, spot and IV held -- small
+    multiples, since each Greek has its own scale (never a dual axis)."""
+    from plotly.subplots import make_subplots
+    specs = [("delta", "Delta (shares)", CATEGORICAL[0]),
+             ("theta", "Theta ($/day)", CATEGORICAL[4]),
+             ("gamma", "Gamma", CATEGORICAL[6]), ("vega", "Vega ($/vol pt)", CATEGORICAL[7])]
+    fig = make_subplots(rows=1, cols=4, subplot_titles=[s[1] for s in specs])
+    for j, (column, label, color) in enumerate(specs, start=1):
+        fig.add_trace(go.Scatter(x=frame["day"], y=frame[column], mode="lines", name=label,
+                                 line=dict(color=color, width=2), showlegend=False,
+                                 hovertemplate="day %{x}: %{y:,.2f}<extra>" + column
+                                               + "</extra>"),
+                      row=1, col=j)
+    fig = _style_axes(_apply_layout(fig, height=300))
+    fig.update_xaxes(title_text="days after entry")
+    return fig
+
+
+def scenario_heatmap(grid: pd.DataFrame) -> go.Figure:
+    """P&L over spot move x IV shift. Diverging: red loss, blue gain, gray 0,
+    every cell labelled with its value."""
+    table = grid.pivot_table(index="iv_shift", columns="move", values="pnl")
+    bound = float(np.nanmax(np.abs(table.values))) or 1.0
+    fig = go.Figure(go.Heatmap(
+        z=table.values, x=[f"{m:+.0%}" for m in table.columns],
+        y=[f"{s * 100:+.0f} vol" for s in table.index],
+        zmin=-bound, zmax=bound, zmid=0,
+        colorscale=[[0, DIVERGING_NEGATIVE], [0.5, DIVERGING_MIDPOINT],
+                    [1, DIVERGING_POSITIVE]],
+        text=[[_money(v) for v in row] for row in table.values], texttemplate="%{text}",
+        textfont=dict(size=10, color=PRIMARY_INK),
+        hovertemplate="spot %{x}, IV %{y}: %{text}<extra></extra>",
+        colorbar=dict(title="P&L $")))
+    fig.update_layout(xaxis_title="Spot move", yaxis_title="IV shift",
+                      xaxis_type="category", yaxis_type="category")
+    fig = _apply_layout(fig, height=360)
+    fig.update_layout(hovermode="closest")
+    return fig
+
+
+def chain_liquidity_chart(window: pd.DataFrame) -> go.Figure:
+    """Put open interest by strike; the trade's legs highlighted by colour
+    AND hatching, so identity is never colour alone."""
+    fig = go.Figure()
+    colors = [LEG_COLORS.get(leg, CATEGORICAL[0]) for leg in window["leg"]]
+    patterns = ["/" if leg else "" for leg in window["leg"]]
+    fig.add_trace(go.Bar(
+        x=window["strike"], y=window["open_interest"], name="Put OI",
+        marker=dict(color=colors, pattern_shape=patterns,
+                    line=dict(color=CHART_SURFACE, width=2)),
+        customdata=np.stack([window["volume"].fillna(0).to_numpy(float),
+                             window["width"].to_numpy(float)], axis=1),
+        hovertemplate="$%{x:g}: OI %{y:,.0f}, volume %{customdata[0]:,.0f}, "
+                      "bid/ask width $%{customdata[1]:.2f}<extra></extra>"))
+    fig.update_layout(xaxis_title="Strike (hatched = the trade's legs)",
+                      yaxis_title="Open interest", showlegend=False)
+    fig = _apply_layout(fig, height=320)
+    fig.update_layout(hovermode="closest")
     return fig
