@@ -42,6 +42,7 @@ PROFILE_FIELDS: dict[str, tuple] = {
     "max_open_positions": (int, 1, 500, "Max open positions"),
     "require_cash_secured": (bool, None, None, "Cash-secured puts only"),
     "spread_approval": (bool, None, None, "Spreads approved"),
+    "naked_approval": (bool, None, None, "Naked options approved (margin accounts)"),
     "allowed_strategies": (list, None, None, "Allowed strategies"),
     "account_type": (str, None, None, "Account type"),
 }

@@ -491,6 +491,23 @@ account_profiles:
   default:
     allowed_strategies: [csp, pcs, covered_call]
     spread_approval: true
+    naked_approval: false             # Phase 16: naked specs (strangles) need this AND account_type: margin
+
+# --- Multi-strategy recommender (Phase 16, analytics/recommender.py) -----------
+# Specs live in strategies/*.yaml. A ticker's conditions: IV regime from the
+# TastyTrade IV rank (below low_below = low, above high_above = high), the
+# technicals cache's trend state, and earnings inside the trade.
+recommender:
+  iv_regime: {low_below: 0.25, high_above: 0.50}
+  n_paths: 10000                      # probability-engine paths per trade (the Screener uses prob_engine.n_paths)
+
+# --- Buying power per strategy class (Phase 16, analytics/margin.py) -----------
+# Naked short option requirement per share: max(20% x underlying - OTM + premium,
+# 10% x (strike for puts / underlying for calls) + premium). A floor: brokers
+# may charge more.
+margin:
+  naked_pct_underlying: 0.20
+  naked_min_pct: 0.10
 
 # --- Options analytics and PCS construction (Phase 12) -----------------------
 # analytics/expected_move.py. tastytrade = what the tastytrade platform

@@ -70,6 +70,7 @@ STAGES = [
     ("probabilities", "Probability engine"),
     ("wheel", "Wheel management"),
     ("portfolio", "Portfolio construction"),
+    ("strategies", "Strategy recommender"),
 ]
 
 
@@ -615,6 +616,26 @@ def _stage_wheel(reporter: BaseReporter, manifest: RunManifest) -> dict:
     return out
 
 
+def _stage_strategies(reporter: BaseReporter, manifest: RunManifest, tickers: list[str],
+                      request) -> dict:
+    """Phase 16: the multi-strategy recommender over the names with chains --
+    the request's `specs` on every ticker, and with `recommend` every spec
+    whose entry conditions the ticker meets."""
+    from analytics import recommender
+    from pipeline import results as run_results
+    out = recommender.run(list(tickers), request=request, spec_ids=request.specs or None,
+                          recommend=request.recommend, reporter=reporter)
+    sheet = out["sheet"]
+    written = run_results.write_strategies(manifest.run_id, sheet, out["conditions"])
+    accepted = int(sheet["accepted"].sum()) if not sheet.empty else 0
+    for _, row in sheet.head(5).iterrows():
+        reporter.log(f"  {row['ticker']} {row['label']}: {row['legs']} -- blended "
+                     f"{row.get('headline_policy')} EV ${row.get('headline_ev') or 0:,.0f}"
+                     + ("" if row["accepted"] else " (rejected)"))
+    return {"positions": int(len(sheet)), "accepted": accepted,
+            "seconds": round(out["seconds"], 1), "persisted": written}
+
+
 def _tickers_with_positions() -> set[str]:
     """Tickers with an open paper-book position (chains get a wider window)."""
     try:
@@ -655,6 +676,11 @@ def _evaluate_open_positions(reporter: BaseReporter) -> list[dict]:
         ticker = str(row["ticker"]).upper()
         strategy = row.get("strategy") or "csp"
         if strategy not in ("csp", "put", "pcs"):
+            decision = _evaluate_spec_row(row, legs, today, book, paper)
+            if decision is not None:
+                out.append(decision)
+                if decision.get("urgency") != "routine":
+                    reporter.log(f"{decision['urgency'].upper()}: {decision['headline']}")
             continue
         chain, under = chains.load_chain(ticker)
         spot = chains.spot_from_underlying(under)
@@ -708,6 +734,39 @@ def _evaluate_open_positions(reporter: BaseReporter) -> list[dict]:
         if decision.urgency != "routine":
             reporter.log(f"{decision.urgency.upper()}: {decision.headline}")
     return out
+
+
+def _evaluate_spec_row(row, legs, today, book, paper) -> dict | None:
+    """Phase 16: an open strategy-spec position, managed by its spec's exit
+    block (`exit_rules.evaluate_spec_position`); its mark is recorded."""
+    from analytics import strategy_spec
+    from analytics.exit_rules import OpenSpecPosition, evaluate_spec_position
+    from data_sources import chains
+    ticker = str(row["ticker"]).upper()
+    try:
+        spec = strategy_spec.load_all().get(row["strategy"])
+    except Exception:
+        spec = None
+    chain, under = chains.load_chain(ticker)
+    spot = chains.spot_from_underlying(under)
+    mine = legs[legs["position_id"] == row["id"]]
+    marked = book.mark_position(row.to_dict(), mine, chain, spot, today)
+    if marked["mark"] is None:
+        return None
+    paper.record_mark(int(row["id"]), marked["mark"], spot, today, source="pipeline")
+    credit = float(row["actual_fill"] if pd.notna(row["actual_fill"]) else row["modelled_fill"])
+    front = min(pd.Timestamp(e).date() for e in mine["expiration"])
+    best = row.get("max_profit_share")
+    position = OpenSpecPosition(
+        ticker=ticker, label=spec.label if spec else row["strategy"],
+        contracts=int(row["contracts"]), entry_credit=credit,
+        current_mark=float(marked["mark"]),
+        max_profit=float(best) if best is not None and pd.notna(best) else abs(credit),
+        calendar_days_left=max((front - today).days, 0),
+        entry_dte_calendar=(front - pd.Timestamp(row["entry_date"]).date()).days,
+        legs=tuple((l["side"], int(l["qty"] or 1)) for _, l in mine.iterrows()))
+    decision = evaluate_spec_position(position, spec.exit if spec else {})
+    return {"position_id": int(row["id"]), "strategy": row["strategy"], **decision.to_dict()}
 
 
 def _mark_for(chain, strike: float, expiration) -> float | None:
@@ -804,6 +863,9 @@ def run(tickers: list[str] | None = None, quick: bool = False,
                           or t in tradable or t not in registered]
             guarded("analyse", _stage_analyse, reporter, manifest, analysable,
                     request, holder["ranked"])
+            if request.specs or request.recommend:
+                guarded("strategies", _stage_strategies, reporter, manifest, targets,
+                        request)
 
     manifest.finished_at = dt.datetime.now().isoformat(timespec="seconds")
     manifest.elapsed_seconds = (dt.datetime.now() - started).total_seconds()

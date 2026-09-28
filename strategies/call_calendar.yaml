@@ -1,0 +1,22 @@
+id: call_calendar
+label: Long call calendar
+family: neutral volatility
+description: Sell a 14-DTE ATM call, buy the same strike at 21 DTE. Profits if the stock pins near the strike and back-month IV holds.
+margin_class: defined_risk
+event_policy_as: pcs
+expirations:
+  front: {dte_target: 14, tolerance: 4}
+  back: {dte_target: 21, tolerance: 4}
+legs:
+  - {name: short_call, type: call, side: short, expiration: front, select: {atm: true}}
+  - {name: long_call, type: call, side: long, expiration: back, select: {same_strike_as: short_call}}
+entry:
+  iv_regime: [low, mid]
+  trend: [range]
+  earnings: block
+exit:
+  profit_target_pct: 25
+  loss_stop_multiple: 0.5
+notes:
+  - MODEL RISK. At the front expiry the back call is valued by Black-Scholes at its own entry IV (sticky strike); a fall in back-month IV is the calendar's main risk and is not modelled.
+  - A debit trade; the loss stop is a fraction of the debit.

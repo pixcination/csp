@@ -1,0 +1,24 @@
+id: iron_condor
+label: Iron condor
+family: neutral premium
+description: A bull put spread and a bear call spread on the same expiry. Profits if the stock stays between the short strikes.
+margin_class: defined_risk
+event_policy_as: pcs
+expirations:
+  front: {dte_target: 45, tolerance: 14}
+legs:
+  - {name: short_put, type: put, side: short, expiration: front, select: {delta: -0.16}}
+  - {name: long_put, type: put, side: long, expiration: front, select: {offset_from: short_put, width_pct: 3}}
+  - {name: short_call, type: call, side: short, expiration: front, select: {delta: 0.16}}
+  - {name: long_call, type: call, side: long, expiration: front, select: {offset_from: short_call, width_pct: 3}}
+entry:
+  iv_regime: [mid, high]
+  trend: [range]
+  earnings: block
+  min_credit: 0.20
+exit:
+  profit_target_pct: 50
+  loss_stop_multiple: 2.0
+  time_stop_dte: 21
+notes:
+  - Buying power is the wider side's max loss; only one side can finish in the money.

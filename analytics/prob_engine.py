@@ -319,11 +319,16 @@ def _fees(spec: TradeSpec) -> tuple[float, float, np.ndarray]:
     from analytics import costs
     n = max(int(spec.contracts), 1)
     legs = spec.position.legs
+    options = [l for l in legs if not getattr(l, "is_stock", False)]
     entry = costs.legs_open([("sell" if l.side == "short" else "buy", n * l.qty)
-                             for l in legs]).total
+                             for l in options]).total
+    # Phase 16: buying the shares of a covered position is an entry cost too.
+    entry += sum(costs.stock_buy(100 * n * l.qty).total
+                 for l in legs if getattr(l, "is_stock", False) and l.side == "long")
     close = costs.legs_close([("buy" if l.side == "short" else "sell", n * l.qty)
-                              for l in legs]).total
-    per_leg = np.array([costs.assignment(n * l.qty).total for l in legs])
+                              for l in options]).total
+    per_leg = np.array([0.0 if getattr(l, "is_stock", False)
+                        else costs.assignment(n * l.qty).total for l in legs])
     return entry, close, per_leg
 
 
@@ -341,7 +346,15 @@ def evaluate(spec: TradeSpec, log_returns: np.ndarray, targets: list[int],
 
     value = np.zeros_like(spot_paths)
     short_delta = None
-    for leg in pos.legs:
+    offsets = pos.expiry_offsets() if hasattr(pos, "expiry_offsets") else [0] * len(pos.legs)
+    for leg, offset in zip(pos.legs, offsets):
+        if getattr(leg, "is_stock", False):
+            # Phase 16: stock legs, net of the risk-free return the share
+            # capital would have earned in cash -- otherwise G's risk-neutral
+            # drift shows up as "edge" on every covered call.
+            carry = spec.spot * (np.exp(cfg.rate * cal_elapsed / 365.0) - 1.0)
+            value += leg.sign * leg.qty * (spot_paths - carry)
+            continue
         iv0 = leg.iv if leg.iv and leg.iv > 0 else 0.3
         iv = np.full(n_steps, iv0)
         if cfg.iv_reversion_half_life_days and spec.rv:
@@ -349,7 +362,14 @@ def evaluate(spec: TradeSpec, log_returns: np.ndarray, targets: list[int],
             iv = spec.rv + (iv0 - spec.rv) * decay
         if spec.event_day is not None and cfg.earnings_crush:
             iv = np.where(cal_elapsed >= spec.event_day, iv * (1 - cfg.earnings_crush), iv)
-        price, d1 = bs_price_grid(spot_paths, leg.strike, tau, iv, cfg.rate,
+        # A leg expiring after the front keeps `offset` more days (calendars);
+        # when the front expires it is valued at the forward vol the entry
+        # term structure implies (strategies.base.Position.later_leg_vol).
+        leg_tau = tau + offset / 365.0 if offset else tau
+        if offset:
+            iv = np.array(iv, dtype=float, copy=True)
+            iv[-1] = pos.later_leg_vol(leg, offset, spec.dte_calendar) * (iv[-1] / iv0)
+        price, d1 = bs_price_grid(spot_paths, leg.strike, leg_tau, iv, cfg.rate,
                                   leg.option_type, log_spot)
         value += leg.sign * leg.qty * price
         if leg.side == "short" and short_delta is None and leg.option_type == "put":
@@ -360,20 +380,37 @@ def evaluate(spec: TradeSpec, log_returns: np.ndarray, targets: list[int],
     max_profit = pos.max_profit
     s_t = spot_paths[:, -1]
     entry, close_fee, leg_fee = _fees(spec)
-    itm = np.stack([(l.intrinsic(s_t) > 0) for l in pos.legs], axis=1)
+    options = [(l, o) for l, o in zip(pos.legs, offsets) if not getattr(l, "is_stock", False)]
+    # At the front expiry: expiring legs in the money are exercised/assigned;
+    # later legs are closed (a close commission each).
+    itm = np.stack([(l.intrinsic(s_t) > 0) & (o == 0) if not getattr(l, "is_stock", False)
+                    else np.zeros(n_paths, bool) for l, o in zip(pos.legs, offsets)], axis=1)
     expiry_fees = itm.astype(float) @ leg_fee
+    later = [l for l, o in options if o > 0]
+    if later:
+        from analytics import costs
+        n_c = max(int(spec.contracts), 1)
+        expiry_fees = expiry_fees + costs.legs_close(
+            [("buy" if l.side == "short" else "sell", n_c * l.qty) for l in later]).total
 
     out: dict = {"n_paths": n_paths}
     out["pop"] = float(np.mean(pnl[:, -1] > 0))
-    shorts = [l for l in pos.legs if l.side == "short"]
-    longs = [l for l in pos.legs if l.side == "long"]
+    shorts = [l for l, _ in options if l.side == "short"]
+    longs = [l for l, _ in options if l.side == "long"]
     if shorts:
-        k = max(l.strike for l in shorts) if shorts[0].option_type == "put" else min(
-            l.strike for l in shorts)
-        below = spot_paths <= k if shorts[0].option_type == "put" else spot_paths >= k
-        out["p_touch_short"] = float(np.mean(below.any(axis=1)))
-        out["p_short_itm"] = float(np.mean(below[:, -1]))
-    if longs:
+        # Touch / ITM on either side: puts below their highest short strike,
+        # calls above their lowest (an iron condor or strangle has both).
+        put_k = [l.strike for l in shorts if l.option_type == "put"]
+        call_k = [l.strike for l in shorts if l.option_type == "call"]
+        crossed = np.zeros_like(spot_paths, dtype=bool)
+        if put_k:
+            crossed |= spot_paths <= max(put_k)
+        if call_k:
+            crossed |= spot_paths >= min(call_k)
+        out["p_touch_short"] = float(np.mean(crossed.any(axis=1)))
+        out["p_short_itm"] = float(np.mean(crossed[:, -1]))
+    multi = bool(getattr(pos, "multi_expiry", False))
+    if longs and not multi:
         out["p_max_loss"] = float(np.mean(pnl[:, -1] <= -pos.max_loss + 1e-9))
     else:
         out["p_assign"] = out.get("p_short_itm")
@@ -491,6 +528,13 @@ def run_trade(spec: TradeSpec, paths: TickerPaths, targets: list[int],
     years = spec.dte_calendar / 365.0
     short = next((l for l in spec.position.legs if l.side == "short"), spec.position.legs[0])
     vol = short.iv if short.iv and short.iv > 0 else 0.3
+    # Phase 16: short puts AND calls (condors, strangles) -- one lognormal
+    # cannot fit both wings of a skew, so G uses the mean short-leg IV
+    # rather than favouring one side.
+    shorts = [l for l in spec.position.legs if l.side == "short"
+              and not getattr(l, "is_stock", False) and l.iv and l.iv > 0]
+    if len({l.option_type for l in shorts}) > 1:
+        vol = float(np.mean([l.iv for l in shorts]))
     results: dict[str, dict] = {}
     meta: dict[str, dict] = {}
     g = g_log_returns(paths.normals, vol, cfg.rate, years)

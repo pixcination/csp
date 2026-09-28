@@ -117,9 +117,10 @@ def mark_position(position: dict, legs: pd.DataFrame, chain: pd.DataFrame | None
 
     fill = _f(position.get("actual_fill"))
     fill = fill if fill is not None else _f(position.get("modelled_fill")) or 0.0
+    best = _f(position.get("max_profit_share")) or fill      # Phase 16: spec max profit
     out = {"mark": mark if marked else None, "natural": natural if marked else None,
            "unrealized": (fill - mark) * 100.0 * n if marked else None,
-           "profit_pct": (fill - mark) / fill if marked and fill else None,
+           "profit_pct": (fill - mark) / best if marked and best else None,
            "delta_shares": greeks["delta"], "gamma_shares": greeks["gamma"],
            "theta_day": greeks["theta"], "vega": greeks["vega"],
            "greeks_source": "/".join(sorted(sources)) or "none"}

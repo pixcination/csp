@@ -355,3 +355,33 @@ def package_fill(short_bid, short_ask, long_bid, long_ask,
     modelled = min(max(net_mid - frac * half, natural), net_mid)
     return {"net_mid": round(net_mid, 4), "natural": round(natural, 4),
             "modelled": round(modelled, 4), "summed_half_spread": round(half, 4)}
+
+
+def multi_leg_fill(legs: list[dict], fraction: float | None = None) -> dict | None:
+    """Package fill for any number of option legs (Phase 16), generalising
+    `package_fill`: `legs` = [{side, qty, bid, ask}]. Net mid is the credit
+    at mids (negative = a debit); the modelled fill gives up
+    `slippage_fraction_of_half_spread` of the summed half-spreads, never
+    better than the net mid nor worse than the natural (sell at bids, buy at
+    asks). A long leg may be bid at zero; every leg needs an ask."""
+    r = _rates()
+    frac = r["slippage_fraction_of_half_spread"] if fraction is None else fraction
+    net_mid = natural = half = 0.0
+    for leg in legs:
+        bid, ask, qty = leg.get("bid"), leg.get("ask"), int(leg.get("qty") or 1)
+        if ask is None or ask <= 0 or (bid is not None and ask < bid):
+            return None
+        bid = bid if bid is not None else 0.0
+        if leg["side"] == "short" and bid <= 0:
+            return None
+        mid = (bid + ask) / 2.0
+        if leg["side"] == "short":
+            net_mid += qty * mid
+            natural += qty * bid
+        else:
+            net_mid -= qty * mid
+            natural -= qty * ask
+        half += qty * (ask - bid) / 2.0
+    modelled = min(max(net_mid - frac * half, natural), net_mid)
+    return {"net_mid": round(net_mid, 4), "natural": round(natural, 4),
+            "modelled": round(modelled, 4), "summed_half_spread": round(half, 4)}

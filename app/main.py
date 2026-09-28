@@ -33,6 +33,8 @@ pages = [
             icon=":material/filter_alt:", default=True),
     st.Page(str(PAGES_DIR / "9_Trade_Detail.py"), title="Trade Detail",
             icon=":material/query_stats:"),
+    st.Page(str(PAGES_DIR / "10_Strategies.py"), title="Strategies",
+            icon=":material/category:"),
     st.Page(str(PAGES_DIR / "0_Command_Center.py"), title="Command Center",
             icon=":material/bolt:"),
     st.Page(str(PAGES_DIR / "1_Decisions.py"), title="Decisions",

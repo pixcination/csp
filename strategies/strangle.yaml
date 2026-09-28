@@ -1,0 +1,23 @@
+id: strangle
+label: Short strangle
+family: neutral premium
+description: Sell an OTM put and an OTM call with no wings. Undefined risk; margin accounts with naked approval only.
+margin_class: naked
+event_policy_as: pcs
+expirations:
+  front: {dte_target: 45, tolerance: 14}
+legs:
+  - {name: short_put, type: put, side: short, expiration: front, select: {delta: -0.16}}
+  - {name: short_call, type: call, side: short, expiration: front, select: {delta: 0.16}}
+entry:
+  iv_regime: [high]
+  trend: [range]
+  earnings: block
+  min_credit: 0.25
+exit:
+  profit_target_pct: 50
+  loss_stop_multiple: 2.0
+  time_stop_dte: 21
+notes:
+  - Buying power is the broker naked formula (analytics/margin.py), a floor; brokers may charge more.
+  - Max loss is unbounded on the call side; the reported max loss is the grid's (3x the top strike).

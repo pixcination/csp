@@ -35,6 +35,9 @@ MANIFEST = "manifest.json"
 CANDIDATES = "candidates.parquet"
 POSITIONS = "positions.parquet"
 UNDERLYINGS = "underlyings.parquet"
+#: Phase 16 strategy recommender: resolved positions and per-ticker conditions
+STRATEGIES = "strategies.parquet"
+STRATEGY_CONDITIONS = "strategy_conditions.parquet"
 #: Phase 13 probability-engine tables, keyed by trade_id
 PROB_TABLES = {"policies": "prob_policies.parquet", "metrics": "prob_metrics.parquet",
                "curves": "prob_curves.parquet"}
@@ -52,6 +55,8 @@ class RunResults:
     prob_policies: pd.DataFrame = field(default_factory=pd.DataFrame)
     prob_metrics: pd.DataFrame = field(default_factory=pd.DataFrame)
     prob_curves: pd.DataFrame = field(default_factory=pd.DataFrame)
+    strategies: pd.DataFrame = field(default_factory=pd.DataFrame)
+    strategy_conditions: pd.DataFrame = field(default_factory=pd.DataFrame)
     has_full_sheet: bool = False
 
     @property
@@ -211,7 +216,27 @@ def load_run(run_id: str) -> RunResults | None:
             result.underlyings = pd.read_parquet(folder / UNDERLYINGS)
         except Exception:
             pass
+    for attr, file in (("strategies", STRATEGIES), ("strategy_conditions", STRATEGY_CONDITIONS)):
+        if (folder / file).exists():
+            try:
+                setattr(result, attr, pd.read_parquet(folder / file))
+            except Exception:
+                pass
     return result
+
+
+def write_strategies(run_id: str, sheet: pd.DataFrame | None,
+                     conditions: pd.DataFrame | None) -> dict:
+    """Write the Phase 16 recommender's tables beside the run's manifest."""
+    folder = runs_dir() / run_id
+    folder.mkdir(parents=True, exist_ok=True)
+    written = {}
+    for name, frame, file in (("strategies", sheet, STRATEGIES),
+                              ("strategy_conditions", conditions, STRATEGY_CONDITIONS)):
+        if frame is not None and not frame.empty:
+            _parquet_safe(frame).to_parquet(folder / file, index=False)
+            written[name] = len(frame)
+    return written
 
 
 def latest_run(finished_only: bool = True, with_analysis: bool = True) -> RunResults | None:

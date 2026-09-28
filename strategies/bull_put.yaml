@@ -1,0 +1,23 @@
+# Bull put spread (put credit spread) as a spec. The built-in PCS path
+# (analytics/strategies/pcs.py) stays the Screener's; this is the same trade
+# through the generic resolver, so the recommender can weigh it against the rest.
+id: bull_put
+label: Bull put spread
+family: bullish premium
+description: Sell a put, buy a further-OTM put. Profits if the stock stays above the short strike.
+margin_class: defined_risk
+event_policy_as: pcs
+expirations:
+  front: {dte_target: 45, tolerance: 14}
+legs:
+  - {name: short_put, type: put, side: short, expiration: front, select: {delta: -0.20}}
+  - {name: long_put, type: put, side: long, expiration: front, select: {offset_from: short_put, width_pct: 4}}
+entry:
+  iv_regime: [mid, high]
+  trend: [uptrend, range]
+  earnings: block
+  min_credit: 0.10
+exit:
+  profit_target_pct: 50
+  loss_stop_multiple: 2.0
+  time_stop_dte: 21

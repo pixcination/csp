@@ -504,6 +504,84 @@ def spread_roll_candidates(chain: pd.DataFrame, position: OpenSpread,
         .head(limit).reset_index(drop=True)
 
 
+# --- Strategy-spec positions (Phase 16) -----------------------------------------
+#
+# A position opened from a strategy spec (condor, calendar, diagonal...) is
+# managed by the spec's own `exit` block, with the same order and the same
+# net-of-fee rule as a spread. Profit is measured against the position's max
+# profit, and a loss stop against the credit taken in -- or, for a debit
+# trade, against the debit paid (a calendar's `loss_stop_multiple: 0.5`
+# closes when half the debit is gone).
+
+@dataclass(frozen=True)
+class OpenSpecPosition:
+    ticker: str
+    label: str
+    contracts: int
+    entry_credit: float            # net per share; negative for a debit
+    current_mark: float            # net debit to close now, per share (negative = you receive)
+    max_profit: float              # per share
+    calendar_days_left: int        # to the front expiry
+    entry_dte_calendar: int
+    legs: tuple = ()               # ((side, qty), ...) for the close fees
+
+    @property
+    def pnl(self) -> float:
+        return self.entry_credit - self.current_mark
+
+    @property
+    def profit_pct(self) -> float:
+        return self.pnl / self.max_profit if self.max_profit else 0.0
+
+
+def evaluate_spec_position(position: OpenSpecPosition, exit_cfg: dict) -> Decision:
+    """Floor -> loss stop -> profit target (net of fees) -> time stop -> hold."""
+    n = max(position.contracts, 1)
+    legs = position.legs or (("short", 1),)
+    close_fees = costs.legs_close([("buy" if s == "short" else "sell", n * q)
+                                   for s, q in legs]).total
+    open_fees = costs.legs_open([("sell" if s == "short" else "buy", n * q)
+                                 for s, q in legs]).total
+    net_if_closed = position.pnl * 100 * n - open_fees - close_fees
+    min_gain = float(((load_config().get("management", {}) or {}).get("exit", {}) or {})
+                     .get("min_net_gain_to_close_early", 5.0))
+    numbers = {"profit_pct": round(position.profit_pct, 4),
+               "pnl_if_closed": round(net_if_closed, 2)}
+    what = f"{position.ticker} {position.label}"
+    days = position.calendar_days_left
+    basis = abs(position.entry_credit)
+
+    if position.entry_credit > 0 and position.current_mark <= 0.05 and days > 0:
+        return Decision(Action.CLOSE, "routine", f"{what}: take it off, nothing left in it",
+                        f"Closing costs ${position.current_mark:.2f}/share: "
+                        f"${net_if_closed:,.2f} net locked in.", numbers=numbers)
+    k = exit_cfg.get("loss_stop_multiple")
+    if k and basis and -position.pnl >= float(k) * basis:
+        kind = "credit" if position.entry_credit > 0 else "debit"
+        return Decision(Action.CLOSE, "act_now", f"{what}: loss stop hit",
+                        f"The loss is {-position.pnl / basis:.1f}x the {kind} "
+                        f"(${basis:.2f}), past the {float(k):g}x stop: "
+                        f"${net_if_closed:,.0f} net if closed now.", numbers=numbers)
+    target = exit_cfg.get("profit_target_pct")
+    if target and position.profit_pct >= float(target) / 100.0:
+        if net_if_closed >= min_gain:
+            return Decision(Action.CLOSE, "routine", f"{what}: profit target reached",
+                            f"{position.profit_pct:.0%} of max profit (target {target}%): "
+                            f"${net_if_closed:,.2f} net of every fee.", numbers=numbers)
+        numbers["below_min_gain"] = True
+        return Decision(Action.HOLD, "routine", f"{what}: target reached, not worth the fee",
+                        f"Closing nets ${net_if_closed:,.2f}, under the ${min_gain:.2f} "
+                        f"minimum. Hold.", numbers=numbers)
+    stop = exit_cfg.get("time_stop_dte")
+    if stop and position.entry_dte_calendar > int(stop) and days <= int(stop):
+        return Decision(Action.CLOSE, "attention", f"{what}: time stop ({stop} DTE)",
+                        f"{days} day(s) left: {position.profit_pct:.0%} of max profit, "
+                        f"${net_if_closed:,.2f} net if closed now.", numbers=numbers)
+    return Decision(Action.HOLD, "routine", f"{what}: hold",
+                    f"{position.profit_pct:.0%} of max profit with {days} day(s) to the front "
+                    f"expiry. No rule has fired.", numbers=numbers)
+
+
 # --- Entry-side gate -------------------------------------------------------
 
 @dataclass(frozen=True)

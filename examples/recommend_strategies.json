@@ -1,0 +1,18 @@
+{
+  "name": "Recommend strategies (Phase 16), ETFs",
+  "strategies": ["pcs"],
+  "pcs_dte_targets": [45],
+  "spread_width_pct": [4],
+  "dte_min": 30,
+  "dte_max": 50,
+  "risk_mode": "delta_range",
+  "delta_range": [-0.30, -0.15],
+  "profit_targets": [25, 50, 100],
+  "account_profile": "default",
+  "universe": "etf",
+  "top_n_underlyings": 10,
+  "event_policy_overrides": {},
+  "strike_rule": "conservative",
+  "specs": [],
+  "recommend": true
+}

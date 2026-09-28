@@ -1,0 +1,22 @@
+id: bear_call
+label: Bear call spread
+family: bearish premium
+description: Sell a call, buy a further-OTM call. Profits if the stock stays below the short strike.
+margin_class: defined_risk
+event_policy_as: pcs
+expirations:
+  front: {dte_target: 45, tolerance: 14}
+legs:
+  - {name: short_call, type: call, side: short, expiration: front, select: {delta: 0.20}}
+  - {name: long_call, type: call, side: long, expiration: front, select: {offset_from: short_call, width_pct: 4}}
+entry:
+  iv_regime: [mid, high]
+  trend: [downtrend, range]
+  earnings: block
+  min_credit: 0.10
+exit:
+  profit_target_pct: 50
+  loss_stop_multiple: 2.0
+  time_stop_dte: 21
+notes:
+  - A short call deep in the money can be assigned early ahead of an ex-dividend date.

@@ -11,6 +11,20 @@ Conventions: `side` is "short" or "long"; `qty` is per contract of the
 position (a vertical is one short and one long); option deltas are the
 chain's (a put's is negative), and a position's Greeks flip the sign of
 short legs.
+
+Phase 16 (multi-strategy):
+* **Stock legs** (`option_type="stock"`, qty 1 = 100 shares per contract):
+  a covered call is a long stock leg plus a short call, and the stock's
+  purchase price is part of the net `credit` (so a covered call's credit is
+  premium - share price, negative). Its "intrinsic" is the price itself.
+* **Several expirations** (calendars, diagonals): everything "at expiry" is
+  at the FRONT expiration. A leg expiring later is valued there by
+  Black-Scholes, with the days it still has left, at the forward vol the
+  entry term structure implies (`later_leg_vol`) -- an assumption that
+  back-month IV holds its level relative to the front, flagged as model
+  risk (`multi_expiry`).
+  Max profit/loss and breakevens then come from a dense price grid, since
+  the payoff is no longer piecewise linear.
 """
 from __future__ import annotations
 
@@ -43,8 +57,14 @@ class Leg:
     def sign(self) -> int:
         return -1 if self.side == "short" else 1
 
+    @property
+    def is_stock(self) -> bool:
+        return self.option_type == "stock"
+
     def intrinsic(self, s_t: np.ndarray | float) -> np.ndarray | float:
         s_t = np.asarray(s_t, dtype=float)
+        if self.option_type == "stock":
+            return s_t
         if self.option_type == "put":
             return np.maximum(self.strike - s_t, 0.0)
         return np.maximum(s_t - self.strike, 0.0)
@@ -63,13 +83,80 @@ class Position:
     credit: float                    # modelled net credit per share (debit < 0)
     collateral_per_contract: float | None = None   # overrides the defined-risk BPR
     notes: list[str] = field(default_factory=list)
+    rate: float = 0.045                  # for valuing later legs at the front expiry
+    front_dte: float | None = None       # calendar days to the front expiry at entry
+
+    def later_leg_vol(self, leg: Leg, offset: int, front_dte: float | None = None) -> float:
+        """The vol a later leg is valued at when the front expires: the
+        FORWARD vol between the two expirations, from the leg's own IV and
+        the IV of the front leg of the same type nearest its strike --
+        sigma_fwd^2 = (sigma_b^2 T_b - sigma_f^2 T_f) / (T_b - T_f). That is
+        what the market's term structure implies for the back leg's remaining
+        life, so a deterministic-vol model reproduces entry prices. Without
+        the front DTE (or a front leg), the leg's own IV (sticky)."""
+        own = leg.iv if leg.iv and leg.iv > 0 else 0.3
+        days = front_dte if front_dte is not None else self.front_dte
+        offsets = self.expiry_offsets()
+        fronts = [l for l, o in zip(self.legs, offsets)
+                  if o == 0 and not l.is_stock and l.option_type == leg.option_type
+                  and l.iv and l.iv > 0]
+        if not days or not fronts or offset <= 0:
+            return own
+        ref = min(fronts, key=lambda l: abs(l.strike - leg.strike))
+        var = (own ** 2 * (days + offset) - ref.iv ** 2 * days) / offset
+        return float(np.sqrt(max(var, (0.5 * own) ** 2)))
+
+    # --- Expirations ---------------------------------------------------------
+
+    def expiry_offsets(self) -> list[int]:
+        """Calendar days each leg expires AFTER the front (option) expiration;
+        0 for front legs and stock. Unparseable expirations count as one."""
+        import pandas as pd
+        dates = []
+        for leg in self.legs:
+            if leg.is_stock:
+                dates.append(None)
+                continue
+            try:
+                dates.append(pd.Timestamp(leg.expiration).date())
+            except (ValueError, TypeError):
+                return [0] * len(self.legs)
+        options = [d for d in dates if d is not None]
+        if not options:
+            return [0] * len(self.legs)
+        front = min(options)
+        return [0 if d is None else (d - front).days for d in dates]
+
+    @property
+    def multi_expiry(self) -> bool:
+        return any(o > 0 for o in self.expiry_offsets())
+
+    def _leg_value_at_front(self, leg: Leg, offset: int, s_t: np.ndarray) -> np.ndarray:
+        if leg.is_stock:
+            return s_t
+        if offset <= 0:
+            return leg.intrinsic(s_t)
+        from analytics.prob_engine import bs_price
+        vol = self.later_leg_vol(leg, offset)
+        price, _ = bs_price(s_t, leg.strike, np.full(s_t.shape, offset / 365.0),
+                            np.full(s_t.shape, vol), self.rate, leg.option_type)
+        return price
 
     # --- Payoff --------------------------------------------------------------
 
     def payoff(self, s_t) -> np.ndarray | float:
-        """P&L per share at expiry for terminal prices `s_t` (before fees)."""
+        """P&L per share at the (front) expiry for terminal prices `s_t`
+        (before fees). Later legs are valued by Black-Scholes (module doc)."""
         s_t = np.asarray(s_t, dtype=float)
-        value = sum(leg.sign * leg.qty * leg.intrinsic(s_t) for leg in self.legs)
+        offsets = self.expiry_offsets()
+        if not any(offsets):
+            value = sum(leg.sign * leg.qty * leg.intrinsic(s_t) for leg in self.legs)
+            return self.credit + value
+        grid = np.atleast_1d(s_t)
+        value = sum(leg.sign * leg.qty * self._leg_value_at_front(leg, o, grid)
+                    for leg, o in zip(self.legs, offsets))
+        if s_t.ndim == 0:
+            return float(self.credit + np.asarray(value)[0])
         return self.credit + value
 
     def value(self, spot: float, days_left: float, iv_fn=None, rate: float = 0.045) -> float:
@@ -78,12 +165,16 @@ class Position:
         vol; default the leg's own IV."""
         from analytics.options_math import bs_price_greeks
         total = 0.0
-        for leg in self.legs:
+        for leg, offset in zip(self.legs, self.expiry_offsets()):
+            if leg.is_stock:
+                total += leg.sign * leg.qty * float(spot)
+                continue
             vol = iv_fn(leg) if iv_fn else leg.iv
-            if days_left <= 0 or not vol:
+            days = days_left + offset
+            if days <= 0 or not vol:
                 price = float(leg.intrinsic(spot))
             else:
-                price = bs_price_greeks(spot, leg.strike, days_left, vol, rate,
+                price = bs_price_greeks(spot, leg.strike, days, vol, rate,
                                         leg.option_type).price
             total += leg.sign * leg.qty * price
         return total
@@ -92,7 +183,11 @@ class Position:
 
     def _grid(self) -> np.ndarray:
         strikes = sorted({leg.strike for leg in self.legs})
-        return np.array([0.0] + strikes + [strikes[-1] * 3.0 + 1.0])
+        top = strikes[-1] * 3.0 + 1.0
+        if self.multi_expiry:
+            # Not piecewise linear: sample densely (strikes included).
+            return np.unique(np.concatenate([np.linspace(0.0, top, 3001), strikes]))
+        return np.array([0.0] + strikes + [top])
 
     @property
     def max_profit(self) -> float:
@@ -127,14 +222,16 @@ class Position:
 
     @property
     def width(self) -> float | None:
-        strikes = [leg.strike for leg in self.legs]
+        strikes = [leg.strike for leg in self.legs if not leg.is_stock]
         return max(strikes) - min(strikes) if len(strikes) > 1 else None
 
     def net_greeks(self) -> dict:
-        """Per contract (x100 shares), signed for the position."""
+        """Per contract (x100 shares), signed for the position. A stock leg
+        has delta 1 and no other Greeks."""
         out = {}
         for greek in ("delta", "gamma", "theta", "vega"):
-            values = [getattr(leg, greek) for leg in self.legs]
+            values = [(1.0 if greek == "delta" else 0.0) if leg.is_stock
+                      else getattr(leg, greek) for leg in self.legs]
             if any(v is None or not np.isfinite(v) for v in values):
                 out[greek] = None
                 continue

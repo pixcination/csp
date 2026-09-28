@@ -15,6 +15,9 @@ explicit and portable:
                           dollars (Phase 15 default: 4%)
     pcs_dte_targets       DTE targets for spreads only (Phase 15 default: 45);
                           unset, spreads use the shared DTE window
+    specs, recommend      Phase 16: strategy specs (strategies/*.yaml) to scan
+                          for, and/or every spec whose entry conditions a
+                          ticker meets; run by analytics/recommender.py
     profit_targets        % of max profit to report odds for
     account_profile       a key of config.yaml -> account_profiles
     universe              all | csp | stock | etf | index | tag:<tag> | [symbols]
@@ -78,6 +81,8 @@ class ScanRequest:
     spread_widths: list[float] = field(default_factory=lambda: [1, 2.5, 5, 10])
     spread_width_pct: list[float] | None = None     # % of spot; when set, replaces the dollars
     pcs_dte_targets: list[int] | None = None        # spreads' own DTE targets (else the shared window)
+    specs: list[str] = field(default_factory=list)  # Phase 16: strategy spec ids to scan
+    recommend: bool = False                         # Phase 16: every spec whose conditions fit
     profit_targets: list[int] = field(default_factory=lambda: [25, 30, 50, 100])
     account_profile: str = "default"
     universe: str | list[str] = "all"
@@ -165,6 +170,15 @@ class ScanRequest:
                 raise RequestError("spread_width_pct are percents of spot in (0, 50]")
         else:
             self.spread_width_pct = None
+        self.specs = [str(s) for s in (self.specs or [])]
+        self.recommend = bool(self.recommend)
+        if self.specs:
+            from analytics import strategy_spec
+            known = strategy_spec.load_all()
+            unknown = [s for s in self.specs if s not in known]
+            if unknown:
+                raise RequestError(f"unknown strategy spec(s): {', '.join(unknown)} "
+                                   f"(have {', '.join(known)})")
         if self.risk_mode not in RISK_MODES:
             raise RequestError(f"risk_mode must be one of {RISK_MODES}")
         if self.delta_range is not None:
@@ -323,7 +337,23 @@ class ScanRequest:
         so a roll of anything opened now can be ranked from the same pull."""
         buffer = int(load_config().get("chain_capture", {}).get("roll_buffer_days", 14))
         lo, hi = self.dte_window()
+        spec_lo, spec_hi = self.spec_dte_window()
+        if spec_hi is not None:
+            lo, hi = min(lo, spec_lo), max(hi, spec_hi)
         return lo, hi + buffer
+
+    def spec_dte_window(self) -> tuple[int | None, int | None]:
+        """The DTE span the requested strategy specs need (Phase 16): every
+        expiration role's target +/- tolerance; (None, None) without specs."""
+        if not self.specs and not self.recommend:
+            return None, None
+        from analytics import strategy_spec
+        specs = strategy_spec.load_all()
+        chosen = [specs[s] for s in self.specs] if self.specs else list(specs.values())
+        spans = [(max(int(e["dte_target"]) - int(e.get("tolerance", 14)), 0),
+                  int(e["dte_target"]) + int(e.get("tolerance", 14)))
+                 for spec in chosen for e in spec.expirations.values()]
+        return (min(a for a, _ in spans), max(b for _, b in spans)) if spans else (None, None)
 
     @property
     def top_n(self) -> int | None:

@@ -41,6 +41,8 @@ with tab_profiles:
                      "max positions": cfg.get("max_open_positions"),
                      "cash-secured": cfg.get("require_cash_secured"),
                      "spreads": cfg.get("spread_approval", True),
+                     "account type": cfg.get("account_type"),
+                     "naked": cfg.get("naked_approval", False),
                      "strategies": ", ".join(cfg.get("allowed_strategies") or [])})
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
                  column_config={
@@ -76,6 +78,17 @@ with tab_profiles:
         cash_secured = cols[1].checkbox("Cash-secured puts only",
                                         value=bool(base.get("require_cash_secured", True)))
         spreads = cols[2].checkbox("Spreads approved", value=bool(base.get("spread_approval", True)))
+        cols = st.columns(3)
+        types = ["research", "taxable", "margin", "roth_ira", "traditional_ira"]
+        current_type = str(base.get("account_type") or "research")
+        if current_type not in types:
+            types.append(current_type)
+        account_type = cols[0].selectbox("Account type", types, index=types.index(current_type),
+                                         help="Naked strategies need a margin account.")
+        naked = cols[1].checkbox("Naked options approved",
+                                 value=bool(base.get("naked_approval", False)),
+                                 help="Phase 16: strangles and other naked specs. Needs a "
+                                      "margin account; never allowed in an IRA.")
         saved = st.form_submit_button("Save profile", type="primary")
     if saved:
         try:
@@ -86,7 +99,8 @@ with tab_profiles:
                 "max_sector_collateral_pct": per_sector / 100,
                 "cash_buffer_pct": buffer / 100, "max_open_positions": int(max_pos),
                 "allowed_strategies": strategies, "require_cash_secured": cash_secured,
-                "spread_approval": spreads})
+                "spread_approval": spreads, "account_type": account_type,
+                "naked_approval": naked})
             st.success(f"Saved profile '{stored}'.")
             st.rerun()
         except us.SettingsError as exc:

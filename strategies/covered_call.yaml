@@ -1,0 +1,22 @@
+# Buy-write: buy 100 shares and sell a call against them in one trade. The
+# wheel's covered calls against ASSIGNED shares stay in analytics/covered_call.py.
+id: covered_call
+label: Covered call (buy-write)
+family: bullish income
+description: Buy 100 shares and sell an OTM call. Income on a stock you are willing to own, upside capped at the strike.
+margin_class: covered
+event_policy_as: covered_call
+expirations:
+  front: {dte_target: 30, tolerance: 10}
+legs:
+  - {name: stock, type: stock, side: long}
+  - {name: short_call, type: call, side: short, expiration: front, select: {delta: 0.30}}
+entry:
+  trend: [uptrend, range]
+  earnings: block
+  min_credit: 0.10
+exit:
+  profit_target_pct: 80
+notes:
+  - The credit shown is premium minus the share price (a debit); buying power is the share cost less the premium.
+  - Ex-dividend dates inside the trade are warned (early assignment of the short call).

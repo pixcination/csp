@@ -102,6 +102,11 @@ def config_dir() -> Path:
     return _ensure(project_root() / "config")
 
 
+def strategies_dir() -> Path:
+    """Strategy spec YAML files (Phase 16), versioned with the code."""
+    return _ensure(project_root() / "strategies")
+
+
 # --- Databases -------------------------------------------------------------
 
 def db_universe_daily() -> Path:

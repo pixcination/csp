@@ -215,6 +215,22 @@ with st.container(border=True):
             if choice != rule_cfg.get("action"):
                 overrides[kind] = {"action": choice}
 
+    row = st.columns([2, 1, 1])
+    try:
+        from analytics import strategy_spec as _ss
+        spec_names = list(_ss.load_all())
+    except Exception:
+        spec_names = []
+    spec_pick = row[0].multiselect(
+        "Also scan strategy specs", spec_names,
+        default=[s for s in (base.specs or []) if s in spec_names], key=k + "specs",
+        help="Phase 16: condors, calendars, strangles... from strategies/*.yaml, resolved "
+             "on every name's chain. Results on the Strategies page.")
+    recommend = row[1].checkbox("Recommend by conditions", value=bool(base.recommend),
+                                key=k + "recommend",
+                                help="Every spec whose IV-regime / trend / earnings "
+                                     "conditions a name meets.")
+
 # Build and validate the request.
 scan, problem = None, None
 try:
@@ -233,7 +249,8 @@ try:
               "account_profile": profile, "universe": universe,
               "top_n_underlyings": "all" if all_names else int(top_n),
               "ranking_weights": weights, "event_policy_overrides": overrides,
-              "strike_rule": rule, "em_multiple": float(em_multiple), "name": name}
+              "strike_rule": rule, "em_multiple": float(em_multiple), "name": name,
+              "specs": list(spec_pick), "recommend": bool(recommend)}
     if dte_range is not None:
         fields.update({"dte_targets": None, "dte_min": int(dte_range[0]),
                        "dte_max": int(dte_range[1])})

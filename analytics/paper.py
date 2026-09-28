@@ -140,6 +140,8 @@ POSITION_COLUMNS = {
     "quote_net_mid": "DOUBLE", "quote_half_spread": "DOUBLE",
     "rec_pop": "DOUBLE", "rec_headline_policy": "VARCHAR",
     "rolled_from": "INTEGER", "rolls_used": "INTEGER",
+    # Phase 16: positions from strategy specs (condors, calendars, ...)
+    "max_profit_share": "DOUBLE", "legs_label": "VARCHAR",
     "max_profit_pct_seen": "DOUBLE", "settlement_price": "DOUBLE",
 }
 
@@ -229,8 +231,29 @@ def _num(value) -> float | None:
     return value if math.isfinite(value) else None
 
 
+def _legs_from_json(rec: dict) -> list[dict]:
+    """Phase 16: a strategy-spec row carries its legs as JSON."""
+    import json
+    out = []
+    for raw in json.loads(rec["legs_json"]):
+        if raw.get("option_type") == "stock":
+            raise ValueError("the paper book records option legs only; buy the shares in "
+                             "the executing account and write the call against them on "
+                             "the Wheel page")
+        out.append({"option_type": raw["option_type"], "side": raw["side"],
+                    "strike": float(raw["strike"]),
+                    "expiration": pd.Timestamp(raw["expiration"]).date(),
+                    "qty": int(raw.get("qty") or 1), "quote_bid": _num(raw.get("bid")),
+                    "quote_ask": _num(raw.get("ask")), "quote_mid": _num(raw.get("mid")),
+                    "iv": _num(raw.get("iv")), "delta": _num(raw.get("delta")),
+                    "root_symbol": rec.get("root_symbol")})
+    return out
+
+
 def legs_from_recommendation(rec: dict) -> list[dict]:
     """The legs a sheet row describes, in the paper_legs shape (per contract)."""
+    if rec.get("legs_json"):
+        return _legs_from_json(rec)
     strategy = rec.get("strategy") or "csp"
     expiration = pd.Timestamp(rec["expiration"]).date()
     root = rec.get("root_symbol")
@@ -249,8 +272,8 @@ def legs_from_recommendation(rec: dict) -> list[dict]:
                 "iv": _num(rec.get("long_iv")) or _num(rec.get("implied_vol")),
                 "delta": _num(rec.get("long_delta")), "root_symbol": root}
         return [short, long]
-    raise ValueError(f"the paper book records {', '.join(s.upper() for s in STRATEGIES)}; "
-                     f"got {strategy!r}")
+    raise ValueError(f"the paper book records {', '.join(s.upper() for s in STRATEGIES)}, "
+                     f"and strategy-spec rows that carry their legs; got {strategy!r}")
 
 
 def _package_quote(legs: list[dict]) -> tuple[float | None, float | None]:
@@ -365,6 +388,7 @@ def accept(recommendation: dict, contracts: int | None = None,
         legs[0]["entry_price"] = float(actual_fill) if actual_fill is not None else modelled
 
     fill = float(actual_fill) if actual_fill is not None else modelled
+    generic = bool(recommendation.get("legs_json"))
     if strategy == "pcs" and not 0 < fill < abs(strike - long_strike):
         raise ValueError(f"a put credit spread's net credit must be between 0 and the "
                          f"width ${abs(strike - long_strike):g}; got ${fill:.2f}")
@@ -372,7 +396,18 @@ def accept(recommendation: dict, contracts: int | None = None,
     entry_date = entry_date or dt.date.today()
     entry_fees = costs.legs_open(_fee_sides(legs, size, opening=True)).total
     width = abs(strike - long_strike) if long_strike is not None else None
-    if strategy == "pcs":
+    max_profit_share = fill
+    if generic:
+        # A strategy spec's risk comes from its own Position at the actual fill.
+        from analytics import margin
+        from analytics.strategies import resolver
+        position = resolver.position_from_row({**recommendation, "modelled_fill": fill})
+        max_loss = position.max_loss * 100.0 * size
+        collateral = margin.bpr_per_contract(position, recommendation.get("margin_class")
+                                             or "defined_risk",
+                                             float(recommendation.get("spot") or strike)) * size
+        max_profit_share = position.max_profit
+    elif strategy == "pcs":
         max_loss = (width - fill) * 100.0 * size
         collateral = max_loss
     else:
@@ -427,6 +462,9 @@ def accept(recommendation: dict, contracts: int | None = None,
              net_mid, half, pop, recommendation.get("headline_policy"),
              _rolled_from, int(_rolls_used)]).fetchone()[0]
 
+        con.execute("UPDATE paper_positions SET max_profit_share = ?, legs_label = ? "
+                    "WHERE id = ?", [max_profit_share, recommendation.get("legs")
+                                     if generic else None, position_id])
         for index, leg in enumerate(legs):
             con.execute(
                 "INSERT INTO paper_legs (position_id, leg_index, option_type, side, strike, "
@@ -444,7 +482,8 @@ def accept(recommendation: dict, contracts: int | None = None,
     finally:
         con.close()
 
-    what = describe(strategy, ticker, expiration, strike, long_strike)
+    what = (f"{ticker} {recommendation.get('label') or strategy} {recommendation.get('legs')}"
+            if generic else describe(strategy, ticker, expiration, strike, long_strike))
     note = (f"Recorded {size} {what} at ${fill:.2f}"
             + (f" ({slippage:+.3f} vs modelled ${modelled:.2f})"
                if actual_fill is not None else " (modelled fill -- excluded from "
@@ -465,6 +504,16 @@ def _position(con, position_id: int) -> dict:
 def _legs(con, position_id: int) -> pd.DataFrame:
     return con.execute("SELECT * FROM paper_legs WHERE position_id = ? ORDER BY leg_index",
                        [position_id]).fetchdf()
+
+
+def _max_profit_share(row: dict, fill) -> float | None:
+    """Max profit per share: the credit for a CSP or PCS, the spec
+    position's own max profit for a Phase 16 strategy (a calendar is a
+    debit, so its credit is no yardstick)."""
+    value = row.get("max_profit_share")
+    if value is not None and pd.notna(value) and float(value) > 0:
+        return float(value)
+    return float(fill) if fill else None
 
 
 def settlement_value(legs: pd.DataFrame, price: float) -> tuple[float, list[float], int]:
@@ -512,7 +561,28 @@ def close_position(position_id: int, status: str, exit_date: dt.date | None = No
         extra_note = None
         assign_shares, economic_exit = False, None
 
-        if strategy == "pcs":
+        generic = strategy not in STRATEGIES
+        if generic:
+            if status == "assigned":
+                raise ValueError("a strategy-spec position that finishes in the money is "
+                                 "'settled' at the underlying's settlement price")
+            if status == "expired_otm":
+                exit_fees, exit_price = 0.0, 0.0
+                leg_exits = [0.0] * len(legs)
+            elif status == "settled":
+                if settlement_price is None:
+                    raise ValueError("settling needs the underlying's settlement price")
+                if legs["expiration"].nunique() > 1:
+                    raise ValueError("a calendar or diagonal outlives its front expiry: "
+                                     "record 'closed_early' with the net debit instead")
+                exit_price, leg_exits, itm = settlement_value(legs, float(settlement_price))
+                exit_fees = sum(costs.assignment(contracts * int(leg["qty"] or 1)).total
+                                for (_, leg), v in zip(legs.iterrows(), leg_exits) if v > 0)
+            else:
+                exit_fees = costs.legs_close(_fee_sides(
+                    legs.to_dict("records"), contracts, opening=False)).total
+                exit_price = float(exit_price or 0.0)
+        elif strategy == "pcs":
             if status == "assigned":
                 raise ValueError("a spread that finishes in the money is 'settled' "
                                  "(give the settlement price), not 'assigned'")
@@ -555,8 +625,9 @@ def close_position(position_id: int, status: str, exit_date: dt.date | None = No
 
         # A spread assigned into shares is judged on its value at settlement.
         final_exit = economic_exit if assign_shares else exit_price
-        final_pct = ((float(entry_fill) - final_exit) / float(entry_fill)
-                     if entry_fill and (status != "assigned" or assign_shares) else None)
+        best = _max_profit_share(row, entry_fill)
+        final_pct = ((float(entry_fill) - final_exit) / best
+                     if best and (status != "assigned" or assign_shares) else None)
         seen = row.get("max_profit_pct_seen")
         seen = None if seen is None or pd.isna(seen) else float(seen)
         if final_pct is not None:
@@ -690,7 +761,8 @@ def record_mark(position_id: int, mark: float, spot: float | None = None,
     try:
         row = _position(con, position_id)
         fill = row["actual_fill"] if pd.notna(row["actual_fill"]) else row["modelled_fill"]
-        pct = (float(fill) - float(mark)) / float(fill) if fill else None
+        best = _max_profit_share(row, fill)
+        pct = (float(fill) - float(mark)) / best if best else None
         con.execute("DELETE FROM paper_marks WHERE position_id = ? AND mark_date = ? "
                     "AND source = ?", [position_id, mark_date, source])
         con.execute("INSERT INTO paper_marks VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -754,6 +826,9 @@ def list_share_lots(open_only: bool = True) -> pd.DataFrame:
 
 def leg_text(position: dict | pd.Series, legs: pd.DataFrame | None = None) -> str:
     """'$748/$738 put spread' or '$61p' for display."""
+    label = position.get("legs_label")
+    if isinstance(label, str) and label:
+        return label
     long = position.get("long_strike")
     if position.get("strategy") == "pcs" and long is not None and pd.notna(long):
         return f"${float(position['strike']):g}/${float(long):g} put spread"
