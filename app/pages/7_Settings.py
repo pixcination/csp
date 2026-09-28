@@ -49,58 +49,79 @@ with tab_profiles:
                      "naked research-only": cfg.get("naked_research_only", False),
                      "placeholder": cfg.get("placeholder", False),
                      "strategies": ", ".join(cfg.get("allowed_strategies") or [])})
-    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
-                 column_config={
-                     "account value": st.column_config.NumberColumn(format="$%,.0f"),
-                     "per position": st.column_config.NumberColumn(format="percent"),
-                     "per ticker": st.column_config.NumberColumn(format="percent")})
+    table = st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
+                         on_select="rerun", selection_mode="single-row", key="profile_table",
+                         column_config={
+                             "account value": st.column_config.NumberColumn(format="$%,.0f"),
+                             "per position": st.column_config.NumberColumn(format="percent"),
+                             "per ticker": st.column_config.NumberColumn(format="percent")})
+    st.caption("Click a row to edit that profile below.")
 
     st.markdown("**Add or edit a profile**")
     names = us.profile_names()
+    # A newly clicked row picks the profile; the picker still works on its own
+    # (a selection is applied once, not on every rerun).
+    selected = table.selection.rows if table is not None else []
+    clicked = rows[selected[0]]["profile"] if selected else None
+    if clicked != st.session_state.get("profile_row_applied"):
+        st.session_state["profile_row_applied"] = clicked
+        if clicked is not None:
+            st.session_state["profile_pick"] = clicked
     pick = st.selectbox("Start from", ["(new profile)"] + names, key="profile_pick")
     base = sizing.account_config(None if pick == "(new profile)" else pick)
-    with st.form("profile_form"):
-        name = st.text_input("Name", "" if pick == "(new profile)" else pick,
+    # Every field is keyed to the picked profile, so switching profiles always
+    # loads that profile's saved values rather than the previous form state.
+    k = f"pf|{pick}|"
+    with st.form(f"profile_form|{pick}"):
+        name = st.text_input("Name", "" if pick == "(new profile)" else pick, key=k + "name",
                              help="e.g. roth_ira, traditional_ira, taxable")
         cols = st.columns(3)
         nlv = cols[0].number_input("Account value ($)", min_value=0.0, step=1000.0,
-                                   value=float(base.get("net_liquidating_value", 0.0)))
-        per_pos = cols[1].number_input("Max per position (%)", 0.1, 100.0, step=0.5,
-                                       value=100 * float(base.get("max_collateral_per_position_pct", 0.04)))
-        per_tick = cols[2].number_input("Max per ticker (%)", 0.1, 100.0, step=0.5,
-                                        value=100 * float(base.get("max_collateral_per_ticker_pct", 0.06)))
+                                   value=float(base.get("net_liquidating_value", 0.0)),
+                                   key=k + "nlv")
+        per_pos = cols[1].number_input(
+            "Max per position (%)", 0.1, 100.0, step=0.5, key=k + "per_pos",
+            value=100 * float(base.get("max_collateral_per_position_pct", 0.04)))
+        per_tick = cols[2].number_input(
+            "Max per ticker (%)", 0.1, 100.0, step=0.5, key=k + "per_tick",
+            value=100 * float(base.get("max_collateral_per_ticker_pct", 0.06)))
         cols = st.columns(3)
-        per_sector = cols[0].number_input("Max per sector (%)", 0.1, 100.0, step=1.0,
-                                          value=100 * float(base.get("max_sector_collateral_pct", 0.25)))
-        buffer = cols[1].number_input("Cash buffer (%)", 0.0, 90.0, step=1.0,
+        per_sector = cols[0].number_input(
+            "Max per sector (%)", 0.1, 100.0, step=1.0, key=k + "per_sector",
+            value=100 * float(base.get("max_sector_collateral_pct", 0.25)))
+        buffer = cols[1].number_input("Cash buffer (%)", 0.0, 90.0, step=1.0, key=k + "buffer",
                                       value=100 * float(base.get("cash_buffer_pct", 0.08)))
-        max_pos = cols[2].number_input("Max open positions", 1, 500, step=1,
+        max_pos = cols[2].number_input("Max open positions", 1, 500, step=1, key=k + "max_pos",
                                        value=int(base.get("max_open_positions", 25)))
         cols = st.columns(3)
         strategies = cols[0].multiselect("Allowed strategies", list(us.STRATEGY_CHOICES),
                                          default=base.get("allowed_strategies")
-                                         or list(us.STRATEGY_CHOICES))
-        cash_secured = cols[1].checkbox("Cash-secured puts only",
+                                         or list(us.STRATEGY_CHOICES), key=k + "strategies")
+        cash_secured = cols[1].checkbox("Cash-secured puts only", key=k + "cash_secured",
                                         value=bool(base.get("require_cash_secured", True)))
-        spreads = cols[2].checkbox("Spreads approved", value=bool(base.get("spread_approval", True)))
+        spreads = cols[2].checkbox("Spreads approved", key=k + "spreads",
+                                   value=bool(base.get("spread_approval", True)))
         cols = st.columns(3)
         types = ["research", "taxable", "margin", "roth_ira", "traditional_ira"]
         current_type = str(base.get("account_type") or "research")
         if current_type not in types:
             types.append(current_type)
         account_type = cols[0].selectbox("Account type", types, index=types.index(current_type),
+                                         key=k + "account_type",
                                          help="Naked strategies need a margin account.")
-        naked = cols[1].checkbox("Naked options approved",
+        naked = cols[1].checkbox("Naked options approved", key=k + "naked",
                                  value=bool(base.get("naked_approval", False)),
                                  help="Phase 16: strangles and other naked specs. Needs a "
                                       "margin account; never allowed in an IRA.")
         research_only = cols[2].checkbox(
-            "Naked strategies research-only", value=bool(base.get("naked_research_only", False)),
+            "Naked strategies research-only", key=k + "research_only",
+            value=bool(base.get("naked_research_only", False)),
             help="Phase 17: strangles appear for comparison but are never auto-tracked.")
         placeholder = st.checkbox(
-            "These are placeholder values", value=bool(base.get("placeholder", False)),
+            "These are placeholder values", key=k + "placeholder",
+            value=bool(base.get("placeholder", False)),
             help="Untick once the account value and limits are real; the Screener warns "
-                 "while it is set.")
+                 "while it is set, and the scheduler refuses auto runs on it.")
         saved = st.form_submit_button("Save profile", type="primary")
     if saved:
         try:
