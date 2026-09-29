@@ -457,6 +457,9 @@ def resolve_universe(request: ScanRequest) -> list[str]:
     else:
         extra = []
         key = request.universe
+        # Symbol Lookup's ad-hoc names reach a request only by name or tag:adhoc.
+        if key != f"tag:{universe.ADHOC_TAG}":
+            frame = frame[~frame["tags"].map(universe.is_adhoc)]
         if key in ("stock", "etf", "index"):
             frame = frame[frame["asset_class"] == key]
         elif key == "csp":

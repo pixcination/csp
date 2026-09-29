@@ -89,7 +89,12 @@ from analytics import costs
 from core.paths import db_trade_log, load_config
 
 BOOKS = ("taken", "tracked")
-SAMPLES = ("top", "control", "near_miss", "manual")
+SAMPLES = ("top", "control", "near_miss", "manual", "lookup")
+#: Samples left out of every accuracy statistic (win rate vs prediction,
+#: POP and P(target) calibration, Phase 21). A Symbol Lookup trade is one
+#: name picked by hand, not a draw from a preset's ranked sheet. Its dollars
+#: and fill still count: they are real P&L and real slippage.
+NOT_FOR_ACCURACY = ("lookup",)
 STATUSES = ["open", "expired_otm", "closed_early", "rolled", "assigned", "settled"]
 CYCLE_STATES = ["put_open", "shares_held", "call_open", "closed"]
 STRATEGIES = ("csp", "pcs")
@@ -249,6 +254,27 @@ def run_profile(run_id: str | None) -> str | None:
         return (manifest.get("request") or {}).get("account_profile") or "default"
     except (OSError, ValueError):
         return None
+
+
+def run_kind(run_id: str | None) -> str | None:
+    """"run" or "lookup" (a Symbol Lookup, Phase 20B); None if unknown."""
+    if not run_id:
+        return None
+    try:
+        import json
+
+        from core.paths import runs_dir
+        manifest = json.loads((runs_dir() / str(run_id) / "manifest.json")
+                              .read_text(encoding="utf-8"))
+        return manifest.get("kind") or "run"
+    except (OSError, ValueError):
+        return None
+
+
+def sample_for_run(run_id: str | None, sample: str) -> str:
+    """Anything recorded from a Symbol Lookup run is sample `lookup`, whichever
+    page records it (kept out of accuracy statistics: NOT_FOR_ACCURACY)."""
+    return "lookup" if run_kind(run_id) == "lookup" else sample
 
 
 def add_flag(position_ids: list[int], flag: str) -> int:
@@ -486,6 +512,7 @@ def accept(recommendation: dict, contracts: int | None = None,
     """
     if book not in BOOKS:
         raise ValueError(f"book must be one of {BOOKS}")
+    sample = sample_for_run(run_id, sample)
     if sample not in SAMPLES:
         raise ValueError(f"sample must be one of {SAMPLES}")
     cfg = load_config().get("execution", {})
@@ -1044,6 +1071,13 @@ def dollar_valid(frame: pd.DataFrame) -> pd.Series:
                                          else bool(v)).astype(bool)
 
 
+def for_accuracy(positions: pd.DataFrame) -> pd.DataFrame:
+    """Positions that count toward accuracy statistics (not NOT_FOR_ACCURACY)."""
+    if positions.empty or "sample" not in positions:
+        return positions
+    return positions[~positions["sample"].isin(NOT_FOR_ACCURACY)]
+
+
 def performance() -> dict:
     """Realised outcomes over closed positions, net of every fee."""
     frame = list_positions()
@@ -1075,18 +1109,21 @@ def performance() -> dict:
             "n_dollar_excluded": int(len(group) - len(money)),
         }
 
+    scored = for_accuracy(closed)
     return {
         "n_closed": int(len(closed)),
+        "n_scored": int(len(scored)),
         "n_open": int((frame["status"] == "open").sum()),
-        "win_rate": float((closed["status"] == "expired_otm").mean()),
+        "win_rate": float((scored["status"] == "expired_otm").mean()) if len(scored)
+        else float("nan"),
         "profit_rate": float((closed["realized"] > 0).mean()),
         "assignment_rate": float((closed["status"] == "assigned").mean()),
         "total_realized": float(closed.loc[valid, "realized"].sum()),
         "mean_annualised": float(closed.loc[valid, "annualised"].mean()) if valid.any()
         else float("nan"),
         "n_dollar_excluded": int((~valid).sum()),
-        "predicted_win_rate": float(closed["rec_prob_otm"].dropna().mean())
-        if closed["rec_prob_otm"].notna().any() else float("nan"),
+        "predicted_win_rate": float(scored["rec_prob_otm"].dropna().mean())
+        if scored["rec_prob_otm"].notna().any() else float("nan"),
         "by_strategy": by_strategy,
     }
 
@@ -1099,7 +1136,7 @@ def calibration() -> dict:
     is wrong -- and you would never find out from P&L alone.
     """
     stats = performance()
-    if stats.get("n_closed", 0) < 10:
+    if stats.get("n_scored", 0) < 10:
         return {**stats, "verdict": "not enough closed positions to judge "
                                     "(need ~10, ideally 30+)"}
     predicted = stats.get("predicted_win_rate")

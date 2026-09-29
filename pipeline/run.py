@@ -104,6 +104,8 @@ class RunManifest:
     warnings: list = field(default_factory=list)
     banner: str = ""
     request: dict = field(default_factory=dict)       # Phase 11: the ScanRequest
+    kind: str = "run"                                  # "lookup": Symbol Lookup (Phase 20B)
+    symbol: str | None = None                          # the looked-up symbol
 
     def write(self) -> Path:
         folder = runs_dir() / self.run_id

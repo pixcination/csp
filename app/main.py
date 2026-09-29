@@ -35,6 +35,9 @@ pages = [
             icon=":material/query_stats:"),
     st.Page(str(PAGES_DIR / "10_Strategies.py"), title="Strategies",
             icon=":material/category:"),
+    # Phase 20B: any ticker, on demand (ad-hoc symbols stay out of the universe).
+    st.Page(str(PAGES_DIR / "12_Symbol_Lookup.py"), title="Symbol Lookup",
+            icon=":material/search:"),
     # Phase 18: tracked forward tests and taken trades -- marks, attribution,
     # probabilities from now, hold vs managed outcomes.
     st.Page(str(PAGES_DIR / "11_Tracking.py"), title="Tracking",

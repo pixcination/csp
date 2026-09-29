@@ -31,6 +31,7 @@ index it tracks goes back to 1927 (verified equal to the cent on the overlap).
 from __future__ import annotations
 
 import datetime as dt
+import re
 
 import duckdb
 import pandas as pd
@@ -40,6 +41,11 @@ from core.paths import (config_dir, db_universe, final_universe_file, load_unive
 
 TABLE = "universe"
 SNAPSHOT = "universe.csv"
+#: Symbols registered by the Symbol Lookup page (Phase 20B). Kept out of
+#: `symbols()` (so `universe: all`, the nightly data stages and the archive)
+#: and out of every keyed request universe until promoted with
+#: `promote_adhoc`; an explicit list or `tag:adhoc` still reaches them.
+ADHOC_TAG = "adhoc"
 
 SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS {TABLE} (
@@ -218,11 +224,30 @@ def load(active_only: bool = False) -> pd.DataFrame:
         con.close()
 
 
+def tag_list(tags) -> list[str]:
+    """A registry `tags` value as lower-case tags."""
+    if not isinstance(tags, str):
+        return []
+    return [t for t in re.split(r"[,; ]+", tags.strip().lower()) if t]
+
+
+def is_adhoc(tags) -> bool:
+    return ADHOC_TAG in tag_list(tags)
+
+
+def adhoc_symbols() -> set[str]:
+    """Registered through Symbol Lookup and not yet promoted."""
+    frame = load()
+    return set(frame.loc[frame["tags"].map(is_adhoc), "symbol"]) if not frame.empty else set()
+
+
 def symbols(scope: str = "csp") -> list[str]:
-    """Active symbols. scope="csp" drops cash-settled indices; "all" keeps them."""
+    """Active symbols. scope="csp" drops cash-settled indices; "all" keeps them.
+    Ad-hoc (Symbol Lookup) symbols are left out of both."""
     if scope not in ("csp", "all"):
         raise ValueError("scope must be 'csp' or 'all'")
     frame = load(active_only=True)
+    frame = frame[~frame["tags"].map(is_adhoc)]
     if scope == "csp":
         frame = frame[frame["settlement"].fillna("physical") != "cash"]
     return frame["symbol"].tolist()
@@ -312,6 +337,15 @@ def update(symbol: str, **fields) -> None:
         export_snapshot(con)
     finally:
         con.close()
+
+
+def promote_adhoc(symbol: str) -> None:
+    """"Add to universe": drop the adhoc tag, keeping any others."""
+    row = get(symbol)
+    if row is None:
+        raise ValueError(f"{normalise(symbol)} is not registered")
+    kept = [t for t in tag_list(row.get("tags")) if t != ADHOC_TAG]
+    update(symbol, tags=",".join(kept) or None, active=True)
 
 
 def set_active(symbol: str, active: bool) -> None:

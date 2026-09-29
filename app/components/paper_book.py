@@ -27,7 +27,9 @@ def book_section() -> None:
         metrics[0].metric("Open", f"{len(open_rows)}")
         metrics[1].metric("Closed", f"{stats.get('n_closed', 0)}")
         if stats.get("n_closed"):
-            metrics[2].metric("Win rate", f"{stats['win_rate']:.0%}")
+            if stats.get("n_scored"):
+                metrics[2].metric("Win rate", f"{stats['win_rate']:.0%}",
+                                  help="Symbol Lookup trades are left out of the win rate.")
             excluded = stats.get("n_dollar_excluded", 0)
             note = (f"Leaves out {excluded} row(s) sized against the research default or a "
                     f"placeholder profile (their rates still count)." if excluded else None)
@@ -156,7 +158,7 @@ def truth_section() -> None:
     with right:
         st.markdown("**Probability calibration**")
         cal = paper.calibration()
-        if cal.get("n_closed", 0) >= 10:
+        if cal.get("n_scored", 0) >= 10:
             st.metric("Predicted vs realised win rate",
                        f"{cal['win_rate']:.0%}",
                        delta=f"{cal['calibration_gap']:+.1%} vs predicted")

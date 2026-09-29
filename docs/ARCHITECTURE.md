@@ -55,7 +55,7 @@ and is not repeated here. Read the docstring before changing a module.
  data/runs/<id>/  manifest.json · candidates.parquet · positions.parquet
           │
           ▼
- app/  (Streamlit): Screener · Trade Detail · Strategies · Tracking · Command Center
+ app/  (Streamlit): Screener · Trade Detail · Strategies · Symbol Lookup · Tracking · Command Center
                     Decisions · Wheel · Validation · Portfolio · Signals · Universe · Settings
 ```
 
@@ -308,6 +308,7 @@ sample size.
 | Signals | **Levels** (universe chance check, support map with %/ATR/EM distances, every level ranked by edge CI, chart of tests, RSI extremes), gap risk, skew, term structure | technicals cache, disk |
 | **Strategies** (Phase 16) | Recommend (latest run's recommender tables or a scan of stored chains: grid, payoff, legs, probabilities, record to the book), Library (specs and profile permissions), Condition matrix | `strategies.parquet`, chains |
 | **Tracking** (Phase 18) | book filter (tracked / taken / both); **Update now** (targeted chain pull + a mark per open position), **Expire due**, **Archive chains**; open positions with mark, P&L, % of max, best/worst, P(target) at entry vs now, POP now, verdict; per position: entry vs now, marks and probabilities over time, P&L attribution, observations, **Promote** to taken; closed positions with hold-to-expiry vs managed P&L; the archive list. The Screener's **Log mode** (multi-row: Log selected / every passing row shown / Log all = top K + control) and the Strategies grid (multi-row, Log selected) feed it Since 2026-09-29 also the **paper book** (performance with dollar totals over real-profile rows only, the ledger, **Mark an outcome / Roll a position / Record a mark**, share lots) and **Is the model telling the truth?** (fill quality, probability calibration), from `app/components/paper_book.py`. | `trade_log.duckdb`, chains |
+| **Symbol Lookup** (Phase 20B) | any ticker: checked at Yahoo and TastyTrade, registered tag `adhoc` (outside `universe: all`, the nightly jobs, the archive and every auto preset until **Add to universe**), then bars / metrics / events, technicals, the Outlook (pooled skill noted), a targeted chain and CSP + put-spread candidates plus the recommender (`pipeline/lookup.py`); gauges with a horizon selector, trend, RSI, IV rank / percentile, IV / forecast ratio, the support map, events, the trade grid (a row opens Trade Detail; Track rows logs sample `lookup`). Refused while a scheduled job runs or is due within 15 min. | a `kind: lookup` run folder (skipped by `latest_run`) |
 | Settings | user account profiles (capital, caps, permissions incl. account type, naked approval, naked research-only, placeholder flag) and ranking-weight presets; **Schedule** tab (Phase 19): worker status with Start/Stop, today's slots, job history, the timetable, auto presets (K, M, daily cap, observe hourly; explicit and placeholder checks); saved to `config/user_settings.yaml` | disk, `data/scheduler/` |
 | Universe | registry editor (add / deactivate / tag), IVR/IVP, next earnings and disagreements, Stage 1 verdicts, per-symbol weekly bars and earnings reactions, 45-day market-event calendar with policy | registry, metrics, events |
 
@@ -413,6 +414,9 @@ the meeting before it.
 | `python scripts/validate_outlook.py` | Outlook walk-forward skill, final fit and live dials (Phase 20; ~1 min) |
 | `python pipeline/scheduler.py [--plan DATE / --status / --run JOB --preset NAME]` | the scheduler worker, or one job now (Phase 19) |
 | `python scripts/scheduler_task.py install / status / remove` | Task Scheduler entry that starts the worker at logon (Phase 19) |
+| `python scripts/launchd_agent.py install / status / remove` | macOS: the LaunchAgent counterpart (docs/MACOS.md) |
+| `python scripts/health_check.py [--days 7]` | weekly scheduler health: per-job status and durations, the mark split into chains (per ticker) and marks (per position), jobs over 15 min, a proposed fix for a slow mark |
+| `python pipeline/lookup.py SYMBOL [--profile P]` | Symbol Lookup from the command line (Phase 20B) |
 | `python scripts/flag_positions.py FLAG --runs-before ISO / --ids ...` | tag logged positions with a data-quality flag (Phase 19) |
 | `python scripts/backtest_pcs.py` | PCS rule backtest and walk-forward (~6 min for 4 ETFs x 768 rule sets) |
 

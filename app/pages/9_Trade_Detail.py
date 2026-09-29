@@ -103,11 +103,18 @@ chosen = top[0].selectbox("Trade", options, index=options.index(trade_id),
 if chosen != trade_id:
     trade_id = chosen
 st.query_params.update({"run": results.run_id, "trade": trade_id})
-if top[1].button("← Screener", width="stretch"):
+is_lookup = getattr(results.manifest, "kind", "run") == "lookup"
+back = ("Symbol Lookup", "pages/12_Symbol_Lookup.py") if is_lookup else     ("Screener", "pages/8_Screener.py")
+if top[1].button(f"← {back[0]}", width="stretch"):
+    if is_lookup:
+        st.session_state["lookup_run"] = results.run_id
     try:
-        st.switch_page("pages/8_Screener.py")
+        st.switch_page(back[1])
     except Exception:
-        st.info("Open the Screener from the sidebar.")
+        st.info(f"Open the {back[0]} from the sidebar.")
+if is_lookup:
+    st.caption(f"Symbol Lookup run: anything recorded here is sample `lookup`, left out of the "
+               f"accuracy statistics.")
 
 row = td.record(results, trade_id)
 position = td.position(row)

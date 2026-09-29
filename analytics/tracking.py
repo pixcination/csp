@@ -293,11 +293,12 @@ def log(rows, book: str = "tracked", sample: str = "manual", run_id: str | None 
     if isinstance(rows, pd.DataFrame):
         rows = rows.to_dict("records")
     profile = account_profile or paper.run_profile(run_id)
+    lookup = paper.run_kind(run_id) == "lookup"
     out = []
     for row in rows:
         row = dict(row)
         key = dedupe_key(row)
-        row_sample = row.get("sample") or sample
+        row_sample = "lookup" if lookup else (row.get("sample") or sample)
         con = _con()
         try:
             existing = _open_by_key(con, key, book)

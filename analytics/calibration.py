@@ -155,7 +155,7 @@ def probability_calibration(strategy: str | None = None) -> Reliability | None:
     OTM), a spread's P(finish above breakeven)); `strategy` restricts it to
     one strategy, None pools them.
     """
-    positions = paper.list_positions()
+    positions = paper.for_accuracy(paper.list_positions())
     if positions.empty:
         return None
     closed = positions[positions["status"] != "open"].copy()
@@ -170,7 +170,7 @@ def probability_calibration(strategy: str | None = None) -> Reliability | None:
 def by_strategy() -> dict[str, dict]:
     """POP reliability per strategy -- a spread and a put are different
     claims, and pooling them can hide an error in either."""
-    positions = paper.list_positions()
+    positions = paper.for_accuracy(paper.list_positions())
     out = {}
     if positions.empty:
         return out
@@ -196,7 +196,7 @@ def target_outcomes() -> pd.DataFrame:
     between marks can be missed: the observed rate is a LOWER bound, and a
     model that looks slightly optimistic here may be right.
     """
-    positions = paper.list_positions()
+    positions = paper.for_accuracy(paper.list_positions())
     if positions.empty:
         return pd.DataFrame()
     closed = positions[positions["status"] != "open"]
@@ -414,8 +414,8 @@ def _automation_gate(probability, fills, performance) -> dict:
     """
     checks = [
         {"check": "50+ closed paper positions",
-         "pass": bool(performance.get("n_closed", 0) >= 50),
-         "detail": f"{performance.get('n_closed', 0)} so far"},
+         "pass": bool(performance.get("n_scored", 0) >= 50),
+         "detail": f"{performance.get('n_scored', 0)} so far"},
         {"check": "Probabilities calibrated within 5 points",
          "pass": bool(probability and probability.n >= MIN_FOR_VERDICT
                       and abs(probability.mean_actual - probability.mean_predicted) <= 0.05),

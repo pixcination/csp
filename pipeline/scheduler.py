@@ -5,7 +5,8 @@ Streamlit re-runs scripts on every interaction, runs one session per tab and
 nothing at all when no tab is open, so the timed work lives in this worker.
 `launch.py` starts it next to the UI (it keeps running when the UI closes);
 `scripts/scheduler_task.py install` adds a Windows Task Scheduler entry that
-starts it at logon. One worker at a time (`data/scheduler/worker.lock`).
+starts it at logon, `scripts/launchd_agent.py install` a macOS LaunchAgent
+(docs/MACOS.md). One worker at a time (`data/scheduler/worker.lock`).
 
 JOBS (trading days only, times ET; config.yaml -> schedule, overridden on the
 Settings page, stored in config/user_settings.yaml -> schedule)
@@ -46,7 +47,8 @@ VISIBILITY
     data/scheduler/history.jsonl    one line per slot: ok / failed / missed /
                                     skipped / refused, with the message, the
                                     run id and duration_s (scan_and_log also
-                                    scan_s and log_s)
+                                    scan_s and log_s; mark chain_s, marks_s,
+                                    tickers and positions)
     data/scheduler/worker.log       the jobs' progress lines and tracebacks
 
 Why a plain loop rather than APScheduler (the review's suggestion): the
@@ -310,6 +312,15 @@ def check_auto(name: str):
         request = ScanRequest.from_dict(fields, inherit=False)
     except RequestError as exc:
         raise Refused(f"preset {name!r} is invalid: {exc}") from None
+    # Symbol Lookup's ad-hoc names never reach an auto preset, even by name.
+    if isinstance(request.universe, list):
+        from data_sources import universe
+        adhoc = universe.adhoc_symbols()
+        kept = [s for s in request.universe if s not in adhoc]
+        if not kept:
+            raise Refused(f"preset {name!r} lists only ad-hoc (Symbol Lookup) symbols; "
+                          f"promote them with 'Add to universe' first")
+        request.universe = kept
     profile = sizing.account_config(request.account_profile)
     if profile.get("placeholder"):
         raise Refused(f"profile {request.account_profile!r} holds placeholder values -- enter "
@@ -323,7 +334,16 @@ def job_mark(slot: Slot, reporter) -> dict:
     with RunLock():
         new = tracking.update(source="scheduled", reporter=reporter)
     priced = int(new["mark"].notna().sum()) if not new.empty else 0
-    return {"message": f"marked {len(new)} open position(s), {priced} priced"}
+    # The two phases apart for the weekly health check: chain pulls scale with
+    # tickers, marks and probabilities with positions.
+    chains, marks = reporter.records.get("chains"), reporter.records.get("marks")
+    phases = {"chain_s": round(chains.elapsed, 1) if chains else None,
+              "marks_s": round(marks.elapsed, 1) if marks else None,
+              "tickers": chains.total if chains else 0, "positions": int(len(new))}
+    return {**phases, "message": f"marked {len(new)} open position(s), {priced} priced"
+                                 + (f" [chains {phases['chain_s']:.0f}s for {phases['tickers']} "
+                                    f"ticker(s), marks {phases['marks_s']:.0f}s]"
+                                    if chains and marks else "")}
 
 
 def _scan(slot: Slot, reporter):
@@ -406,7 +426,8 @@ def execute(slot: Slot, manual: bool = False) -> dict | None:
     try:
         out = RUNNERS[slot.job](slot, LogReporter())
         entry.update(status="ok", message=out.get("message", ""), run_id=out.get("run_id"),
-                     **{k: out[k] for k in ("scan_s", "log_s") if k in out})
+                     **{k: out[k] for k in ("scan_s", "log_s", "chain_s", "marks_s",
+                                            "tickers", "positions") if k in out})
     except RunLocked as exc:
         log.info("%s: run lock held (%s); will retry", slot.label, exc)
         return None
@@ -504,22 +525,32 @@ def serve() -> int:
     return 0
 
 
+def spawn_args() -> tuple[list[str], dict]:
+    """(argv, Popen keyword arguments) for a detached worker on this platform.
+    Windows: pythonw with no console, detached from the launcher's console.
+    POSIX (macOS): its own session, so closing the terminal that ran
+    `launch.py` (SIGHUP to its process group) does not stop it."""
+    exe = Path(sys.executable)
+    script = str(ROOT / "pipeline" / "scheduler.py")
+    kwargs = {"cwd": str(ROOT), "stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+              "stderr": subprocess.DEVNULL, "close_fds": True}
+    if sys.platform == "win32":
+        windowless = exe.with_name("pythonw.exe")
+        kwargs["creationflags"] = (subprocess.DETACHED_PROCESS
+                                   | subprocess.CREATE_NEW_PROCESS_GROUP
+                                   | subprocess.CREATE_NO_WINDOW)
+        return [str(windowless if windowless.exists() else exe), script], kwargs
+    kwargs["start_new_session"] = True
+    return [str(exe), script], kwargs
+
+
 def start_worker() -> int | None:
     """Start a detached worker unless one is running; returns its pid."""
     running = worker_pid()
     if running:
         return running
-    exe = Path(sys.executable)
-    windowless = exe.with_name("pythonw.exe")
-    flags = 0
-    if sys.platform == "win32":
-        flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-                 | subprocess.CREATE_NO_WINDOW)
-    proc = subprocess.Popen(
-        [str(windowless if windowless.exists() else exe), str(ROOT / "pipeline" / "scheduler.py")],
-        cwd=str(ROOT), creationflags=flags, stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
-    return proc.pid
+    argv, kwargs = spawn_args()
+    return subprocess.Popen(argv, **kwargs).pid
 
 
 # --- Status for the UI -------------------------------------------------------------------
@@ -543,6 +574,28 @@ def status(now: dt.datetime | None = None) -> dict:
             "failures_today": [h for h in today if h.get("status") in ("failed", "refused")],
             "missed_today": [h for h in today if h.get("status") in ("missed", "skipped")],
             "should_be_running": bool(cfg.get("enabled", True)) and in_hours}
+
+
+def busy(now: dt.datetime | None = None, within_minutes: float = 15) -> str | None:
+    """Why an interactive job must not start now (Symbol Lookup): a scheduled
+    job running, or one due within `within_minutes`. None when clear."""
+    now = now or now_et()
+    if worker_pid():
+        state = str(_read_json("heartbeat.json").get("state") or "")
+        if state.startswith("running"):
+            return f"the scheduler is {state}"
+    cfg = settings()
+    done = {h["key"] for h in history(since=now.date())}
+    horizon = now + dt.timedelta(minutes=within_minutes)
+    for slot in plan_day(now.date(), cfg):
+        if slot.key in done:
+            continue
+        # Still pending (not yet recorded) and inside the grace, or coming up.
+        overdue = now - dt.timedelta(minutes=float(cfg.get("grace_minutes", 30)))
+        if overdue <= slot.when <= horizon:
+            when = "now" if slot.when <= now else f"at {slot.when:%H:%M}"
+            return f"{slot.label} is due {when}"
+    return None
 
 
 def main() -> int:

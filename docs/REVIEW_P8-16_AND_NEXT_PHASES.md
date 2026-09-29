@@ -564,3 +564,10 @@ fit residuals) must:
 The entry-day count is the effective sample size for anything driven by
 market direction; confidence intervals and "the data couldn't decide"
 calls are made on it, not on the position count.
+
+**Requirement (added 2026-09-29): leave Symbol Lookup trades out.**
+Positions with `sample = lookup` (logged from the Symbol Lookup page, or
+from Trade Detail on a lookup run) are single names picked by hand, not
+draws from a preset's ranked sheet. They are excluded from every accuracy
+statistic (`paper.NOT_FOR_ACCURACY`, `paper.for_accuracy`); their dollar
+P&L and fills still count. Report their number separately.

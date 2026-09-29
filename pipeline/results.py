@@ -252,5 +252,8 @@ def latest_run(finished_only: bool = True, with_analysis: bool = True) -> RunRes
             continue
         if with_analysis and "analyse" not in (result.manifest.stages or {}):
             continue
+        # A one-symbol Symbol Lookup must not become every page's "latest run".
+        if getattr(result.manifest, "kind", "run") == "lookup":
+            continue
         return result
     return None
