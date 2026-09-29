@@ -385,3 +385,19 @@ def test_blocks_sort_chronologically_and_targeted_snapshots_are_skipped(tmp_path
                                     "2026-09-29_rth_10", "2026-09-29_rth_15", "2026-09-29_post"]
     assert chains.latest_block_for("XSP") == "2026-09-29_post"                 # the freshest
     assert chains.latest_block_for("XSP", complete=True) == "2026-09-29_rth_10"  # full chain
+
+
+def test_paper_book_sections_live_on_tracking():
+    """2026-09-29 (Tom): the paper-book sections moved from Decisions to Tracking."""
+    from pathlib import Path
+
+    from streamlit.testing.v1 import AppTest
+    pages = Path(__file__).resolve().parent.parent / "app" / "pages"
+    decisions = (pages / "1_Decisions.py").read_text(encoding="utf-8")
+    assert 'st.subheader("Paper book")' not in decisions and "11_Tracking.py" in decisions
+    if paper.list_positions().empty:
+        pytest.skip("no positions on disk")
+    at = AppTest.from_file(str(pages / "11_Tracking.py"), default_timeout=300).run()
+    assert not at.exception, [e.message for e in at.exception]
+    headers = [h.value for h in at.subheader]
+    assert "Paper book" in headers and "Is the model telling the truth?" in headers

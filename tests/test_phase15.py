@@ -581,6 +581,9 @@ def test_decisions_and_portfolio_render_a_multi_leg_book(ledger):
     at = _app("1_Decisions.py")
     at.run()
     assert not at.exception, [e.message for e in at.exception]
+    at = _app("11_Tracking.py")            # the book's forms moved here on 2026-09-29
+    at.run()
+    assert not at.exception, [e.message for e in at.exception]
     assert any(e.label == "Roll a position" for e in at.expander)
     at = _app("4_Portfolio.py")
     at.run()

@@ -21,6 +21,11 @@ profile -- the research `default` ($3M) and placeholder profiles count in
 probability and %-of-max reports, not in dollars. `flags` marks data-quality
 caveats (`pre_fix_bars`: priced before the Phase 18 partial-bar fix).
 Scheduled marks and auto-logs (Phase 19) run in pipeline/scheduler.py.
+
+Since 2026-09-29 the paper book's own sections live here too (moved from
+Decisions, app/components/paper_book.py): book performance and the ledger,
+the outcome / roll / mark forms, share lots, and "is the model telling the
+truth?". Decisions keeps the proposals and the accept/override flow.
 """
 from __future__ import annotations
 
@@ -234,6 +239,19 @@ else:
     if (~valid).any():
         st.caption(f"{int((~valid).sum())} row(s) sized against the research default or a "
                    "placeholder profile: dollar P&L left out; per-contract outcomes shown.")
+
+# --- The paper book (moved from Decisions) ---------------------------------------------
+
+from app.components import paper_book  # noqa: E402
+
+st.divider()
+st.subheader("Paper book")
+st.caption("Both books. Performance totals in dollars count only rows sized against a real "
+           "profile; outcomes, rolls and marks recorded here apply to any open position.")
+paper_book.book_section()
+st.divider()
+st.subheader("Is the model telling the truth?")
+paper_book.truth_section()
 
 with st.expander("Chain archive"):
     from data_sources import chain_archive
