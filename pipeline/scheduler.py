@@ -12,7 +12,8 @@ Settings page, stored in config/user_settings.yaml -> schedule)
 
     mark          hourly 9:45-15:45: re-mark every open position (both books)
                   -- analytics/tracking.update
-    scan_and_log  once a day per auto preset, 10:45: run the preset, then
+    scan_and_log  once a day per auto preset, 10:45 (or the preset's own `time`,
+                  to stagger them): run the preset, then
                   tracking.auto_log (the C.3 sample; never naked or
                   research-only rows; the preset's daily cap on NEW positions,
                   default K + 2M = 11)
@@ -42,8 +43,9 @@ RULES
 VISIBILITY
     data/scheduler/heartbeat.json   pid, time, state, the next slots
     data/scheduler/history.jsonl    one line per slot: ok / failed / missed /
-                                    skipped / refused, with the message and
-                                    the run id
+                                    skipped / refused, with the message, the
+                                    run id and duration_s (scan_and_log also
+                                    scan_s and log_s)
     data/scheduler/worker.log       the jobs' progress lines and tracebacks
 
 Why a plain loop rather than APScheduler (the review's suggestion): the
@@ -81,7 +83,8 @@ from core.progress import BaseReporter  # noqa: E402
 JOBS = ("mark", "scan_and_log", "observe", "archive", "nightly")
 ORDER = {job: i for i, job in enumerate(JOBS)}
 STATUSES = ("ok", "failed", "missed", "skipped", "refused")
-AUTO_FIELDS = {"top_k": int, "control_m": int, "daily_cap": int, "observe_hourly": bool}
+AUTO_FIELDS = {"top_k": int, "control_m": int, "daily_cap": int, "observe_hourly": bool,
+               "time": str}
 
 log = logging.getLogger("csp.scheduler")
 
@@ -115,7 +118,8 @@ def settings() -> dict:
 
 
 def auto_presets(cfg: dict | None = None) -> dict[str, dict]:
-    """Auto presets with K, M, the daily cap (default K + 2M) filled in."""
+    """Auto presets with K, M, the daily cap (default K + 2M) and the log
+    time (default schedule -> scan_and_log -> time) filled in."""
     cfg = cfg or settings()
     tracking = load_config().get("tracking", {}) or {}
     out = {}
@@ -125,7 +129,8 @@ def auto_presets(cfg: dict | None = None) -> dict[str, dict]:
         m = int(auto.get("control_m", tracking.get("control_m", 3)))
         out[name] = {"top_k": k, "control_m": m,
                      "daily_cap": int(auto.get("daily_cap") or k + 2 * m),
-                     "observe_hourly": bool(auto.get("observe_hourly", False))}
+                     "observe_hourly": bool(auto.get("observe_hourly", False)),
+                     "time": str(auto.get("time") or cfg["scan_and_log"]["time"])}
     return out
 
 
@@ -171,8 +176,8 @@ def plan_day(day: dt.date, cfg: dict | None = None) -> list[Slot]:
             marks.append(t)
         t += step
     slots = [Slot("mark", t) for t in marks]
-    log_time = at(cfg["scan_and_log"]["time"])
     for name, auto in auto_presets(cfg).items():
+        log_time = at(auto["time"])
         if open_ <= log_time < close:
             slots.append(Slot("scan_and_log", log_time, name))
         if auto["observe_hourly"]:
@@ -329,7 +334,9 @@ def job_scan_and_log(slot: Slot, reporter) -> dict:
     auto = auto_presets().get(slot.preset)
     if auto is None:
         raise Refused(f"{slot.preset!r} is no longer marked auto")
+    t0 = time.monotonic()
     request, manifest, sheets = _scan(slot, reporter)
+    t1 = time.monotonic()
     totals = {"opened": 0, "observed": 0, "capped": 0, "excluded": 0}
     for sheet in sheets:
         out = tracking.auto_log(sheet, manifest.run_id, slot.preset, request.account_profile,
@@ -337,11 +344,13 @@ def job_scan_and_log(slot: Slot, reporter) -> dict:
                                 daily_cap=auto["daily_cap"], today=slot.when.date())
         for key in totals:
             totals[key] += out[key]
-    return {"run_id": manifest.run_id,
+    scan_s, log_s = round(t1 - t0, 1), round(time.monotonic() - t1, 1)
+    return {"run_id": manifest.run_id, "scan_s": scan_s, "log_s": log_s,
             "message": (f"{request.account_profile}: opened {totals['opened']}, observed "
                         f"{totals['observed']}, over the daily cap {totals['capped']}, "
                         f"excluded {totals['excluded']} naked/research-only row(s)"
-                        + ("" if sheets else "; the run produced no sheet"))}
+                        + ("" if sheets else "; the run produced no sheet")
+                        + f" [scan {scan_s:.0f}s, log {log_s:.0f}s]")}
 
 
 def job_observe(slot: Slot, reporter) -> dict:
@@ -381,14 +390,15 @@ def execute(slot: Slot, manual: bool = False) -> dict | None:
     """Run one slot and record it. None when the run lock is held (the
     caller retries until the grace runs out)."""
     from pipeline.run import RunLocked
-    started = now_et()
+    started, t0 = now_et(), time.monotonic()
     entry = {"key": ("manual|" if manual else "") + slot.key, "job": slot.job,
              "preset": slot.preset, "planned": slot.when.isoformat(),
              "started": started.isoformat(timespec="seconds")}
     log.info("%s: starting", slot.label)
     try:
         out = RUNNERS[slot.job](slot, LogReporter())
-        entry.update(status="ok", message=out.get("message", ""), run_id=out.get("run_id"))
+        entry.update(status="ok", message=out.get("message", ""), run_id=out.get("run_id"),
+                     **{k: out[k] for k in ("scan_s", "log_s") if k in out})
     except RunLocked as exc:
         log.info("%s: run lock held (%s); will retry", slot.label, exc)
         return None
@@ -398,8 +408,10 @@ def execute(slot: Slot, manual: bool = False) -> dict | None:
         log.error("%s failed:\n%s", slot.label, traceback.format_exc())
         entry.update(status="failed", message=f"{type(exc).__name__}: {exc}")
     entry["finished"] = now_et().isoformat(timespec="seconds")
+    entry["duration_s"] = round(time.monotonic() - t0, 1)
     record(entry)
-    log.info("%s: %s -- %s", slot.label, entry["status"], entry["message"])
+    log.info("%s: %s in %.0fs -- %s", slot.label, entry["status"], entry["duration_s"],
+             entry["message"])
     return entry
 
 

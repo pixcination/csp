@@ -317,7 +317,8 @@ def save_schedule(fields: dict) -> None:
 
 
 def set_auto_preset(name: str, auto: dict | None) -> None:
-    """Mark a saved preset auto ({top_k, control_m, daily_cap, observe_hourly})
+    """Mark a saved preset auto ({top_k, control_m, daily_cap, observe_hourly,
+    optional time HH:MM for its own log slot})
     or clear it (None). Refused unless the preset is fully explicit."""
     from analytics.scan_request import missing_fields
     data = load()
@@ -341,5 +342,13 @@ def set_auto_preset(name: str, auto: dict | None) -> None:
             if not 0 <= clean[key] <= 100:
                 raise SettingsError(f"{key} must be between 0 and 100")
     clean["observe_hourly"] = bool(auto.get("observe_hourly", False))
+    log_time = auto.get("time", (autos.get(name) or {}).get("time"))   # kept across edits
+    if log_time:
+        try:
+            hour, minute = (int(x) for x in str(log_time).split(":"))
+            assert 0 <= hour < 24 and 0 <= minute < 60
+        except (ValueError, AssertionError):
+            raise SettingsError(f"time must be HH:MM, got {log_time!r}") from None
+        clean["time"] = f"{hour:02d}:{minute:02d}"
     autos[name] = clean
     _write(data)

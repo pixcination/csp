@@ -299,7 +299,8 @@ with tab_schedule:
                          "K": auto["top_k"] if auto else None,
                          "M": auto["control_m"] if auto else None,
                          "daily cap": auto["daily_cap"] if auto else None,
-                         "observe hourly": auto["observe_hourly"] if auto else None})
+                         "observe hourly": auto["observe_hourly"] if auto else None,
+                         "log time": auto["time"] if auto else None})
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
         blocked = [r["preset"] for r in rows if r["auto"] and r["placeholder profile"]]
         if blocked:

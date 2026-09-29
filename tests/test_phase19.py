@@ -259,6 +259,13 @@ def test_observe_hourly_fills_the_other_mark_slots():
     assert len(observe) == 6 and all(s.when.strftime("%H:%M") != "10:45" for s in observe)
 
 
+def test_auto_presets_can_be_staggered():
+    cfg = {**CFG, "auto_presets": {"a": {}, "b": {"time": "11:15"}, "c": {"time": "11:30"}}}
+    logs = [s for s in scheduler.plan_day(dt.date(2026, 9, 28), cfg) if s.job == "scan_and_log"]
+    assert [(s.preset, s.when.strftime("%H:%M")) for s in logs] == [
+        ("a", "10:45"), ("b", "11:15"), ("c", "11:30")]
+
+
 def test_decide_wait_run_missed_and_overrun():
     day = dt.date(2026, 9, 28)
     slot = scheduler.Slot("mark", _at(day, "11:45"))

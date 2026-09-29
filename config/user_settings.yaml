@@ -178,7 +178,7 @@ schedule:
       observe_hourly: false
       top_k: 5
     xsp_pcs_roth:
-      control_m: 3
-      daily_cap: 11
+      control_m: 1
+      daily_cap: 3
       observe_hourly: false
-      top_k: 5
+      top_k: 1

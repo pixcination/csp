@@ -549,3 +549,18 @@ in D.3 return sensible sets.
 3. Re-run the probability-engine validation on archived real option prices
    instead of RV × 1.15.
 4. Report what changed and what the data couldn't yet decide.
+
+**Requirement (added 2026-09-28): count entry days, not just positions.**
+Positions logged on the same day share market exposure (one sell-off hits
+all of them), so they are not independent observations. Every accuracy
+statistic in Phase 21 (hit rates, calibration, rank IC, P&L by bucket,
+fit residuals) must:
+
+- group by entry date (per-day aggregates, or errors clustered / block-
+  bootstrapped by entry date), and
+- report the number of entry days next to the number of positions
+  (e.g. "n = 214 positions over 58 entry days").
+
+The entry-day count is the effective sample size for anything driven by
+market direction; confidence intervals and "the data couldn't decide"
+calls are made on it, not on the position count.
