@@ -391,7 +391,7 @@ def universe_skew(tickers: list[str] | None = None, reporter=None) -> pd.DataFra
     with reporter.stage("skew", "Skew and term structure", total=len(tickers)):
         for ticker in tickers:
             try:
-                chain, under = chains.load_chain(ticker)
+                chain, under = chains.load_chain(ticker, complete=True)
                 spot = chains.spot_from_underlying(under)
                 if chain.empty or not spot:
                     reporter.advance(1, note=f"{ticker} no snapshot")

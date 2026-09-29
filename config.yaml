@@ -640,7 +640,7 @@ tracking:
 archive:
   dte_min: 0
   dte_max: 60
-  time_et: "15:45"
+  time_et: "15:30"
 
 # --- Scheduler (Phase 19, pipeline/scheduler.py) --------------------------------
 # Times are ET, trading days only; the Settings page overrides any of this in
@@ -651,7 +651,9 @@ schedule:
   enabled: true
   mark: {start: "09:45", end: "15:45", every_minutes: 60}   # Tom: hourly marks, 7 slots
   scan_and_log: {time: "10:45"}       # Tom 2026-09-28: auto-log once a day per auto preset
-  archive: {time: "15:45"}            # half days: 15 minutes before the close
+  archive: {time: "15:30"}            # 2026-09-29: the 67-ticker archive takes ~13 min; at 15:45
+                                      # (after the mark) it ran 15:49-16:01, past the close. Half
+                                      # days: 30 minutes before the close
   nightly: {time: "18:30"}            # run --data-only, then settle expired tracked positions
   grace_minutes: 30                   # a missed slot still runs if picked up within this
   poll_seconds: 30

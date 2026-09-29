@@ -112,7 +112,7 @@ def rank_rolls(ticker: str, current_strike: float, current_expiration: dt.date,
     from data_sources.yfinance_sync import load_daily
 
     cfg = load_config().get("management", {}).get("defense", {})
-    chain, under = chains.load_chain(ticker)
+    chain, under = chains.load_chain(ticker, complete=True)
     spot = chains.spot_from_underlying(under)
     if chain.empty or not spot:
         return []

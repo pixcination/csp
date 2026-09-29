@@ -435,7 +435,7 @@ def load_chain_for(row: dict, block: str | None = None) -> pd.DataFrame:
         chain = pd.DataFrame()
     if chain.empty and block is not None:
         try:
-            chain, _ = chains.load_chain(row["ticker"])
+            chain, _ = chains.load_chain(row["ticker"], complete=True)
         except Exception:
             chain = pd.DataFrame()
     return chain

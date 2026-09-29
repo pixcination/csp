@@ -214,7 +214,7 @@ def run(tickers: list[str], request=None, spec_ids: list[str] | None = None,
         from data_sources import chains as _chains
 
         def chain_loader(t):
-            chain, under = _chains.load_chain(t)
+            chain, under = _chains.load_chain(t, complete=True)
             return chain, _chains.spot_from_underlying(under)
 
     account = sizing.account_from_config(request.account_profile,

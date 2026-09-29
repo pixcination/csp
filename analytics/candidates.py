@@ -119,14 +119,17 @@ def evaluate_universe(tickers: list[str] | None = None,
 
     rows: list = []                  # Recommendation | SpreadRecommendation
     annotated: list[dict] = []
+    notes: dict[str, str] = {}       # per ticker, kept in the census (Phase 19 follow-up)
     wants_csp, wants_pcs = "csp" in request.strategies, "pcs" in request.strategies
     with reporter.stage("candidates", "Ranking candidates", total=len(tickers)):
         for ticker in tickers:
             try:
-                chain, under = chains.load_chain(ticker)
+                chain, under = chains.load_chain(ticker, complete=True)
                 spot = chains.spot_from_underlying(under)
                 if chain.empty or not spot:
-                    reporter.advance(1, note=f"{ticker} no snapshot")
+                    notes[ticker] = ("no chain snapshot" if chain.empty
+                                     else "no spot in the snapshot")
+                    reporter.advance(1, note=f"{ticker} {notes[ticker]}")
                     continue
                 metrics = metrics_by_symbol.get(ticker)
                 ctx = TickerContext.build(ticker, chain, spot, today, metrics)
@@ -134,6 +137,7 @@ def evaluate_universe(tickers: list[str] | None = None,
                 strikes = _candidate_strikes(chain, spot, today, cfg, request) \
                     if csp_ok else pd.DataFrame()
                 if strikes.empty and not wants_pcs:
+                    notes[ticker] = "no strikes in band"
                     reporter.advance(1, note=f"{ticker} no strikes in band")
                     continue
 
@@ -193,15 +197,24 @@ def evaluate_universe(tickers: list[str] | None = None,
 
                 new = rows[before:]
                 accepted = sum(1 for r in new if r.accepted)
+                exps = sorted(pd.to_datetime(chain["expiration"]).dt.date.unique())
+                notes[ticker] = (f"{accepted} of {len(new)} passed; chain {len(chain)} rows, "
+                                 f"{len(exps)} expiration(s) to {exps[-1] if exps else '-'}")
                 reporter.advance(1, note=f"{ticker} {accepted} of {len(new)} passed")
             except Exception as exc:
+                notes[ticker] = f"error: {type(exc).__name__}: {exc}"
                 reporter.advance(1, note=f"{ticker} error")
                 reporter.log(f"{ticker}: {type(exc).__name__}: {exc}")
 
     if not rows:
-        return pd.DataFrame()
+        empty = pd.DataFrame()
+        empty.attrs["census"] = {"strikes_examined": 0, "tickers": 0, "accepted": 0,
+                                 "by_reason": [], "headline": "no candidate built",
+                                 "ticker_notes": notes}
+        return empty
 
     census = rejection_census(rows)
+    census["ticker_notes"] = notes
     dominant = (census["by_reason"][0][1] / max(census["strikes_examined"], 1)
                 if census["by_reason"] else 0.0)
     if census["accepted"] == 0 or dominant > 0.6:

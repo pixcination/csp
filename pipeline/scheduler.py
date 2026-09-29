@@ -20,13 +20,14 @@ Settings page, stored in config/user_settings.yaml -> schedule)
     observe       optional, per auto preset with observe_hourly: the preset at
                   the other mark slots; observations for already-tracked rows
                   only, nothing opened
-    archive       15:45: the full-universe chain snapshot (chain_archive)
+    archive       15:30: the full-universe chain snapshot (chain_archive; ~13 min,
+                  so it finishes inside the session)
     nightly       18:30: `run --data-only` (bars, earnings, metrics, events,
                   Stage 1), then settle expired tracked positions
 
 RULES
     Half days     slots at or after the close are dropped; the archive moves
-                  to 15 minutes before the close (12:45 on a 13:00 close).
+                  to 30 minutes before the close (12:30 on a 13:00 close).
     Holidays/DST  the NYSE calendar in ET (core.market_calendar).
     Missed slots  asleep, powered off, or busy: a slot runs if picked up within
                   `grace_minutes` (30) of its time, else it is logged `missed`.
@@ -182,7 +183,7 @@ def plan_day(day: dt.date, cfg: dict | None = None) -> list[Slot]:
             slots.append(Slot("scan_and_log", log_time, name))
         if auto["observe_hourly"]:
             slots += [Slot("observe", t, name) for t in marks if t != log_time]
-    archive = min(at(cfg["archive"]["time"]), close - dt.timedelta(minutes=15))
+    archive = min(at(cfg["archive"]["time"]), close - dt.timedelta(minutes=30))
     if archive >= open_:
         slots.append(Slot("archive", archive))
     slots.append(Slot("nightly", at(cfg["nightly"]["time"])))
@@ -283,6 +284,13 @@ class LogReporter(BaseReporter):
 
     def _on_log(self, message):
         log.info("  %s", message)
+
+    def _on_advance(self, record):
+        # Per-item notes only when something was skipped or failed, so a
+        # missing ticker is explained in the log (2026-09-29: XSP vanished).
+        note = record.note or ""
+        if any(w in note for w in ("no chain", "no spot", "no snapshot", "error", "failed")):
+            log.info("    %s", note)
 
 
 def check_auto(name: str):

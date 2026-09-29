@@ -222,7 +222,7 @@ def test_json_requests_inherit_scan_defaults_and_say_so():
 
 CFG = {"enabled": True, "grace_minutes": 30, "mark": {"start": "09:45", "end": "15:45",
                                                         "every_minutes": 60},
-       "scan_and_log": {"time": "10:45"}, "archive": {"time": "15:45"},
+       "scan_and_log": {"time": "10:45"}, "archive": {"time": "15:30"},
        "nightly": {"time": "18:30"},
        "auto_presets": {"auto_pcs": {"top_k": 5, "control_m": 3}}}
 
@@ -242,12 +242,12 @@ def test_plan_normal_day_half_day_and_holiday():
     assert len(logs) == 1 and logs[0].preset == "auto_pcs" and logs[0].when == _at(day, "10:45")
     at_1045 = [s.job for s in plan if s.when == _at(day, "10:45")]
     assert at_1045 == ["mark", "scan_and_log"]                     # mark first
-    assert [s.job for s in plan][-2:] == ["archive", "nightly"]
+    assert [s.job for s in plan][-3:] == ["archive", "mark", "nightly"]   # 15:30, 15:45, 18:30
     auto = scheduler.auto_presets(CFG)["auto_pcs"]
     assert auto["daily_cap"] == 11                                 # K + 2M
     half = scheduler.plan_day(dt.date(2026, 11, 27), CFG)          # 13:00 close
     assert max(s.when for s in half if s.job == "mark") == _at(dt.date(2026, 11, 27), "12:45")
-    assert [s for s in half if s.job == "archive"][0].when == _at(dt.date(2026, 11, 27), "12:45")
+    assert [s for s in half if s.job == "archive"][0].when == _at(dt.date(2026, 11, 27), "12:30")
     assert scheduler.plan_day(dt.date(2026, 11, 26), CFG) == []    # Thanksgiving
     assert scheduler.plan_day(dt.date(2026, 10, 3), CFG) == []     # Saturday
     assert scheduler.plan_day(day, {**CFG, "enabled": False}) == []
@@ -347,3 +347,41 @@ def test_schedule_settings_validate(settings_file):
         us.save_schedule({"nightly": {"time": "25:00"}})
     with pytest.raises(us.SettingsError):
         us.save_schedule({"bogus": 1})
+
+
+# --- Fixes from the first unattended day (2026-09-29) ------------------------------------------
+
+def test_holdings_for_portfolio_limits_count_taken_only(ledger):
+    from pipeline import run
+    tracking.log([PCS])                                              # tracked SPY
+    paper.accept(dict(PCS, ticker="QQQ", trade_id=None), actual_fill=2.0)   # taken QQQ
+    assert run._tickers_with_positions() == {"SPY", "QQQ"}           # chains: both
+    assert run._tickers_with_positions(book="taken") == {"QQQ"}      # limits: real trades
+
+
+def test_census_explains_every_ticker(monkeypatch):
+    from analytics import candidates
+    from data_sources import chains
+    monkeypatch.setattr(chains, "load_chain", lambda t, block=None, complete=False: (pd.DataFrame(), pd.DataFrame()))
+    frame = candidates.evaluate_universe(["XSP"], request=ScanRequest.default(
+        strategies=["pcs"], universe=["XSP"]))
+    assert frame.empty
+    assert frame.attrs["census"]["ticker_notes"] == {"XSP": "no chain snapshot"}
+
+
+def test_blocks_sort_chronologically_and_targeted_snapshots_are_skipped(tmp_path, monkeypatch):
+    from data_sources import chains
+    monkeypatch.setattr(chains, "chains_dir", lambda: tmp_path)
+    blocks = ["2026-09-29_post", "2026-09-29_rth_09", "2026-09-29_rth_15", "2026-09-29_pre",
+              "2026-09-28_closed", "2026-09-29_rth_10"]
+    for block in blocks:
+        chain_path, under_path = chains._paths("XSP", block)
+        chain_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({"expiration": ["2026-11-20"]}).to_parquet(chain_path)
+        pd.DataFrame([{"mark": 700.0, "targeted_only": block in ("2026-09-29_post",
+                                                                   "2026-09-29_rth_15")}]
+                     ).to_parquet(under_path)
+    assert chains.list_blocks() == ["2026-09-28_closed", "2026-09-29_pre", "2026-09-29_rth_09",
+                                    "2026-09-29_rth_10", "2026-09-29_rth_15", "2026-09-29_post"]
+    assert chains.latest_block_for("XSP") == "2026-09-29_post"                 # the freshest
+    assert chains.latest_block_for("XSP", complete=True) == "2026-09-29_rth_10"  # full chain

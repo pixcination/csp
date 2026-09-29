@@ -576,6 +576,18 @@ def capture(ticker: str, dte_max: int | None = None, dte_min: int = 0,
                 frame = pd.concat([old, frame], ignore_index=True)
             under_frame["dte_min"], under_frame["dte_max"] = recorded
             result.dte_window = recorded
+            # A targeted pull into an empty block holds only the positions'
+            # expirations: never the "latest complete chain" (2026-09-29: the
+            # hourly marks left one-expiration XSP snapshots that later
+            # analyses read as the whole chain).
+            targeted_only = True
+            if existing is not None:
+                try:
+                    prior = pd.read_parquet(existing.under_path)
+                    targeted_only = bool(prior.get("targeted_only", pd.Series([False])).iloc[0])
+                except Exception:
+                    targeted_only = False
+            under_frame["targeted_only"] = targeted_only
         frame.to_parquet(chain_path, index=False)
         under_frame.to_parquet(under_path, index=False)
 
@@ -689,25 +701,58 @@ def capture_targets(tickers: list[str], request, with_positions: set[str] | None
 
 # --- Reading ---------------------------------------------------------------
 
+def block_order(block: str) -> tuple:
+    """Chronological key for a session block name: within a day pre, then
+    rth_HH by hour, then post, then closed (the overnight block carries the
+    close's date). Plain name order put `closed` < `post` < `pre` < `rth_*`,
+    so after the close the "latest" block was the day's last RTH hour."""
+    day, _, kind = block.partition("_")
+    rank = {"pre": 0.0, "post": 30.0, "closed": 40.0}.get(kind)
+    if rank is None and kind.startswith("rth_"):
+        try:
+            rank = 1.0 + int(kind[4:])
+        except ValueError:
+            rank = 25.0
+    return (day, 50.0 if rank is None else rank, block)
+
+
 def list_blocks() -> list[str]:
     root = chains_dir()
     if not root.is_dir():
         return []
-    return sorted(p.name for p in root.iterdir() if p.is_dir())
+    return sorted((p.name for p in root.iterdir() if p.is_dir()), key=block_order)
 
 
-def latest_block_for(ticker: str, rth_only: bool = False) -> str | None:
+def _targeted_only(ticker: str, block: str) -> bool:
+    under_path = _paths(ticker, block)[1]
+    if not under_path.exists():
+        return False
+    try:
+        under = pd.read_parquet(under_path, columns=None)
+    except Exception:
+        return False
+    return bool("targeted_only" in under and bool(under["targeted_only"].iloc[0]))
+
+
+def latest_block_for(ticker: str, rth_only: bool = False, complete: bool = False) -> str | None:
+    """The newest block holding this ticker. `complete=True` skips snapshots
+    made only by a targeted (open-positions) refresh."""
     for block in reversed(list_blocks()):
         if rth_only and "_rth_" not in block:
             continue
         if _paths(ticker, block)[0].exists():
+            if complete and _targeted_only(ticker, block):
+                continue
             return block
     return None
 
 
-def load_chain(ticker: str, block: str | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load a snapshot. Defaults to the most recent one for that ticker."""
-    block = block or latest_block_for(ticker)
+def load_chain(ticker: str, block: str | None = None,
+               complete: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load a snapshot. Defaults to the most recent one for that ticker;
+    `complete=True` (analysis: candidates, rolls, skew, covered calls, the
+    recommender) the most recent one that is not a targeted refresh only."""
+    block = block or latest_block_for(ticker, complete=complete)
     if block is None:
         return pd.DataFrame(), pd.DataFrame()
     chain_path, under_path = _paths(ticker, block)

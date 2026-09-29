@@ -495,7 +495,9 @@ def _stage_analyse(reporter: BaseReporter, manifest: RunManifest,
         # participate in the selection, not audit it.
         from analytics import portfolio
 
-        held = sorted(_tickers_with_positions())
+        # Real trades only: 2026-09-29's auto-logs were all "blocked on
+        # concentration" by tracked forward tests counted as holdings.
+        held = sorted(_tickers_with_positions(book="taken"))
         with reporter.stage("portfolio", "Portfolio construction", total=1):
             try:
                 selection = portfolio.select(best, held=held)
@@ -664,11 +666,13 @@ def _stage_strategies(reporter: BaseReporter, manifest: RunManifest, tickers: li
             "seconds": round(out["seconds"], 1), "persisted": written}
 
 
-def _tickers_with_positions() -> set[str]:
-    """Tickers with an open paper-book position (chains get a wider window)."""
+def _tickers_with_positions(book: str | None = None) -> set[str]:
+    """Tickers with an open paper-book position (chains get a wider window).
+    `book="taken"` for anything that counts against the account (portfolio
+    construction): tracked forward tests never do (Phase 18, review C.2)."""
     try:
         from analytics import paper
-        frame = paper.list_positions(status="open")
+        frame = paper.list_positions(status="open", book=book)
         if frame.empty:
             return set()
         return set(frame["ticker"].str.upper())
@@ -821,6 +825,12 @@ def run(tickers: list[str] | None = None, quick: bool = False,
                 guarded("chains", _stage_chains, reporter, manifest, targets,
                         force_chains, request, holder["ranked"])
             # CSP needs a physically settled name; PCS runs on indices too.
+            # Held tickers join the chain pull (marks, rolls) but never the
+            # candidate sheet: 2026-09-29's XSP-only preset built candidates
+            # for 20 held tickers and auto-logged a QQQ spread.
+            from analytics.scan_request import resolve_universe
+            in_scope = set(resolve_universe(request))
+            targets = [t for t in targets if t in in_scope]
             analysable = [t for t in targets if "pcs" in request.strategies
                           or t in tradable or t not in registered]
             guarded("analyse", _stage_analyse, reporter, manifest, analysable,

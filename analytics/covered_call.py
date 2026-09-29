@@ -289,7 +289,7 @@ def candidates_for_lot(ticker: str, shares: int, basis: float,
     from data_sources.yfinance_sync import load_daily
 
     cfg = load_config().get("management", {}).get("covered_call", {})
-    chain, under = chains.load_chain(ticker)
+    chain, under = chains.load_chain(ticker, complete=True)
     spot = chains.spot_from_underlying(under)
     if chain.empty or not spot or "call_delta" not in chain.columns:
         return []
