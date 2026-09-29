@@ -11,9 +11,10 @@ TWO BOOKS (`paper_positions.book`)
 
 WHAT GETS LOGGED (C.3 -- measure the model, not the choices)
     `sample_rows(sheet)` picks, from one ranked sheet:
-      top      the first K passing rows (default 5)
-      control  M random passing rows further down, and M random near-miss
-               rejected rows (exactly one failed gate), default M = 3
+      top        the first K passing rows (default 5)
+      control    M random passing rows further down (default M = 3)
+      near_miss  M random rejected rows that failed exactly one gate
+               (labelled `control` before 2026-09-29, relabelled then)
     Positions are deduplicated on `dedupe_key` (the sheet's trade_id:
     strategy, ticker, expiry, strikes). Seeing an open logged trade again
     appends a row to `tracking_observations` (price, rank, probabilities)
@@ -256,7 +257,7 @@ def sample_rows(sheet: pd.DataFrame, k: int | None = None, m: int | None = None,
         if "rejections" in rejected else rejected.iloc[0:0]
     near = near.iloc[sorted(rng.choice(len(near), min(m, len(near)), replace=False))] \
         if len(near) else near
-    return pd.concat([top, control.assign(sample="control"), near.assign(sample="control")],
+    return pd.concat([top, control.assign(sample="control"), near.assign(sample="near_miss")],
                      ignore_index=True)
 
 
@@ -395,7 +396,7 @@ def auto_log(sheet: pd.DataFrame, run_id: str, preset: str, account_profile: str
     finally:
         con.close()
     # Already-open rows only add observations; new ones fill the room in
-    # sample order (top first, then controls).
+    # sample order (top first, then controls, then near-misses).
     new_rank = np.cumsum([not o for o in is_open])
     allowed = [o or n <= room for o, n in zip(is_open, new_rank)]
     kept = picked[allowed]

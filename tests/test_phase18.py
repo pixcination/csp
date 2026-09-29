@@ -97,9 +97,9 @@ def test_sample_rows_top_control_and_near_miss():
     top = picked[picked["sample"] == "top"]
     assert list(top["trade_id"]) == ["t0", "t1", "t2", "t3", "t4"]
     assert list(top["rank"]) == [1, 2, 3, 4, 5]
-    control = picked[picked["sample"] == "control"]
-    passing = control[control["accepted"]]
-    near = control[~control["accepted"]]
+    passing = picked[picked["sample"] == "control"]
+    near = picked[picked["sample"] == "near_miss"]
+    assert passing["accepted"].all() and not near["accepted"].any()
     assert len(passing) == 3 and set(passing["trade_id"]) <= {f"t{i}" for i in range(5, 20)}
     assert len(near) == 3 and all(len(r) == 1 for r in near["rejections"])
     again = tracking.sample_rows(sheet, k=5, m=3, seed="run-1")

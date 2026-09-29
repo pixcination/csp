@@ -89,7 +89,7 @@ from analytics import costs
 from core.paths import db_trade_log, load_config
 
 BOOKS = ("taken", "tracked")
-SAMPLES = ("top", "control", "manual")
+SAMPLES = ("top", "control", "near_miss", "manual")
 STATUSES = ["open", "expired_otm", "closed_early", "rolled", "assigned", "settled"]
 CYCLE_STATES = ["put_open", "shares_held", "call_open", "closed"]
 STRATEGIES = ("csp", "pcs")
