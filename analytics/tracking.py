@@ -660,11 +660,65 @@ def _extremes(con, position_id: int) -> tuple[float | None, float | None]:
     return (_f(row[0]), _f(row[1])) if row else (None, None)
 
 
+def reuse_since(now: dt.datetime | None = None) -> dt.datetime:
+    """The oldest capture a mark reuses instead of pulling again (Tom
+    2026-09-29): anything from the last `tracking.reuse_chain_minutes` (20),
+    and when an archive finished inside that window, anything it captured --
+    the 15:45 mark reads the whole 15:30 archive, however long it took. An
+    archive run by hand hours earlier widens nothing."""
+    from data_sources import chain_archive
+    now = now or dt.datetime.now()
+    window = dt.timedelta(minutes=float(_cfg().get("reuse_chain_minutes", 20)))
+    since = now - window
+    try:
+        latest = next(iter(chain_archive.list_archives()), None)
+        started = dt.datetime.fromisoformat(latest["captured_at"]) if latest else None
+        finished = started + dt.timedelta(seconds=float(latest.get("seconds") or 0)) \
+            if started else None
+    except (OSError, ValueError, TypeError):
+        started = finished = None
+    if started and since <= finished <= now:
+        since = min(since, started)
+    return since
+
+
+def fresh_snapshot(ticker: str, legs: pd.DataFrame, since: dt.datetime,
+                   today: dt.date) -> str | None:
+    """The block of `ticker`'s newest snapshot when it prices every unexpired
+    leg from a capture at or after `since`; None when the mark must pull.
+    Only the newest block counts, because that is the one the marks read."""
+    from analytics import book as book_mod
+    from data_sources import chains
+
+    block = chains.latest_block_for(ticker)
+    if block is None:
+        return None
+    chain, _ = chains.load_chain(ticker, block)
+    if chain.empty or "captured_at" not in chain:
+        return None
+    for _, leg in legs.iterrows():
+        leg = leg.to_dict()
+        exp = pd.Timestamp(leg["expiration"]).date()
+        if exp < today:
+            continue
+        quote = book_mod.leg_quote(chain, leg)
+        if quote is None or quote["mark"] is None:
+            return None
+        rows = chain[pd.to_datetime(chain["expiration"]).dt.date == exp]
+        if pd.to_datetime(rows["captured_at"]).min() < pd.Timestamp(since):
+            return None
+    return block
+
+
 def update(position_ids: list[int] | None = None, pull: bool = True, book: str | None = None,
            n_paths: int | None = None, source: str = "update", reporter=None,
-           now: dt.datetime | None = None) -> pd.DataFrame:
+           now: dt.datetime | None = None, reuse: bool = True) -> pd.DataFrame:
     """Re-mark open positions (C.4): targeted chain pull for their tickers,
-    then one `position_marks` row per position. Returns the new marks."""
+    then one `position_marks` row per position. Returns the new marks;
+    `.attrs["chains"]` = {"pulled", "reused"} ticker counts.
+
+    `reuse` (Tom 2026-09-29): a ticker whose newest snapshot prices every
+    leg from a capture since `reuse_since()` is not pulled again."""
     from analytics import book as book_mod
     from analytics import paper
     from core.market_calendar import session_block
@@ -682,7 +736,9 @@ def update(position_ids: list[int] | None = None, pull: bool = True, book: str |
         return pd.DataFrame()
     legs = paper.list_legs(positions["id"].astype(int).tolist())
     tickers = sorted(set(positions["ticker"].str.upper()))
+    pulled, reused = 0, 0
     if pull:
+        since = reuse_since(now) if reuse else None
         with reporter.stage("chains", "Chains for open positions", total=len(tickers)):
             for ticker in tickers:
                 mine = legs[legs["position_id"].isin(
@@ -692,6 +748,12 @@ def update(position_ids: list[int] | None = None, pull: bool = True, book: str |
                 if not wanted:
                     reporter.advance(1, note=f"{ticker}: expired, nothing to pull")
                     continue
+                block = fresh_snapshot(ticker, mine, since, today) if since else None
+                if block:
+                    reused += 1
+                    reporter.advance(1, note=f"{ticker}: reused {block}")
+                    continue
+                pulled += 1
                 res = chains.capture(ticker, force=True, expirations=wanted)
                 reporter.advance(1, note=f"{ticker}: {res.rows} rows" if res.ok
                                  else f"{ticker}: {res.error or res.reason}")
@@ -772,7 +834,9 @@ def update(position_ids: list[int] | None = None, pull: bool = True, book: str |
             reporter.advance(1, note=f"#{row['id']} {ticker}: "
                                      + (f"{pct:+.0%} of max" if pct is not None else "unpriced")
                                      + f", {record['verdict'] or 'no verdict'}")
-    return pd.DataFrame(out)
+    frame = pd.DataFrame(out)
+    frame.attrs["chains"] = {"pulled": pulled, "reused": reused}
+    return frame
 
 
 # --- Reading --------------------------------------------------------------------------------

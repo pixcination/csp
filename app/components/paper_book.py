@@ -42,6 +42,14 @@ def book_section() -> None:
             st.caption(" · ".join(
                 f"{name.upper()}: {v['n_closed']} closed, {v['profit_rate']:.0%} profitable, "
                 f"${v['total_realized']:,.0f}" for name, v in stats["by_strategy"].items()))
+        lookup = stats.get("tracked_lookup") or {}
+        if lookup.get("n_closed"):
+            annualised = lookup["mean_annualised"]
+            st.caption(f"Symbol Lookup, tracked: {lookup['n_closed']} closed, "
+                       f"${lookup['total_realized']:,.0f}"
+                       + (f", {annualised:.1%} mean annualised" if annualised == annualised
+                          else "")
+                       + ". Not in the totals above; taken lookup trades are.")
 
         shown = positions.copy()
         shown["legs"] = [paper.leg_text(r) for _, r in shown.iterrows()]

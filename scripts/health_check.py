@@ -36,15 +36,26 @@ MARK_WARN_MIN = 10.0
 
 MARK_FIX = """\
 Proposed fix (mark over {limit:.0f} min: {why}):
-  1. Reuse fresh chains. tracking.update force-pulls every held ticker's chain
-     (chains.capture(force=True)); skip tickers whose chain block is under ~20
-     minutes old -- the 10:45 scans and the 15:30 archive have just pulled most
-     of them. Cuts the chain phase, which scales with tickers.
-  2. Fewer paths for the mark's probabilities-from-now (n_paths, e.g. 4000 ->
+  (Done 2026-09-30: a mark reuses snapshots under 20 minutes old, and the
+  15:45 mark reads the 15:30 archive -- see the `reused` column.)
+  1. Fewer paths for the mark's probabilities-from-now (n_paths, e.g. 4000 ->
      1000): the marks phase scales with open positions.
+  2. Run the 10:45 mark after the scans, so it reuses their chains (today it
+     runs first and pulls every held ticker itself).
   3. If neither is enough: mark every 2 hours (Settings -> Schedule ->
      every_minutes = 120), or mark the taken book hourly and the tracked
      book twice a day."""
+
+# Days the scheduler has not yet handled live (Tom 2026-09-29). Each is flagged
+# ahead of time, then checked against history.jsonl once it has passed.
+WATCH_AHEAD_DAYS = 14
+FIRSTS = [
+    (dt.date(2026, 11, 2), "DST ends Sun Nov 1: first trading day on EST (UTC-5)"),
+    (dt.date(2026, 11, 26), "Thanksgiving: market closed, no slots"),
+    (dt.date(2026, 11, 27), "Half day (13:00 close): archive 12:30, last mark 12:45"),
+    (dt.date(2026, 12, 24), "Half day (13:00 close): archive 12:30, last mark 12:45"),
+    (dt.date(2026, 12, 25), "Christmas: market closed, no slots"),
+]
 
 
 def _minutes(entry: dict) -> float | None:
@@ -88,6 +99,132 @@ def log_phases() -> dict[str, dict]:
     return out
 
 
+def _day_result(day: dt.date) -> str:
+    """How the scheduler handled a past day: every planned slot recorded
+    and ok (none on a closed day), and the marks on time."""
+    got = {e["key"]: e for e in scheduler.history(since=day)
+           if (scheduler._parse(e.get("planned")) or now_et()).date() == day}
+    planned = scheduler.plan_day(day)
+    if not planned:
+        return "ok: closed, no slots ran" if not got else \
+            f"PROBLEM: closed day but {len(got)} slot(s) recorded"
+    missing = [s.label for s in planned if s.key not in got]
+    bad = [k for k, e in got.items() if e.get("status") != "ok"]
+    late = []
+    for s in planned:
+        started = scheduler._parse((got.get(s.key) or {}).get("started"))
+        if s.job == "mark" and started and (started - s.when).total_seconds() > 600:
+            late.append(f"{s.label} started {started:%H:%M}")
+    if not (missing or bad or late):
+        return f"ok: {len(planned)} slot(s), all ok and on time"
+    return "PROBLEM: " + "; ".join(
+        ([f"not recorded: {', '.join(missing)}"] if missing else [])
+        + ([f"not ok: {', '.join(bad)}"] if bad else [])
+        + ([f"late: {', '.join(late)}"] if late else []))
+
+
+def _first_45dte_expiry() -> tuple[dt.date | None, str]:
+    """The earliest expiration among positions opened at 30+ DTE, and how
+    the book stands: anything past its expiration still open is a failure."""
+    import pandas as pd
+    from analytics import paper
+    from core.freshness import last_completed_session
+    frame = paper.list_positions()
+    if frame.empty:
+        return None, "no positions"
+    exp, entry = pd.to_datetime(frame["expiration"]).dt.date, \
+        pd.to_datetime(frame["entry_date"]).dt.date
+    long_dated = frame[[(e - n).days >= 30 for e, n in zip(exp, entry)]]
+    if long_dated.empty:
+        return None, "no 30+ DTE positions yet"
+    exps = pd.to_datetime(long_dated["expiration"]).dt.date
+    done = last_completed_session()
+    overdue = long_dated[(long_dated["status"] == "open") & (exps < done)]
+    first = min(exps)
+    settled = long_dated[(long_dated["status"] != "open")]
+    state = (f"PROBLEM: {len(overdue)} position(s) past expiration still open "
+             f"(#{', #'.join(str(i) for i in overdue['id'].head(8))})" if len(overdue)
+             else f"ok: {len(settled)} settled" if len(settled) else "none settled yet")
+    return first, state
+
+
+def _earnings_gate(now: dt.datetime) -> list[str]:
+    """When the weekly auto-logs first lose tickers to the October earnings
+    gate: forecast from the earnings calendar, then per auto-log run the
+    tickers the gate removed."""
+    import pandas as pd
+    from core.paths import load_universe
+    from data_sources.yfinance_sync import load_earnings
+    from pipeline import results
+    out, met = [], set()
+    presets = scheduler.auto_presets(scheduler.settings())
+    today = now.date()
+    runs = [e for e in scheduler.history(since=dt.date(today.year, 9, 29))
+            if e["job"] == "scan_and_log" and e.get("run_id")]
+    for e in runs:
+        if e.get("preset") in met:
+            continue
+        try:
+            cand = results.load_run(e["run_id"]).candidates
+        except Exception:
+            continue
+        if cand is None or cand.empty or "rejections" not in cand:
+            continue
+        hit = cand[cand["rejections"].astype(str).str.contains(r"earnings 20\d\d-10-")]
+        if hit.empty:
+            continue
+        met.add(e.get("preset"))
+        out.append(f"  {e.get('preset')}: met on {e['key'][:10]} ({hit['ticker'].nunique()} "
+                   f"ticker(s) removed for October reports, {int(cand['accepted'].sum())} "
+                   f"accepted, slot {e.get('status')})")
+    try:
+        cal = load_earnings()
+        cal = cal[cal["ticker"].isin(set(load_universe(scope="all")))]
+        cal_dates = pd.to_datetime(cal["earnings_date"]).dt.date
+        october = cal[[d.month == 10 and d.year == today.year and d >= today
+                       for d in cal_dates]]
+    except Exception:
+        october = pd.DataFrame()
+    if not october.empty:
+        first = min(pd.to_datetime(october["earnings_date"]).dt.date)
+        names = sorted(october.loc[pd.to_datetime(october["earnings_date"]).dt.date == first,
+                                   "ticker"])
+        from core import user_settings
+        saved = user_settings.scan_presets()
+        # Single-stock weeklies expire on Fridays: the gate first applies when the
+        # Friday after the report comes inside the preset's DTE window.
+        friday = first + dt.timedelta(days=(4 - first.weekday()) % 7)
+        for name in presets:
+            dte_max = int((saved.get(name) or {}).get("dte_max") or 0)
+            if name in met or not 0 < dte_max < 30:
+                continue
+            bites = friday - dt.timedelta(days=dte_max)
+            out.append(f"  {name}: not met yet; expected from {bites:%a %b %d} "
+                       f"({', '.join(names)} report {first:%b %d}, the {friday:%b %d} "
+                       f"expiry enters the {dte_max}-DTE window). Far fewer stock "
+                       f"candidates for a few weeks is expected, not a fault.")
+    return out or ["  nothing to report (earnings calendar empty)"]
+
+
+def watch_list(now: dt.datetime) -> list[str]:
+    today = now.date()
+    lines = ["", "Firsts the scheduler has not handled live yet:"]
+    items = list(FIRSTS)
+    first, state = _first_45dte_expiry()
+    if first:
+        items.append((first, f"First 45-DTE expiry settles (nightly expire_due): {state}"))
+    for day, what in sorted(items):
+        ahead = (day - today).days
+        if ahead > WATCH_AHEAD_DAYS:
+            lines.append(f"  {day:%a %b %d}  in {ahead} days      {what}")
+        elif ahead >= 0:
+            lines.append(f"  {day:%a %b %d}  COMING UP ({ahead}d)  {what}")
+        else:
+            lines.append(f"  {day:%a %b %d}  passed          {what} -> {_day_result(day)}")
+    lines += ["", "October earnings gate (auto-logs):"] + _earnings_gate(now)
+    return lines
+
+
 def report(days: int = 7, now: dt.datetime | None = None) -> str:
     now = now or now_et()
     since = now.date() - dt.timedelta(days=days - 1)
@@ -123,12 +260,14 @@ def report(days: int = 7, now: dt.datetime | None = None) -> str:
     marks = [e for e in entries if e["job"] == "mark" and e.get("status") == "ok"]
     lines += ["", "Mark job (chains scale with tickers, marks with open positions):",
               f"  {'day':10} {'runs':>4} {'median':>7} {'longest':>8} {'chains':>7} "
-              f"{'tickers':>7} {'marks':>6} {'positions':>9} {'s/ticker':>8} {'s/pos':>6}"]
+              f"{'pulled':>7} {'reused':>6} {'marks':>6} {'positions':>9} {'s/ticker':>8} "
+              f"{'s/pos':>6}"]
     worst = None
     per_day: dict[str, list[dict]] = defaultdict(list)
     for e in marks:
         planned = scheduler._parse(e.get("planned"))
-        phases = {k: e.get(k) for k in ("chain_s", "marks_s", "tickers", "positions")}
+        phases = {k: e.get(k) for k in ("chain_s", "marks_s", "tickers", "reused",
+                                         "positions")}
         if phases["chain_s"] is None and planned is not None:
             phases.update(parsed.get(f"{planned:%Y-%m-%dT%H:%M}", {}))
         if phases.get("positions") is None:
@@ -145,7 +284,8 @@ def report(days: int = 7, now: dt.datetime | None = None) -> str:
         lines.append(
             f"  {day:10} {len(rows):>4} {statistics.median(mins):>6.1f}m {max(mins):>7.1f}m "
             + (f"{chain:>6.0f}s" if chain is not None else f"{'--':>7}")
-            + f" {tick if tick is not None else '--':>7} "
+            + f" {tick if tick is not None else '--':>7}"
+            + f" {last.get('reused') if last.get('reused') is not None else '--':>6} "
             + (f"{mk:>5.0f}s" if mk is not None else f"{'--':>6}")
             + f" {pos if pos is not None else '--':>9} "
             + (f"{chain / tick:>8.1f}" if chain and tick else f"{'--':>8}")
@@ -190,6 +330,7 @@ def report(days: int = 7, now: dt.datetime | None = None) -> str:
         lines += ["", f"Symbol Lookups: {len(done)}, median {statistics.median(secs):.0f}s, "
                       f"longest {max(secs):.0f}s; over the {lookup.TARGET_SECONDS}s target: "
                       f"{len(over)}"]
+    lines += watch_list(now)
     return "\n".join(lines)
 
 

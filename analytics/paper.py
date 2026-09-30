@@ -1094,8 +1094,15 @@ def performance() -> dict:
     closed["annualised"] = (closed["realized"] / collateral) * (365.0 / days)
     closed["strategy"] = closed["strategy"].fillna("csp")
     # Dollar totals only over rows sized against a real account (Phase 18
-    # follow-up); rates and probabilities use every closed row.
-    valid = dollar_valid(closed)
+    # follow-up); rates and probabilities use every closed row. Tracked Symbol
+    # Lookup rows get their own line, not the headline (Tom 2026-09-29, 20B
+    # decision 3); taken lookup trades are real money and stay in.
+    tracked_lookup = ((closed["book"].fillna("taken") == "tracked") if "book" in closed
+                      else pd.Series(False, index=closed.index)) \
+        & (closed["sample"] == "lookup" if "sample" in closed
+           else pd.Series(False, index=closed.index))
+    lookup_money = closed[dollar_valid(closed) & tracked_lookup]
+    valid = dollar_valid(closed) & ~tracked_lookup
 
     by_strategy = {}
     for name, group in closed.groupby("strategy"):
@@ -1106,7 +1113,7 @@ def performance() -> dict:
             "total_realized": float(money["realized"].sum()),
             "mean_annualised": float(money["annualised"].mean()) if len(money)
             else float("nan"),
-            "n_dollar_excluded": int(len(group) - len(money)),
+            "n_dollar_excluded": int((~dollar_valid(group)).sum()),
         }
 
     scored = for_accuracy(closed)
@@ -1121,7 +1128,11 @@ def performance() -> dict:
         "total_realized": float(closed.loc[valid, "realized"].sum()),
         "mean_annualised": float(closed.loc[valid, "annualised"].mean()) if valid.any()
         else float("nan"),
-        "n_dollar_excluded": int((~valid).sum()),
+        "n_dollar_excluded": int((~dollar_valid(closed)).sum()),
+        "tracked_lookup": {"n_closed": int(tracked_lookup.sum()),
+                           "total_realized": float(lookup_money["realized"].sum()),
+                           "mean_annualised": float(lookup_money["annualised"].mean())
+                           if len(lookup_money) else float("nan")},
         "predicted_win_rate": float(scored["rec_prob_otm"].dropna().mean())
         if scored["rec_prob_otm"].notna().any() else float("nan"),
         "by_strategy": by_strategy,

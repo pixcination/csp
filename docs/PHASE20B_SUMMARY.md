@@ -105,10 +105,55 @@ plus 300 open positions, a mark would pass 15 minutes. If a mark goes over
 15 minutes, the report prints the proposed fix; over 10 minutes it prints a
 "watch" line:
 
-1. Reuse chains under ~20 minutes old instead of `force=True`.
-2. Use fewer simulation paths for the probabilities from now.
+1. Use fewer simulation paths for the probabilities from now.
+2. Run the 10:45 mark after the scans, so it reuses their chains.
 3. Mark every 2 hours, or mark the tracked book less often than the taken
    book.
+
+### 3a. Mark: reuse fresh chains (2026-09-29, before the freeze)
+
+With whole-universe presets most of the 67 tickers will soon hold open
+positions, so the mark would pass 15 minutes. Tom's fix, now in
+`tracking.update`:
+- A ticker whose newest snapshot prices every leg from a capture in the last
+  20 minutes (`tracking.reuse_chain_minutes`) isn't pulled again.
+- If an archive finished inside those 20 minutes, everything it captured
+  counts too. So the 15:45 mark reads the 15:30 archive (and the 12:45 mark
+  reads the 12:30 archive on half days), however long the archive took.
+- The history records `tickers` (pulled) and `reused`. The health check
+  shows both.
+
+Measured on the current book (42 open positions, 20 tickers, a copy of the
+ledger, 2026-09-29 21:30 ET):
+
+| | total | chains | marks |
+|---|---|---|---|
+| Before: pull every ticker | 213 s | 189 s (20 pulled) | 23 s |
+| After: every snapshot fresh | 21 s | 0 s (20 reused) | 21 s |
+
+With the current schedule, only the 15:45 mark finds fresh snapshots. At
+10:45 the mark runs before the scans, and at 11:45 the scans finished about
+30 minutes earlier. The other marks pull as before. That's fix 2 above, if
+it's needed.
+
+### 3b. Firsts the scheduler hasn't handled live
+
+The report ends with a watch list. Each date shows "in N days" until it is
+14 days away, then "COMING UP". Once it has passed, the report checks it
+against the history: every planned slot is recorded and `ok`, marks start
+within 10 minutes, and a closed day has no slots.
+- Mon Nov 2: the first trading day after DST ends (EST, UTC-5)
+- The first 45-DTE expiry, taken from the book: Nov 6 (2 PCS), then Nov 20
+  (24 positions). It is flagged if anything past its expiration is still
+  open.
+- Thu Nov 26 closed, Fri Nov 27 half day (archive 12:30, last mark 12:45)
+- Thu Dec 24 half day, Fri Dec 25 closed
+- The October earnings gate, per auto preset: the first auto-log that
+  removed tickers for October reports. Until then, a forecast from the
+  earnings calendar. `csp_weekly_taxable` is expected from Mon Oct 5: JPM,
+  C and WFC report Oct 13, and the Oct 16 expiry enters the 11-DTE window.
+  Both PCS presets met the gate on 2026-09-29. XSP's entry comes from the
+  run before the universe fix (e94312a) and won't recur.
 
 ## 4. macOS preparation
 
@@ -144,7 +189,14 @@ Behaviour on Windows is unchanged.
 - The worker was restarted on the new code after the nightly job, outside
   10:40–11:20 and 15:25–15:50.
 
-## 6. Decisions to confirm
+## 6. Decisions (confirmed by Tom 2026-09-29)
+
+1, 2, 4 and 5 were accepted as written. Tom changed 3: slippage includes
+lookup trades, and dollar P&L includes taken lookup trades. Tracked lookup
+trades show on their own line (Tracking -> Paper book), not in the headline
+tracked totals (`paper.performance()["tracked_lookup"]`). 6 stands.
+
+The original proposals:
 
 1. **Lookup runs are ordinary run folders** marked `kind: lookup`, so Trade
    Detail works unchanged. They count toward run retention like any run

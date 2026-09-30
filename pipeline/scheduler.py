@@ -12,7 +12,9 @@ JOBS (trading days only, times ET; config.yaml -> schedule, overridden on the
 Settings page, stored in config/user_settings.yaml -> schedule)
 
     mark          hourly 9:45-15:45: re-mark every open position (both books)
-                  -- analytics/tracking.update
+                  -- analytics/tracking.update; a ticker whose snapshot is
+                  under 20 min old is not pulled again, and the 15:45 mark
+                  reads the 15:30 archive
     scan_and_log  once a day per auto preset, 10:45 (or the preset's own `time`,
                   to stagger them): run the preset, then
                   tracking.auto_log (the C.3 sample; never naked or
@@ -337,12 +339,17 @@ def job_mark(slot: Slot, reporter) -> dict:
     # The two phases apart for the weekly health check: chain pulls scale with
     # tickers, marks and probabilities with positions.
     chains, marks = reporter.records.get("chains"), reporter.records.get("marks")
+    # `tickers` counts pulls only (s/ticker stays a pull cost); `reused` the
+    # tickers read from a snapshot under 20 minutes old or today's archive.
+    counts = new.attrs.get("chains", {})
     phases = {"chain_s": round(chains.elapsed, 1) if chains else None,
               "marks_s": round(marks.elapsed, 1) if marks else None,
-              "tickers": chains.total if chains else 0, "positions": int(len(new))}
+              "tickers": int(counts.get("pulled", chains.total if chains else 0)),
+              "reused": int(counts.get("reused", 0)), "positions": int(len(new))}
     return {**phases, "message": f"marked {len(new)} open position(s), {priced} priced"
                                  + (f" [chains {phases['chain_s']:.0f}s for {phases['tickers']} "
-                                    f"ticker(s), marks {phases['marks_s']:.0f}s]"
+                                    f"ticker(s), {phases['reused']} reused, "
+                                    f"marks {phases['marks_s']:.0f}s]"
                                     if chains and marks else "")}
 
 

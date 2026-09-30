@@ -633,6 +633,8 @@ tracking:
   top_k: 5
   control_m: 3
   n_paths: 4000                       # engine paths per position per update (probabilities from now)
+  reuse_chain_minutes: 20             # Tom 2026-09-29: a mark reuses a ticker's snapshot captured in
+                                      # the last 20 min (and the whole archive, if it finished in them)
 
 # --- Daily chain archive (Phase 18, scripts/archive_chains.py) ------------------
 # Review C.6: a full-universe, strike-filtered snapshot once a day (15:45 ET),

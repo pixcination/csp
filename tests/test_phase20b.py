@@ -200,11 +200,20 @@ def test_lookup_trades_are_sample_lookup_and_left_out_of_accuracy(runs, ledger):
     con = paper._connect()
     try:
         con.execute("UPDATE paper_positions SET status = 'expired_otm', exit_date = "
-                    "DATE '2026-08-28', exit_price = 0, rec_prob_otm = 0.8")
+                    "DATE '2026-08-28', exit_price = 0, rec_prob_otm = 0.8, "
+                    "dollar_pnl_valid = TRUE")
     finally:
         con.close()
     stats = paper.performance()
     assert stats["n_closed"] == 3 and stats["n_scored"] == 1
+    # Decision 3 (Tom 2026-09-29): the tracked lookup trade is its own line; the
+    # taken one (strike 9) and the tracked top row (strike 10) are the headline.
+    each = 0.18 * 100 * 2
+    fees = paper.list_positions().set_index("strike")["entry_fees"].fillna(0.0)
+    assert stats["tracked_lookup"]["n_closed"] == 1
+    assert stats["tracked_lookup"]["total_realized"] == pytest.approx(each - fees[11.0], abs=0.01)
+    assert stats["total_realized"] == pytest.approx(2 * each - fees[9.0] - fees[10.0], abs=0.01)
+    assert stats["n_dollar_excluded"] == 0
     assert taken.position_id
 
 
@@ -252,9 +261,11 @@ def test_health_check_reports_mark_phases_and_proposes_a_fix(tmp_path, monkeypat
     ]
     monkeypatch.setattr(scheduler, "history", lambda since=None, limit=None: hist)
     monkeypatch.setattr(lookup, "recent", lambda limit=20: [])
+    monkeypatch.setattr(health_check, "_first_45dte_expiry", lambda: (None, ""))
+    monkeypatch.setattr(health_check, "_earnings_gate", lambda now: [])
     text = health_check.report(7, now=_at("19:00"))
     assert "Jobs over 15 minutes: 1" in text and "2026-09-30|mark|-|09:45: 16.7 min" in text
-    assert "Proposed fix" in text and "Reuse fresh chains" in text
+    assert "Proposed fix" in text and "Fewer paths" in text
     assert "9.5" in text and "0.95" in text                 # s/ticker, s/position
     assert "Not ok: 1" in text
 
@@ -302,3 +313,79 @@ def test_launchd_plist(tmp_path):
     assert plist["WorkingDirectory"] == str(tmp_path)
     bare = plistlib.loads(launchd_agent.plist_bytes("py", tmp_path, caffeinate=False))
     assert bare["ProgramArguments"][0] == "py"
+
+
+# --- The mark reuses fresh snapshots (Tom 2026-09-29) ----------------------------------------
+
+PCS = {"strategy": "pcs", "ticker": "SPY", "strike": 700.0, "long_strike": 690.0,
+       "expiration": "2026-11-20", "modelled_fill": 2.00, "contracts": 3,
+       "bid": 5.00, "ask": 5.20, "mid": 5.10, "long_bid": 3.00, "long_ask": 3.12,
+       "long_mid": 3.06, "implied_vol": 0.18, "long_iv": 0.20, "delta": -0.25,
+       "long_delta": -0.17, "headline_policy": "close_50_stop_2x_or_21dte",
+       "settlement": "physical", "spot": 740.0, "em": 25.0, "accepted": True,
+       "trade_id": "pcs|SPY|2026-11-20|700|690"}
+
+
+def _snapshot(captured_at, strikes=(700.0, 690.0)):
+    rows = [{"expiration": "2026-11-20", "strike_price": k, "root_symbol": "SPY",
+             "put_bid": 1.9, "put_ask": 2.1, "put_mark": 2.0, "put_iv": 0.18,
+             "put_delta": -0.2, "put_gamma": 0.004, "put_theta": -0.1, "put_vega": 0.9,
+             "captured_at": captured_at} for k in strikes]
+    return pd.DataFrame(rows), pd.DataFrame([{"mark": 740.0}])
+
+
+@pytest.mark.parametrize("age_min, archive, strikes, pulls", [
+    (10, None, (700.0, 690.0), 0),                  # under 20 minutes: reused
+    (30, None, (700.0, 690.0), 1),                  # older: pulled
+    (10, None, (700.0,), 1),                        # a leg missing from the snapshot: pulled
+    (35, (40, 5), (700.0, 690.0), 0),               # the archive finished 5 min ago: reused
+    (35, (200, 180), (700.0, 690.0), 1),            # an archive hours ago widens nothing
+])
+def test_mark_reuses_fresh_snapshots_and_the_archive(ledger, monkeypatch, age_min, archive,
+                                                     strikes, pulls):
+    from data_sources import chain_archive, chains
+    tracking.log([PCS])
+    now = dt.datetime(2026, 9, 30, 15, 45)
+    snap = _snapshot(now - dt.timedelta(minutes=age_min), strikes)
+    calls = []
+    monkeypatch.setattr(chains, "latest_block_for", lambda t, **k: "2026-09-30_rth_15")
+    monkeypatch.setattr(chains, "load_chain", lambda t, block=None, **k: snap)
+    monkeypatch.setattr(chains, "capture", lambda t, **k: calls.append(t) or
+                        chains.CaptureResult(ticker=t, ok=True))
+    manifests = [] if archive is None else [{
+        "date": "2026-09-30", "seconds": (archive[0] - archive[1]) * 60.0,
+        "captured_at": (now - dt.timedelta(minutes=archive[0])).isoformat(timespec="seconds")}]
+    monkeypatch.setattr(chain_archive, "list_archives", lambda: manifests)
+    new = tracking.update(n_paths=200, now=now)
+    assert len(calls) == pulls
+    assert new.attrs["chains"] == {"pulled": pulls, "reused": 1 - pulls}
+
+
+# --- Health check: the firsts the scheduler has not handled live -------------------------
+
+def test_health_check_flags_firsts_ahead_and_checks_them_after(tmp_path, monkeypatch):
+    from scripts import health_check
+    monkeypatch.setattr(health_check, "_first_45dte_expiry",
+                        lambda: (dt.date(2026, 11, 20), "none settled yet"))
+    monkeypatch.setattr(health_check, "_earnings_gate", lambda now: ["  gate"])
+    half = scheduler.plan_day(dt.date(2026, 11, 27))
+    assert max(s.when for s in half if s.job == "mark").strftime("%H:%M") == "12:45"
+    assert [s.when.strftime("%H:%M") for s in half if s.job == "archive"] == ["12:30"]
+    assert scheduler.plan_day(dt.date(2026, 11, 26)) == []
+    assert scheduler.plan_day(dt.date(2026, 11, 2))[0].when.utcoffset() == dt.timedelta(hours=-5)
+
+    def entry(slot, status="ok", late=0):
+        return {"key": slot.key, "job": slot.job, "status": status,
+                "planned": slot.when.isoformat(),
+                "started": (slot.when + dt.timedelta(minutes=late)).isoformat()}
+    hist = [entry(s) for s in half]
+    monkeypatch.setattr(scheduler, "history", lambda since=None, limit=None: hist)
+    lines = "\n".join(health_check.watch_list(_at("19:00", dt.date(2026, 11, 13))))
+    assert "COMING UP (7d)" in lines and "First 45-DTE expiry" in lines
+    assert "COMING UP (13d)" in lines and "in 41 days" in lines and "gate" in lines
+    lines = "\n".join(health_check.watch_list(_at("19:00", dt.date(2026, 11, 30))))
+    assert "Thanksgiving: market closed, no slots -> ok: closed" in lines
+    assert f"-> ok: {len(half)} slot(s), all ok and on time" in lines
+    hist[:] = [entry(s, late=15 if s.job == "mark" else 0) for s in half[1:]]
+    lines = "\n".join(health_check.watch_list(_at("19:00", dt.date(2026, 11, 30))))
+    assert "PROBLEM: not recorded" in lines and "late:" in lines
