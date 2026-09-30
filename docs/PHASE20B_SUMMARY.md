@@ -124,7 +124,7 @@ positions, so the mark would pass 15 minutes. Tom's fix, now in
   shows both.
 
 Measured on the current book (42 open positions, 20 tickers, a copy of the
-ledger, 2026-09-29 21:30 ET):
+ledger, 2026-09-29 about 21:15 ET):
 
 | | total | chains | marks |
 |---|---|---|---|

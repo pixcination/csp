@@ -3,6 +3,10 @@ Weekly health check of the scheduled jobs (data/scheduler/history.jsonl).
 
     .venv\Scripts\python scripts\health_check.py            # the last 7 days
     .venv\Scripts\python scripts\health_check.py --days 14
+    .venv\Scripts\python scripts\health_check.py --save    # also data/scheduler/health/<date>.txt
+
+The Windows task "CSP weekly health check" runs it with --save every Saturday
+(`scripts/health_check.py --install-task`).
 
 Reports, per job (and auto preset): slots by status, median and longest
 duration; every slot that did not finish `ok`; every job over 15 minutes;
@@ -337,8 +341,27 @@ def report(days: int = 7, now: dt.datetime | None = None) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Weekly scheduler health check.")
     ap.add_argument("--days", type=int, default=7)
+    ap.add_argument("--save", action="store_true",
+                    help="also write data/scheduler/health/<date>.txt")
+    ap.add_argument("--install-task", action="store_true",
+                    help="create the Windows task that runs --save every Saturday 10:00")
     args = ap.parse_args()
-    print(report(args.days))
+    if args.install_task:
+        import subprocess
+        command = (f'"{ROOT / ".venv" / "Scripts" / "pythonw.exe"}" '
+                   f'"{ROOT / "scripts" / "health_check.py"}" --save')
+        done = subprocess.run(["schtasks", "/Create", "/F", "/TN", "CSP weekly health check",
+                               "/SC", "WEEKLY", "/D", "SAT", "/ST", "10:00", "/RL", "LIMITED",
+                               "/TR", command], capture_output=True, text=True)
+        print((done.stdout or done.stderr).strip())
+        return done.returncode
+    text = report(args.days)
+    if args.save:
+        folder = scheduler.folder() / "health"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"{now_et().date()}.txt").write_text(text + "\n", encoding="utf-8")
+    if sys.stdout is not None:
+        print(text)
     return 0
 
 
