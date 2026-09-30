@@ -12,8 +12,8 @@ Reports, per job (and auto preset): slots by status, median and longest
 duration; every slot that did not finish `ok`; every job over 15 minutes;
 the auto-logs' positions; the archive's size; Symbol Lookups and their time
 against the 90 s target; and the MARK job in detail -- per day, its duration
-split into chain pulls (scale with tickers) and marks (scale with open
-positions). A mark over 15 minutes gets a proposed fix, before it pushes
+split into quotes (one DXLink session for the held legs) and marks (scale
+with open positions). A mark over 15 minutes gets a proposed fix, before it pushes
 into the next hourly slot (the 10:45 mark into the 11:45 one).
 
 Marks recorded before the phase split was stored (2026-09-29) are split
@@ -38,17 +38,15 @@ from pipeline import scheduler  # noqa: E402
 LONG_JOB_MIN = 15.0
 MARK_WARN_MIN = 10.0
 
-MARK_FIX = """\
-Proposed fix (mark over {limit:.0f} min: {why}):
-  (Done 2026-09-30: a mark reuses snapshots under 20 minutes old, and the
-  15:45 mark reads the 15:30 archive -- see the `reused` column.)
-  1. Fewer paths for the mark's probabilities-from-now (n_paths, e.g. 4000 ->
-     1000): the marks phase scales with open positions.
-  2. Run the 10:45 mark after the scans, so it reuses their chains (today it
-     runs first and pulls every held ticker itself).
-  3. If neither is enough: mark every 2 hours (Settings -> Schedule ->
-     every_minutes = 120), or mark the taken book hourly and the tracked
-     book twice a day."""
+MARK_FIX = """Proposed fix (mark over {limit:.0f} min: {why}):
+  (Done 2026-09-30: the mark quotes only the held legs and underlyings, in one
+  DXLink session, and reuses snapshots under 20 minutes old or the archive.
+  Hourly marks at full paths stay -- managed outcomes and target-hit scoring
+  depend on them.)
+  1. The marks phase scales with open positions (s/pos): profile it (daily
+     bars, market context and the engine, per position) and share what
+     repeats per ticker.
+  2. Run the 10:45 mark after the scans, so it reuses their chains."""
 
 # Days the scheduler has not yet handled live (Tom 2026-09-29). Each is flagged
 # ahead of time, then checked against history.jsonl once it has passed.
@@ -262,16 +260,16 @@ def report(days: int = 7, now: dt.datetime | None = None) -> str:
     # --- The mark job ---------------------------------------------------------------
     parsed = log_phases()
     marks = [e for e in entries if e["job"] == "mark" and e.get("status") == "ok"]
-    lines += ["", "Mark job (chains scale with tickers, marks with open positions):",
-              f"  {'day':10} {'runs':>4} {'median':>7} {'longest':>8} {'chains':>7} "
-              f"{'pulled':>7} {'reused':>6} {'marks':>6} {'positions':>9} {'s/ticker':>8} "
+    lines += ["", "Mark job (quotes: held legs in one session; marks scale with positions):",
+              f"  {'day':10} {'runs':>4} {'median':>7} {'longest':>8} {'quotes':>7} "
+              f"{'tickers':>7} {'reused':>6} {'legs':>5} {'marks':>6} {'positions':>9} "
               f"{'s/pos':>6}"]
     worst = None
     per_day: dict[str, list[dict]] = defaultdict(list)
     for e in marks:
         planned = scheduler._parse(e.get("planned"))
-        phases = {k: e.get(k) for k in ("chain_s", "marks_s", "tickers", "reused",
-                                         "positions")}
+        phases = {k: e.get(k) for k in ("chain_s", "marks_s", "tickers", "reused", "legs",
+                                         "unquoted", "positions")}
         if phases["chain_s"] is None and planned is not None:
             phases.update(parsed.get(f"{planned:%Y-%m-%dT%H:%M}", {}))
         if phases.get("positions") is None:
@@ -289,13 +287,18 @@ def report(days: int = 7, now: dt.datetime | None = None) -> str:
             f"  {day:10} {len(rows):>4} {statistics.median(mins):>6.1f}m {max(mins):>7.1f}m "
             + (f"{chain:>6.0f}s" if chain is not None else f"{'--':>7}")
             + f" {tick if tick is not None else '--':>7}"
-            + f" {last.get('reused') if last.get('reused') is not None else '--':>6} "
+            + f" {last.get('reused') if last.get('reused') is not None else '--':>6}"
+            + f" {last.get('legs') if last.get('legs') is not None else '--':>5} "
             + (f"{mk:>5.0f}s" if mk is not None else f"{'--':>6}")
-            + f" {pos if pos is not None else '--':>9} "
-            + (f"{chain / tick:>8.1f}" if chain and tick else f"{'--':>8}")
+            + f" {pos if pos is not None else '--':>9}"
             + (f" {mk / pos:>6.2f}" if mk and pos else f" {'--':>6}"))
         if worst is None or max(mins) > worst[1]:
             worst = (day, max(mins), last)
+    unquoted = [(r["key"], r["unquoted"]) for rows in per_day.values() for r in rows
+                if r.get("unquoted")]
+    if unquoted:
+        lines.append(f"  Unquoted legs (left unpriced): " + ", ".join(
+            f"{k[:16]} {n}" for k, n in unquoted[:8]))
     if worst:
         day, top, last = worst
         if top > LONG_JOB_MIN:

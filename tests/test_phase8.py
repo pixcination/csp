@@ -423,6 +423,21 @@ def test_stale_daily_bars_warn(daily_db, monkeypatch):
     assert "behind" in item.age
 
 
+def test_daily_bars_freshness_ignores_symbols_off_the_registry(daily_db, monkeypatch):
+    # Tom 2026-09-29: BRK.B's leftover bars made preflight warn; only active,
+    # non-ad-hoc registry symbols count.
+    from core import freshness
+    monkeypatch.setattr(freshness, "db_universe_daily", lambda: daily_db)
+    _insert(daily_db, _raw_frame(ticker="ORPHAN", n=20, ex_index=5))
+    _insert(daily_db, _raw_frame(ticker="LIVE", n=300))
+    assert "ORPHAN" in freshness._daily_bars(freshness.thresholds()).detail
+    item = freshness._daily_bars(freshness.thresholds(), ["LIVE"])
+    assert "LIVE" in item.detail and "ORPHAN" not in item.detail
+    from data_sources import universe
+    monkeypatch.setattr(universe, "symbols", lambda scope="csp": ["LIVE"])
+    assert freshness._tracked_symbols() == ["LIVE"]
+
+
 def test_freshness_report_never_raises(monkeypatch, tmp_path):
     from core import freshness
     monkeypatch.setattr(freshness, "db_universe_daily", lambda: tmp_path / "none.duckdb")

@@ -713,12 +713,15 @@ def fresh_snapshot(ticker: str, legs: pd.DataFrame, since: dt.datetime,
 def update(position_ids: list[int] | None = None, pull: bool = True, book: str | None = None,
            n_paths: int | None = None, source: str = "update", reporter=None,
            now: dt.datetime | None = None, reuse: bool = True) -> pd.DataFrame:
-    """Re-mark open positions (C.4): targeted chain pull for their tickers,
-    then one `position_marks` row per position. Returns the new marks;
-    `.attrs["chains"]` = {"pulled", "reused"} ticker counts.
+    """Re-mark open positions (C.4), then one `position_marks` row per
+    position. Returns the new marks; `.attrs["chains"]` = {"pulled",
+    "reused", "legs", "rest", "unquoted"}.
 
-    `reuse` (Tom 2026-09-29): a ticker whose newest snapshot prices every
-    leg from a capture since `reuse_since()` is not pulled again."""
+    Quotes (Tom 2026-09-29): a ticker whose newest snapshot prices every leg
+    from a capture since `reuse_since()` reads that snapshot; every other
+    ticker's held legs and underlying are quoted together in one DXLink
+    session (`chains.quote_legs`), kept in memory -- no chain is pulled or
+    written. Full chains come from the scans and the 15:30 archive."""
     from analytics import book as book_mod
     from analytics import paper
     from core.market_calendar import session_block
@@ -736,34 +739,50 @@ def update(position_ids: list[int] | None = None, pull: bool = True, book: str |
         return pd.DataFrame()
     legs = paper.list_legs(positions["id"].astype(int).tolist())
     tickers = sorted(set(positions["ticker"].str.upper()))
-    pulled, reused = 0, 0
+    counts = {"pulled": 0, "reused": 0, "legs": 0, "rest": 0, "unquoted": 0}
+    quoted: dict = {}
     if pull:
         since = reuse_since(now) if reuse else None
-        with reporter.stage("chains", "Chains for open positions", total=len(tickers)):
+        to_quote = []
+        with reporter.stage("chains", "Leg quotes for open positions", total=len(tickers)):
             for ticker in tickers:
                 mine = legs[legs["position_id"].isin(
                     positions.loc[positions["ticker"].str.upper() == ticker, "id"])]
-                wanted = {pd.Timestamp(e).date() for e in mine["expiration"]
-                          if pd.Timestamp(e).date() >= today}
-                if not wanted:
-                    reporter.advance(1, note=f"{ticker}: expired, nothing to pull")
+                live = mine[[pd.Timestamp(e).date() >= today for e in mine["expiration"]]]
+                if live.empty:
+                    reporter.advance(1, note=f"{ticker}: expired, nothing to quote")
                     continue
                 block = fresh_snapshot(ticker, mine, since, today) if since else None
                 if block:
-                    reused += 1
+                    counts["reused"] += 1
                     reporter.advance(1, note=f"{ticker}: reused {block}")
                     continue
-                pulled += 1
-                res = chains.capture(ticker, force=True, expirations=wanted)
-                reporter.advance(1, note=f"{ticker}: {res.rows} rows" if res.ok
-                                 else f"{ticker}: {res.error or res.reason}")
+                to_quote.append(live.assign(ticker=ticker))
+            if to_quote:
+                res = chains.quote_legs(pd.concat(to_quote, ignore_index=True),
+                                        limiter=chains.SubscriptionLimiter(
+                                            load_config().get("stage3_subs_per_minute_budget",
+                                                              8000)),
+                                        reporter=reporter, now=now)
+                if res.symbols and len(res.missing) == res.symbols:
+                    # Fail the slot (red on Schedule) rather than record a book
+                    # of unpriced marks as a successful run.
+                    raise RuntimeError(f"no leg quotes: stream {res.stream_error or 'empty'}, "
+                                       f"REST returned none of {res.symbols}")
+                quoted = res.frames
+                counts.update(pulled=len(res.frames), legs=res.symbols, rest=res.rest_fallback,
+                              unquoted=len(res.missing))
+                reporter.advance(len(res.frames), note=(
+                    f"{res.symbols} legs of {len(res.frames)} ticker(s) in one session, "
+                    f"{res.streamed} streamed, {res.rest_fallback} by REST"
+                    + (f", {len(res.missing)} unquoted" if res.missing else "")))
     block = session_block(now)
     out = []
     with reporter.stage("marks", "Marks and probabilities", total=len(positions)):
         for _, pos in positions.iterrows():
             row = pos.to_dict()
             ticker = str(row["ticker"]).upper()
-            chain, under = chains.load_chain(ticker)
+            chain, under = quoted.get(ticker) or chains.load_chain(ticker)
             spot = chains.spot_from_underlying(under)
             mine = legs[legs["position_id"] == row["id"]].sort_values("leg_index")
             marked = book_mod.mark_position(row, mine, chain, spot, today)
@@ -835,7 +854,7 @@ def update(position_ids: list[int] | None = None, pull: bool = True, book: str |
                                      + (f"{pct:+.0%} of max" if pct is not None else "unpriced")
                                      + f", {record['verdict'] or 'no verdict'}")
     frame = pd.DataFrame(out)
-    frame.attrs["chains"] = {"pulled": pulled, "reused": reused}
+    frame.attrs["chains"] = counts
     return frame
 
 

@@ -265,8 +265,9 @@ def test_health_check_reports_mark_phases_and_proposes_a_fix(tmp_path, monkeypat
     monkeypatch.setattr(health_check, "_earnings_gate", lambda now: [])
     text = health_check.report(7, now=_at("19:00"))
     assert "Jobs over 15 minutes: 1" in text and "2026-09-30|mark|-|09:45: 16.7 min" in text
-    assert "Proposed fix" in text and "Fewer paths" in text
-    assert "9.5" in text and "0.95" in text                 # s/ticker, s/position
+    assert "Proposed fix" in text and "profile it" in text
+    assert "Fewer paths" not in text and "every 2 hours" not in text   # Tom: never
+    assert "0.95" in text                                   # s/position
     assert "Not ok: 1" in text
 
 
@@ -348,17 +349,95 @@ def test_mark_reuses_fresh_snapshots_and_the_archive(ledger, monkeypatch, age_mi
     now = dt.datetime(2026, 9, 30, 15, 45)
     snap = _snapshot(now - dt.timedelta(minutes=age_min), strikes)
     calls = []
+
+    def quote_legs(legs, **k):
+        calls.append(sorted(set(legs["ticker"])))
+        fresh = _snapshot(now)
+        return chains.LegQuotes(frames={"SPY": fresh}, symbols=len(legs), streamed=len(legs))
     monkeypatch.setattr(chains, "latest_block_for", lambda t, **k: "2026-09-30_rth_15")
     monkeypatch.setattr(chains, "load_chain", lambda t, block=None, **k: snap)
-    monkeypatch.setattr(chains, "capture", lambda t, **k: calls.append(t) or
-                        chains.CaptureResult(ticker=t, ok=True))
+    monkeypatch.setattr(chains, "capture", lambda *a, **k: pytest.fail("no chain pulls"))
+    monkeypatch.setattr(chains, "quote_legs", quote_legs)
     manifests = [] if archive is None else [{
         "date": "2026-09-30", "seconds": (archive[0] - archive[1]) * 60.0,
         "captured_at": (now - dt.timedelta(minutes=archive[0])).isoformat(timespec="seconds")}]
     monkeypatch.setattr(chain_archive, "list_archives", lambda: manifests)
     new = tracking.update(n_paths=200, now=now)
-    assert len(calls) == pulls
-    assert new.attrs["chains"] == {"pulled": pulls, "reused": 1 - pulls}
+    assert calls == [["SPY"]] * pulls
+    assert new.attrs["chains"]["pulled"] == pulls and new.attrs["chains"]["reused"] == 1 - pulls
+    assert new.attrs["chains"]["legs"] == 2 * pulls
+    assert new["mark"].notna().all()
+
+
+class _FakeTT:
+    """tastytrade_common stand-in: DXLink quotes what `streamed` holds."""
+    def __init__(self, streamed, rest):
+        from data_sources import tastytrade_client as tt
+        self.real, self.streamed, self.rest, self.sessions = tt.common(), streamed, rest, []
+
+    def __getattr__(self, name):                     # empty_strike_row, apply_* ...
+        return getattr(self.real, name)
+
+    def fetch_quote_token(self):
+        return "token", "wss://x"
+
+    async def stream_market_events_once(self, url, token, symbols, collect):
+        self.sessions.append(list(symbols))
+        return {s: p for s, p in self.streamed.items() if s in symbols}
+
+    def fetch_rest_market_data(self, symbols, kind, chunk_size=90):
+        return {s: self.rest[s] for s in symbols if s in self.rest}
+
+
+def test_quote_legs_one_session_rest_fallback_and_index_mark(monkeypatch):
+    from data_sources import chains
+    from data_sources import tastytrade_client as tt
+    assert chains.occ_symbol("SPXW", "2026-11-20", "put", 7390) == "SPXW  261120P07390000"
+    assert chains.occ_symbol("F", dt.date(2026, 10, 2), "call", 11.5) == "F     261002C00011500"
+    greeks = {"iv": 0.2, "delta": -0.2, "gamma": 0.01, "theta": -0.1, "vega": 0.5}
+    fake = _FakeTT(streamed={
+        ".SPXW261120P7390": {"bid": 66.2, "ask": 67.2, **greeks},
+        ".SPY261120P735": {"bid": 6.68, "ask": 6.72, **greeks},
+        "SPX": {"bid": 7643.1, "ask": 7707.9, "last": 7670.8},     # wide: use last
+        "SPY": {"bid": 765.48, "ask": 765.52, "last": 764.3},      # tight: use the mid
+    }, rest={"SPY   261120P00705000": {"bid": "3.46", "ask": "3.48", "mark": "3.47"}})
+    monkeypatch.setattr(tt, "common", lambda: fake)
+    monkeypatch.setattr(tt, "authenticate", lambda: None)
+    legs = pd.DataFrame([
+        {"ticker": "SPX", "root_symbol": "SPXW", "expiration": "2026-11-20",
+         "option_type": "put", "strike": 7390.0},
+        {"ticker": "SPY", "root_symbol": "SPY", "expiration": "2026-11-20",
+         "option_type": "put", "strike": 735.0},
+        {"ticker": "SPY", "root_symbol": "SPY", "expiration": "2026-11-20",
+         "option_type": "put", "strike": 705.0},                   # REST fallback
+        {"ticker": "SPY", "root_symbol": "SPY", "expiration": "2026-11-20",
+         "option_type": "put", "strike": 700.0}])                  # nobody quotes it
+    out = chains.quote_legs(legs, limiter=chains.SubscriptionLimiter(8000),
+                            collect_seconds=0)
+    assert len(fake.sessions) == 1 and sorted(fake.sessions[0])[-2:] == ["SPX", "SPY"]
+    assert out.symbols == 4 and out.subscriptions == 6 and out.streamed == 2
+    assert out.rest_fallback == 1 and out.missing == ["SPY   261120P00700000"]
+    spx_chain, spx_under = out.frames["SPX"]
+    assert chains.spot_from_underlying(spx_under) == pytest.approx(7670.8)
+    assert chains.spot_from_underlying(out.frames["SPY"][1]) == pytest.approx(765.50)
+    from analytics import book
+    quote = book.leg_quote(spx_chain, legs.iloc[0].to_dict())
+    assert quote["mark"] == pytest.approx(66.7) and quote["delta"] == -0.2
+    spy = out.frames["SPY"][0]
+    assert book.leg_quote(spy, legs.iloc[2].to_dict())["mark"] == pytest.approx(3.47)
+    assert book.leg_quote(spy, legs.iloc[3].to_dict())["mark"] is None
+    assert set(spy["quote_source"]) == {"legs"}
+
+
+def test_mark_fails_the_slot_when_no_leg_is_quoted(ledger, monkeypatch):
+    from data_sources import chain_archive, chains
+    tracking.log([PCS])
+    monkeypatch.setattr(chains, "latest_block_for", lambda t, **k: None)
+    monkeypatch.setattr(chain_archive, "list_archives", lambda: [])
+    monkeypatch.setattr(chains, "quote_legs", lambda legs, **k: chains.LegQuotes(
+        symbols=2, missing=["a", "b"], stream_error="auth"))
+    with pytest.raises(RuntimeError, match="no leg quotes"):
+        tracking.update(n_paths=200, now=dt.datetime(2026, 9, 30, 11, 45))
 
 
 # --- Health check: the firsts the scheduler has not handled live -------------------------

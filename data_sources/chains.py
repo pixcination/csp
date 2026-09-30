@@ -601,6 +601,136 @@ def capture(ticker: str, dte_max: int | None = None, dte_min: int = 0,
     return result
 
 
+def occ_symbol(root: str, expiration, option_type: str, strike: float) -> str:
+    """The TastyTrade (OCC) option symbol: 'SPY   261120P00735000'."""
+    exp = pd.Timestamp(expiration).date()
+    cp = "C" if str(option_type).lower().startswith("c") else "P"
+    return f"{str(root).upper():<6}{exp:%y%m%d}{cp}{int(round(float(strike) * 1000)):08d}"
+
+
+@dataclass
+class LegQuotes:
+    """`quote_legs` output: per ticker a (chain, underlying) pair in the
+    snapshot schema, holding only the requested legs' rows."""
+    frames: dict = field(default_factory=dict)
+    symbols: int = 0                     # option symbols asked for
+    subscriptions: int = 0               # DXLink symbols (options + underlyings)
+    streamed: int = 0                    # options quoted by the stream
+    rest_fallback: int = 0               # options and underlyings quoted by REST instead
+    missing: list = field(default_factory=list)
+    stream_error: str | None = None
+
+
+def quote_legs(legs: pd.DataFrame, limiter: SubscriptionLimiter | None = None,
+               reporter: BaseReporter | None = None, now: dt.datetime | None = None,
+               collect_seconds: float | None = None) -> LegQuotes:
+    """Quote only the given legs (Tom 2026-09-29, the hourly mark): every
+    leg's option symbol plus each ticker's underlying, subscribed together
+    in ONE DXLink session (Quote, Trade, Summary, Greeks), paced by the
+    subscription limiter. Anything the stream leaves without a bid/ask (or
+    an underlying without a price) is asked of REST. Nothing is written:
+    full chains come from the scans and the 15:30 archive.
+
+    `legs` needs ticker, root_symbol, expiration, option_type, strike."""
+    reporter = reporter or NullReporter()
+    out = LegQuotes()
+    if legs.empty:
+        return out
+    ttc = tt.common()
+    tt.authenticate()
+    info = classify(now)
+    block = session_block(now)
+    captured_at = dt.datetime.now()
+
+    rows: dict[tuple, dict] = {}          # (ticker, root, exp, strike) -> strike row
+    index: dict[str, tuple[str, dict]] = {}
+    for leg in legs.to_dict("records"):
+        ticker = str(leg["ticker"]).upper()
+        root = str(leg.get("root_symbol") or _tt_symbol(ticker))
+        exp = pd.Timestamp(leg["expiration"]).date()
+        strike = float(leg["strike"])
+        side = "call" if str(leg.get("option_type") or "put").lower().startswith("c") else "put"
+        key = (ticker, root, exp, strike)
+        row = rows.get(key)
+        if row is None:
+            row = ttc.empty_strike_row(exp.isoformat(), strike, None, None)
+            row["root_symbol"] = root
+            rows[key] = row
+        symbol = occ_symbol(root, exp, side, strike)
+        row[f"{side}_symbol"] = symbol
+        index[symbol] = (side, row)
+    options = sorted(index)
+    tickers = sorted({k[0] for k in rows})
+    underlying = {t: _tt_symbol(t) for t in tickers}
+    out.symbols = len(options)
+
+    dx_options, dx_to_tasty = ttc.build_equity_streamer_symbols(options)
+    dx_under = {sym: t for t, sym in underlying.items()}
+    dx_all = dx_options + sorted(dx_under)
+    out.subscriptions = len(dx_all)
+    if limiter:
+        limiter.wait(len(dx_all), reporter)
+    collect = collect_seconds if collect_seconds is not None else 8 + 0.5 * len(dx_all) / 1000.0
+    try:
+        quote_token, dxlink_url = ttc.fetch_quote_token()
+        stream = asyncio.run(ttc.stream_market_events_once(dxlink_url, quote_token, dx_all,
+                                                           collect))
+    except Exception as exc:
+        stream = {}
+        out.stream_error = f"{type(exc).__name__}: {str(exc)[:80]}"
+        reporter.log(f"leg quotes: stream failed ({out.stream_error}); REST only")
+    if limiter:
+        limiter.record(len(dx_all))
+
+    for dx_sym, payload in stream.items():
+        symbol = dx_to_tasty.get(dx_sym)
+        if symbol in index:
+            side, row = index[symbol]
+            ttc.apply_stream(row, side, payload)
+
+    def priced(side: str, row: dict) -> bool:
+        return row.get(f"{side}_bid") is not None and row.get(f"{side}_ask") is not None
+    gaps = [s for s, (side, row) in index.items() if not priced(side, row)]
+    out.streamed = len(options) - len(gaps)
+    if gaps:
+        for symbol, quote in ttc.fetch_rest_market_data(gaps, kind="equity-option").items():
+            if symbol in index:
+                side, row = index[symbol]
+                ttc.apply_rest(row, side, quote)
+                out.rest_fallback += 1
+    out.missing = [s for s, (side, row) in index.items()
+                   if not priced(side, row) and row.get(f"{side}_mark") is None]
+
+    under_rows: dict[str, dict] = {}
+    for sym, ticker in dx_under.items():
+        payload = stream.get(sym) or {}
+        bid, ask, last = (ttc._normalize_numeric(payload.get(k)) for k in ("bid", "ask", "last"))
+        # Mid when the quote is tight; else the last trade, as REST marks an
+        # index (SPX's streamed quote was 65 points wide on 2026-09-29).
+        mid = (bid + ask) / 2.0 if bid and ask and bid > 0 and ask > 0 else None
+        mark = mid if mid and (ask - bid) <= 0.001 * mid else (last or mid)
+        under_rows[ticker] = {"symbol": ticker, "tt_symbol": sym, "bid": bid, "ask": ask,
+                              "last": last, "mark": mark}
+    lacking = [underlying[t] for t, r in under_rows.items() if not r["mark"]]
+    if lacking:
+        for sym, quote in ttc.fetch_rest_market_data(lacking, kind="equity").items():
+            ticker = dx_under.get(sym)
+            if ticker:
+                row = ttc.underlying_row_from_quote(quote, "Equity")
+                under_rows[ticker].update({k: row.get(k) for k in ("bid", "ask", "last", "mark")})
+                out.rest_fallback += 1
+
+    for ticker in tickers:
+        chain = pd.DataFrame([r for k, r in rows.items() if k[0] == ticker])
+        stamp = {"capture_block": block, "captured_at": captured_at,
+                 "session_state": info.state.value, "quote_source": "legs"}
+        for column, value in stamp.items():
+            chain[column] = value
+        chain["greeks_from_stream"] = bool(stream)
+        out.frames[ticker] = (chain, pd.DataFrame([{**under_rows[ticker], **stamp}]))
+    return out
+
+
 def capture_universe(tickers: list[str], with_positions: set[str] | None = None,
                       force: bool = False,
                       reporter: BaseReporter | None = None) -> list[CaptureResult]:

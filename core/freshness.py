@@ -67,7 +67,25 @@ def _file_age_days(path: Path) -> float:
     return (dt.datetime.now() - modified).total_seconds() / 86400
 
 
-def _daily_bars(limits: dict) -> Freshness:
+def _tracked_symbols() -> list[str] | None:
+    """The symbols whose staleness is a real problem: active registry
+    symbols, indices included, ad-hoc (Symbol Lookup) ones not. Bars left
+    behind by inactive or removed symbols (BRK.B, 2026-09-29) are ignored.
+    None when the registry can't be read -- then every symbol counts."""
+    try:
+        from data_sources import universe
+        return universe.symbols(scope="all") or None
+    except Exception:
+        return None
+
+
+def _where(column: str, symbols: list[str] | None) -> tuple[str, list]:
+    if not symbols:
+        return "", []
+    return f"WHERE {column} IN ({', '.join('?' * len(symbols))}) ", list(symbols)
+
+
+def _daily_bars(limits: dict, symbols: list[str] | None = None) -> Freshness:
     import duckdb
     path = db_universe_daily()
     label = "Daily bars"
@@ -76,8 +94,10 @@ def _daily_bars(limits: dict) -> Freshness:
     try:
         con = duckdb.connect(str(path), read_only=True)
         try:
+            where, params = _where("ticker", symbols)
             row = con.execute("SELECT ticker, max(date) AS last FROM daily_bars_raw "
-                              "GROUP BY ticker ORDER BY last LIMIT 1").fetchone()
+                              f"{where}GROUP BY ticker ORDER BY last LIMIT 1",
+                              params).fetchone()
         finally:
             con.close()
     except Exception as exc:
@@ -162,7 +182,7 @@ def pd_timestamp(value) -> dt.datetime:
     return dt.datetime.combine(value, dt.time())
 
 
-def _technicals(limits: dict) -> Freshness:
+def _technicals(limits: dict, symbols: list[str] | None = None) -> Freshness:
     """Level study / indicator cache: stalest symbol's as_of vs the last
     completed session (Phase 10)."""
     import duckdb
@@ -174,8 +194,10 @@ def _technicals(limits: dict) -> Freshness:
     try:
         con = duckdb.connect(str(path), read_only=True)
         try:
+            where, params = _where("symbol", symbols)
             row = con.execute("SELECT min(as_of) FROM (SELECT symbol, max(as_of) AS as_of "
-                              "FROM indicator_latest GROUP BY symbol)").fetchone()
+                              f"FROM indicator_latest {where}GROUP BY symbol)",
+                              params).fetchone()
         finally:
             con.close()
     except Exception:
@@ -206,8 +228,9 @@ def report() -> list[Freshness]:
     """Every cache's age, in the order a run depends on them."""
     limits = thresholds()
     ref = reference_dir()
+    symbols = _tracked_symbols()
     items = [
-        _daily_bars(limits),
+        _daily_bars(limits, symbols),
         _file("earnings", "Earnings calendar", ref / "earnings.parquet",
               limits["earnings_days"], "the earnings gate reads this; re-run the pipeline"),
         _file("dividends", "Dividend ex-dates", ref / "dividends.parquet",
@@ -221,7 +244,7 @@ def report() -> list[Freshness]:
                         limits["market_metrics_days"], "IV rank / percentile; re-run the pipeline"),
         _universe_table("events", "Events table", "SELECT max(built_at) FROM events",
                         limits["events_days"], "earnings / macro / OPEX gates; re-run the pipeline"),
-        _technicals(limits),
+        _technicals(limits, symbols),
         _chains(limits),
         _cache_1m(limits),
     ]

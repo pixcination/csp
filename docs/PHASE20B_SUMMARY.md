@@ -105,36 +105,66 @@ plus 300 open positions, a mark would pass 15 minutes. If a mark goes over
 15 minutes, the report prints the proposed fix; over 10 minutes it prints a
 "watch" line:
 
-1. Use fewer simulation paths for the probabilities from now.
+1. Profile the marks phase, which scales with positions, and share the work
+   that repeats for each ticker.
 2. Run the 10:45 mark after the scans, so it reuses their chains.
-3. Mark every 2 hours, or mark the tracked book less often than the taken
-   book.
 
-### 3a. Mark: reuse fresh chains (2026-09-29, before the freeze)
+Tom ruled out marking less often and using fewer paths (2026-09-29): managed
+outcomes and target-hit scoring depend on hourly marks at full paths.
 
-With whole-universe presets most of the 67 tickers will soon hold open
-positions, so the mark would pass 15 minutes. Tom's fix, now in
-`tracking.update`:
-- A ticker whose newest snapshot prices every leg from a capture in the last
-  20 minutes (`tracking.reuse_chain_minutes`) isn't pulled again.
-- If an archive finished inside those 20 minutes, everything it captured
-  counts too. So the 15:45 mark reads the 15:30 archive (and the 12:45 mark
-  reads the 12:30 archive on half days), however long the archive took.
-- The history records `tickers` (pulled) and `reused`. The health check
-  shows both.
+### 3a. Mark: held legs only (2026-09-29, before the freeze)
 
-Measured on the current book (42 open positions, 20 tickers, a copy of the
-ledger, 2026-09-29 about 21:15 ET):
+With whole-universe presets, most of the 67 tickers will soon hold open
+positions. Pulling each held ticker's expirations (about 9.5 s per ticker)
+would push the mark past 15 minutes. Tom's fix, now in `tracking.update`:
+1. **Reuse first.** A ticker whose newest snapshot prices every leg from a
+   capture in the last 20 minutes (`tracking.reuse_chain_minutes`) reads
+   that snapshot. If an archive finished inside those 20 minutes, everything
+   it captured counts too. So the 15:45 mark reads the 15:30 archive, and
+   the 12:45 mark reads the 12:30 archive on half days.
+2. **Every other ticker: its held legs only.** `chains.quote_legs` builds
+   each open leg's option symbol from its root, expiration, type and strike.
+   It subscribes those symbols and each ticker's underlying together in one
+   DXLink session (Quote, Trade, Summary, Greeks), paced by the existing
+   subscription limiter. REST fills in any leg or underlying the stream left
+   without a price. The quotes stay in memory, and no chain is pulled or
+   written. Full chains come from the scans and the 15:30 archive.
+3. The underlying's spot is the mid when the quote is within 0.1% of the
+   price. Otherwise it's the last trade, which is how REST marks an index;
+   SPX's streamed quote was 65 points wide.
+4. A leg nobody quotes stays unpriced and is counted (`unquoted`). If no leg
+   is quoted at all, the slot fails, so it shows red on the Schedule tab
+   instead of recording a book of unpriced marks.
+5. Hourly marks and 4,000 paths are unchanged.
 
-| | total | chains | marks |
+The history records `tickers`, `reused`, `legs`, `rest` and `unquoted`. The
+health check shows them and lists unquoted legs.
+
+Measured on the current book (42 open positions, 20 tickers, 63 legs; a copy
+of the ledger; 2026-09-29 around 23:30 ET; no snapshot fresh, as for a
+typical hourly mark):
+
+| | total | quotes / chains | marks |
 |---|---|---|---|
-| Before: pull every ticker | 213 s | 189 s (20 pulled) | 23 s |
-| After: every snapshot fresh | 21 s | 0 s (20 reused) | 21 s |
+| Before: targeted pull per ticker | 213 s | 190 s | 22 s |
+| After: held legs, one session | 33 s | 10.7 s | 21 s |
+| After, snapshots fresh (the 15:45 mark) | 21 s | 0 s | 21 s |
 
-With the current schedule, only the 15:45 mark finds fresh snapshots. At
-10:45 the mark runs before the scans, and at 11:45 the scans finished about
-30 minutes earlier. The other marks pull as before. That's fix 2 above, if
-it's needed.
+All 42 positions were priced both ways. The marks come out equal because
+both take the leg's bid/ask mid (REST's `mark` is that mid). After hours, 34
+of 42 marks were identical. SPX legs came out up to $0.60 higher from the
+stream than from REST. A comparison under market-hours quotes is scheduled
+for 2026-09-30 13:05 ET (`data/scheduler/compare_leg_quotes.py`).
+
+**Projection, 67 tickers / 300 positions** (about 660 legs + 67 underlyings
+= about 730 subscriptions):
+- Quotes: the collection window is 8 s + 0.5 s per 1,000 symbols, about
+  8.4 s, plus sign-in, so about 11-13 s. The limiter's 8,000 per minute
+  isn't reached.
+- Marks: 0.50 s per position tonight, 0.95 s during market hours
+  (2026-09-29), so 150-285 s.
+- Total: **about 3-5 minutes**, against about 13-15.5 minutes pulling
+  chains (67 x 9.5 s + marks). The marks phase is now most of the time.
 
 ### 3b. Firsts the scheduler hasn't handled live
 
